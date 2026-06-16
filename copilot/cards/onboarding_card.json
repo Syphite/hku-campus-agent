@@ -1,0 +1,182 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "Welcome to HKU Campus Agent",
+      "size": "Large",
+      "weight": "Bolder",
+      "color": "Accent"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Let me set up your profile so I can find the right scholarships, events, and opportunities for you. This takes about 2 minutes.",
+      "wrap": true,
+      "spacing": "Small"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Academic Details",
+      "weight": "Bolder",
+      "spacing": "Large",
+      "separator": true
+    },
+    {
+      "type": "Input.ChoiceSet",
+      "id": "faculty",
+      "label": "Faculty",
+      "isRequired": true,
+      "errorMessage": "Please select your faculty",
+      "style": "compact",
+      "choices": [
+        {"title": "Architecture",                    "value": "Architecture"},
+        {"title": "Arts",                            "value": "Arts"},
+        {"title": "Business and Economics",          "value": "Business and Economics"},
+        {"title": "Dentistry",                       "value": "Dentistry"},
+        {"title": "Education",                       "value": "Education"},
+        {"title": "Engineering",                     "value": "Engineering"},
+        {"title": "Law",                             "value": "Law"},
+        {"title": "Medicine",                        "value": "Medicine"},
+        {"title": "Science",                         "value": "Science"},
+        {"title": "Social Sciences",                 "value": "Social Sciences"},
+        {"title": "School of Computing and Data Science", "value": "School of Computing and Data Science"}
+      ]
+    },
+    {
+      "type": "Input.Text",
+      "id": "programme",
+      "label": "Programme (e.g. Bachelor of Engineering in Computer Science)",
+      "isRequired": true,
+      "errorMessage": "Please enter your programme",
+      "placeholder": "e.g. Bachelor of Science in Mathematics"
+    },
+    {
+      "type": "Input.ChoiceSet",
+      "id": "year_of_study",
+      "label": "Year of Study",
+      "isRequired": true,
+      "style": "compact",
+      "choices": [
+        {"title": "Year 1", "value": "1"},
+        {"title": "Year 2", "value": "2"},
+        {"title": "Year 3", "value": "3"},
+        {"title": "Year 4", "value": "4"},
+        {"title": "Year 5+", "value": "5"},
+        {"title": "Postgraduate", "value": "postgraduate"}
+      ]
+    },
+    {
+      "type": "Input.Number",
+      "id": "gpa",
+      "label": "Current CGPA (leave blank if first semester)",
+      "placeholder": "e.g. 3.7",
+      "min": 0,
+      "max": 4.3
+    },
+    {
+      "type": "TextBlock",
+      "text": "Background",
+      "weight": "Bolder",
+      "spacing": "Large",
+      "separator": true
+    },
+    {
+      "type": "Input.ChoiceSet",
+      "id": "local_status",
+      "label": "Student Status",
+      "isRequired": true,
+      "style": "compact",
+      "choices": [
+        {"title": "Local (Hong Kong)",  "value": "local"},
+        {"title": "Non-local",          "value": "non-local"}
+      ]
+    },
+    {
+      "type": "Input.Text",
+      "id": "country_of_origin",
+      "label": "Country / Place of Origin (if non-local)",
+      "placeholder": "e.g. Mainland China, United Kingdom"
+    },
+    {
+      "type": "Input.ChoiceSet",
+      "id": "financial_need_opt_in",
+      "label": "Include need-based scholarships in my matches?",
+      "style": "compact",
+      "value": "false",
+      "choices": [
+        {"title": "Yes — show me need-based scholarships too", "value": "true"},
+        {"title": "No thanks",                                 "value": "false"}
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "Your answer is private and only used for scholarship filtering.",
+      "size": "Small",
+      "color": "Good",
+      "spacing": "None"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Interests & Activities",
+      "weight": "Bolder",
+      "spacing": "Large",
+      "separator": true
+    },
+    {
+      "type": "Input.Text",
+      "id": "interests",
+      "label": "Interests (comma-separated)",
+      "placeholder": "e.g. AI, robotics, hackathons, creative writing"
+    },
+    {
+      "type": "Input.Text",
+      "id": "activities",
+      "label": "Activities & Achievements",
+      "isMultiline": true,
+      "placeholder": "e.g. HKU Robotics Team Vice Captain, volunteer at Code4HK, Dean's List 2024-25"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Preferences",
+      "weight": "Bolder",
+      "spacing": "Large",
+      "separator": true
+    },
+    {
+      "type": "Input.ChoiceSet",
+      "id": "digest_frequency",
+      "label": "How often would you like your digest?",
+      "style": "compact",
+      "value": "weekly",
+      "choices": [
+        {"title": "Daily",   "value": "daily"},
+        {"title": "Weekly (recommended)", "value": "weekly"},
+        {"title": "Monthly", "value": "monthly"}
+      ]
+    },
+    {
+      "type": "Input.ChoiceSet",
+      "id": "language_preference",
+      "label": "Preferred language for responses",
+      "style": "compact",
+      "value": "english",
+      "choices": [
+        {"title": "English",  "value": "english"},
+        {"title": "Mandarin (普通话)", "value": "mandarin"},
+        {"title": "Cantonese (廣東話)", "value": "cantonese"}
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.Submit",
+      "title": "Set up my profile",
+      "style": "positive",
+      "data": {
+        "action": "onboarding_submit"
+      }
+    }
+  ]
+}

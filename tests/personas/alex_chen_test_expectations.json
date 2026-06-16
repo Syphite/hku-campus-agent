@@ -1,0 +1,24 @@
+{
+  "student_id": "persona_alex_chen",
+  "expected_matches": ["ss_663", "ss_395", "ss_396", "ss_486", "ss_36", "ss_95", "ss_832"],
+  "expected_non_matches": ["ss_840", "ss_803", "ss_786", "ss_144", "ss_555"],
+  "notes": "Alex should match Engineering and open-to-all scholarships. Should NOT match Arts, Medicine, Social Sciences, or financial need only scholarships.",
+  "demo_scenarios": [
+    {
+      "scenario": "Timetable conflict",
+      "description": "Hackathon with Tuesday 2-5pm sessions clashes with COMP3230 Lab — agent flags and suggests alternative timing"
+    },
+    {
+      "scenario": "Scholarship match",
+      "description": "Peter H.M. Lau AI Scholarship (ss_663) surfaces as strong match — CS programme directly matches AI and Data Systems focus"
+    },
+    {
+      "scenario": "Near miss",
+      "description": "Innovation and Technology Scholarship (ss_395) — non-final year required, Alex qualifies, show this as strong match"
+    },
+    {
+      "scenario": "Forward looking",
+      "description": "Peter H.M. Lau Penultimate Year Scholarship (ss_662) — eligible next year as Year 3, agent bookmarks it"
+    }
+  ]
+}

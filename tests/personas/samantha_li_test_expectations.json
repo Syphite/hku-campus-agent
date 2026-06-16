@@ -1,0 +1,20 @@
+{
+  "student_id": "persona_samantha_li",
+  "expected_matches": ["ss_414", "ss_413", "ss_766", "ss_472", "ss_486", "ss_839", "ss_834"],
+  "expected_non_matches": ["ss_663", "ss_48", "ss_473", "ss_144", "ss_786"],
+  "notes": "Samantha should match Arts scholarships, entrance scholarships (Year 1), and need-based scholarships (opted in). Should NOT match Engineering or Social Sciences scholarships. No GPA filter applies since GPA is null.",
+  "demo_scenarios": [
+    {
+      "scenario": "Financial need surfacing",
+      "description": "R.C. Lee Hall (ss_414) and Chung Chow Hang Lan (ss_413) surface for Samantha but not Alex — financial need opt-in working"
+    },
+    {
+      "scenario": "Multilingual opportunity",
+      "description": "GBA cultural exchange programme surfaced from Xiaohongshu mock data — never appeared in HKU email"
+    },
+    {
+      "scenario": "New student onboarding",
+      "description": "Agent explains no GPA yet and surfaces entrance scholarships available to Year 1 students"
+    }
+  ]
+}

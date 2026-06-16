@@ -1,0 +1,20 @@
+{
+  "student_id": "persona_david_wong",
+  "expected_matches": ["ss_786", "ss_838", "ss_396", "ss_486", "ss_781"],
+  "expected_non_matches": ["ss_663", "ss_662", "ss_48", "ss_473", "ss_395"],
+  "notes": "David is final year so most undergraduate merit scholarships should be flagged as excluded or near-expired. Agent should redirect to postgraduate entrance scholarships. ss_395 (Innovation and Technology) explicitly requires non-final year so should be excluded.",
+  "demo_scenarios": [
+    {
+      "scenario": "Final year redirect",
+      "description": "Agent proactively flags that most undergraduate merit scholarships exclude final year students — redirects to HKU Business School Dean's Master Fellowship (ss_786) as next step"
+    },
+    {
+      "scenario": "High stakes deadline risk",
+      "description": "Case competition submission in 4 days — dissertation final draft due 2 days later — agent flags high risk and suggests completing scholarship application first"
+    },
+    {
+      "scenario": "Recruiter email triage",
+      "description": "HSBC and McKinsey recruiting emails kept in inbox — generic career fair mass mails archived with reason"
+    }
+  ]
+}
