@@ -23,3 +23,4 @@ python-docx>=1.1.0 # For DOCX filling
 botbuilder-core
 botbuilder-ai
 aiohttp
+httpx<0.28.0
