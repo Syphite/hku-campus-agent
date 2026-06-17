@@ -10,3 +10,8 @@ requiredVersions:
     # the azd ai agent extension is required for this template
     "azure.ai.agents": ">=0.1.0-preview"
 
+services:
+  bot:
+    project: ./
+    language: python
+    host: appservice
