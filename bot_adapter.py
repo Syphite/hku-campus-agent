@@ -1,12 +1,12 @@
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
-from botbuilder.schema import Activity
-from aiohttp import web
+from botbuilder.schema import Activity, Attachment
+from aiohttp import ClientSession, web
 import os
-import json
-from agent.handler import handle_message
+from agent.handler import handle_cv_upload, handle_form_uploaded, handle_message
+from agent.profile import get_profile
 from dotenv import load_dotenv
 
-# Load local .env file if running locally (Azure will use its Configuration Settings)
+# Load local .env file if running locally
 load_dotenv()
 
 # Securely fetch all required parameters for a cross-tenant / multi-tenant bot
@@ -28,30 +28,94 @@ async def messages(req: web.Request) -> web.Response:
     if not req.has_body:
         return web.Response(status=400, text="Missing request body")
         
-    body     = await req.json()
+    body = await req.json()
     activity = Activity().deserialize(body)
-    auth     = req.headers.get("Authorization", "")
+    auth = req.headers.get("Authorization", "")
 
     async def turn_handler(turn_context: TurnContext):
         # Extract student metadata safely
-        student_id = turn_context.activity.from_property.id if turn_context.activity.from_property else "unknown_user"
+        from_property = turn_context.activity.from_property
+        student_id = from_property.id if from_property and from_property.id else None
+        if not student_id:
+            await turn_context.send_activity("I couldn't identify your user ID. Please reopen the chat and try again.")
+            return
+
+        async def send_agent_responses(responses):
+            for r in responses:
+                # CRITICAL FIX: Map raw dicts to Attachment objects for the Bot Framework SDK
+                attachments = []
+                if r.get("attachments"):
+                    for att in r["attachments"]:
+                        attachments.append(Attachment(
+                            content_type=att.get("contentType"),
+                            content=att.get("content")
+                        ))
+
+                await turn_context.send_activity(Activity(
+                    type="message",
+                    text=r.get("text", ""),
+                    attachments=attachments if attachments else None
+                ))
+
+        def is_supported_document(att) -> bool:
+            content_type = (getattr(att, "content_type", "") or "").lower()
+            filename = (getattr(att, "name", "") or "").lower()
+            return (
+                "pdf" in content_type
+                or "wordprocessingml.document" in content_type
+                or filename.endswith(".pdf")
+                or filename.endswith(".docx")
+            )
+
+        async def download_document_attachment(att) -> tuple[bytes, str]:
+            content_url = getattr(att, "content_url", None)
+            filename = getattr(att, "name", None) or "upload.pdf"
+
+            if not content_url:
+                raise ValueError("Attachment is missing a content URL")
+
+            headers = {"Authorization": auth} if auth else {}
+            async with ClientSession(headers=headers) as session:
+                async with session.get(content_url) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"Could not download attachment: HTTP {resp.status}")
+                    file_bytes = await resp.read()
+
+            return file_bytes, filename
+
+        document_attachments = []
+        for att in turn_context.activity.attachments or []:
+            if is_supported_document(att):
+                document_attachments.append(att)
+
+        if document_attachments:
+            profile = get_profile(student_id)
+            has_active_draft = bool(profile and profile.get("last_scholarship_id"))
+            await turn_context.send_activity(
+                "📄 Processing your application form... please wait."
+                if has_active_draft else
+                "📄 Processing your CV... please wait."
+            )
+            for att in document_attachments:
+                try:
+                    file_bytes, filename = await download_document_attachment(att)
+                    if has_active_draft:
+                        await send_agent_responses(handle_form_uploaded(student_id, file_bytes, filename))
+                    else:
+                        await send_agent_responses(handle_cv_upload(student_id, file_bytes, filename))
+                except Exception as e:
+                    await turn_context.send_activity(f"Sorry, I couldn't process that attachment: {e}")
+            return
         
         message = {
-            "type":  turn_context.activity.type,
-            "text":  turn_context.activity.text or "",
+            "type": turn_context.activity.type,
+            "text": turn_context.activity.text or "",
             "value": turn_context.activity.value or {}
         }
         
         # Process logic via your custom agent handler
         responses = handle_message(student_id, message)
-        
-        # Iteratively send responses back to the channel
-        for r in responses:
-            await turn_context.send_activity(Activity(
-                type="message",
-                text=r.get("text", ""),
-                attachments=r.get("attachments", [])
-            ))
+        await send_agent_responses(responses)
 
     # Process the incoming pipeline activity
     try:

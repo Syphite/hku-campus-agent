@@ -273,7 +273,14 @@ def run_matching(student_id: str) -> dict:
     candidates = _stage1_search(profile)
     if not candidates:
         logger.warning("No candidates from Stage 1 — check index has data")
-        return {"matched": [], "near_misses": [], "matched_count": 0, "near_miss_count": 0}
+        return {
+            "apply_now": [],
+            "prepare": [],
+            "apply_now_count": 0,
+            "prepare_count": 0,
+            "student_id": student_id,
+            "student_name": profile.get("name", "")
+        }
 
     matches     = _stage2_reasoning(profile, candidates)
     matched     = [m for m in matches if m.get("match_strength") in ("strong", "partial")]
@@ -291,11 +298,35 @@ def run_matching(student_id: str) -> dict:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
+    mock_profile = {
+        "id": "local_mock_student",
+        "name": "Local Mock Student",
+        "email": "local.mock.student@connect.hku.hk",
+        "academic": {
+            "faculty": "Engineering",
+            "programme": "Bachelor of Engineering in Computer Science",
+            "year_of_study": 2,
+            "gpa": 3.7,
+            "level": "undergraduate",
+            "nationality": {
+                "local_status": "local",
+                "country_of_origin": "Hong Kong"
+            },
+            "expected_graduation_year": 2028,
+        },
+        "financial": {"financial_need_opt_in": False},
+        "interests": ["AI", "robotics", "hackathons"],
+        "activities": ["HKU Robotics Team", "Undergraduate research assistant"],
+        "cv_text": "Engineering student with robotics, research, and hackathon experience.",
+        "timetable": {"upcoming_deadlines": []},
+    }
+    get_profile = lambda student_id: mock_profile
+
     print("\n" + "="*60)
-    print("MATCHING TEST — Samantha Li")
+    print("MATCHING TEST — Local Mock Student")
     print("="*60)
 
-    result = run_matching("persona_samantha_li")
+    result = run_matching(mock_profile["id"])
 
     if "error" in result:
         print(f"ERROR: {result['error']}")

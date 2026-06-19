@@ -31,12 +31,20 @@ def _times_overlap(
     Check if two time ranges overlap.
     Times are strings in "HH:MM" format.
     """
-    def to_minutes(t: str) -> int:
-        h, m = t.split(":")
-        return int(h) * 60 + int(m)
+    def to_minutes(t: str) -> int | None:
+        try:
+            h, m = t.split(":")
+            return int(h) * 60 + int(m)
+        except (ValueError, AttributeError):
+            return None  # Return None if format is bad
 
     a0, a1 = to_minutes(a_start), to_minutes(a_end)
     b0, b1 = to_minutes(b_start), to_minutes(b_end)
+
+    # If any time is invalid, assume no overlap to prevent crashing.
+    if a0 is None or a1 is None or b0 is None or b1 is None:
+        return False
+
     return a0 < b1 and b0 < a1
 
 

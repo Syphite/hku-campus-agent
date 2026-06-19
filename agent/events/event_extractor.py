@@ -168,11 +168,8 @@ def extract_events_for_student(student_id: str) -> list:
     Convenience function — loads mock data and extracts events.
     In production this would be called with real scraped + email data.
     """
-    import sys, os
-    sys.path.insert(0, os.path.dirname(__file__))
-    
-    from mock_linkedin import get_mock_linkedin_posts
-    from mock_xiaohongshu import get_mock_xhs_posts
+    from agent.events.mock_linkedin import get_mock_linkedin_posts
+    from agent.events.mock_xiaohongshu import get_mock_xhs_posts
     
     all_posts = get_mock_linkedin_posts() + get_mock_xhs_posts()
     
@@ -183,7 +180,17 @@ if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
 
-    student_id = sys.argv[1] if len(sys.argv) > 1 else "persona_alex_chen"
+    mock_profile = {
+        "id": "local_mock_student",
+        "name": "Local Mock Student",
+        "interests": ["AI", "robotics", "hackathons"],
+        "academic": {
+            "faculty": "Engineering",
+            "programme": "Bachelor of Engineering in Computer Science",
+            "year_of_study": 2,
+        }
+    }
+    student_id = sys.argv[1] if len(sys.argv) > 1 else mock_profile["id"]
     print(f"\nExtracting events for {student_id}...")
 
     events = extract_events_for_student(student_id)

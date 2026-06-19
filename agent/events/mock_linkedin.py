@@ -1,4 +1,4 @@
-q"""
+"""
 agent/events/mock_linkedin.py
 Mock LinkedIn post data simulating what a real LinkedIn scraper would return.
 For the prototype demo — replace with real scraper post-hackathon.

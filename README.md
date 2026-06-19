@@ -9,7 +9,7 @@ hku_agent/
 ├── README.md
 ├── scripts/
 │   ├── test_connections.py         ← run this first
-│   └── seed_profiles.py            ← seeds demo personas into Cosmos DB
+│   └── seed_profiles.py            ← retired; profiles come from onboarding
 ├── scholarship_scraper/
 │   ├── parser.py                   ← scrapes scholar.aas.hku.hk (665 scholarships)
 │   ├── indexer.py                  ← creates/updates Azure AI Search index
@@ -21,10 +21,6 @@ hku_agent/
 ├── external_schemes_scraper/
 │   └── parser.py                   ← scrapes aas.hku.hk/external-schemes/
 └── tests/
-    └── personas/
-        ├── persona_alex_chen.json
-        ├── persona_samantha_li.json
-        └── persona_david_wong.json
 ```
 
 ## Setup
@@ -67,6 +63,5 @@ python3 run_local.py --limit 5
 # Scrape all 665 and index (takes ~15 minutes)
 python3 run_local.py
 
-# Seed demo personas into Cosmos DB
-python3 scripts/seed_profiles.py
+# Create user profiles through the Copilot onboarding card
 ```
