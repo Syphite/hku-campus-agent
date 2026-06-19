@@ -9,23 +9,21 @@ from dotenv import load_dotenv
 # Load local .env file if running locally
 load_dotenv()
 
-# Securely fetch all required parameters for a cross-tenant / multi-tenant bot
+# Securely fetch all required parameters
 APP_ID = os.environ.get("MicrosoftAppId", os.environ.get("BOT_APP_ID", ""))
 APP_PASSWORD = os.environ.get("MicrosoftAppPassword", os.environ.get("BOT_APP_PASSWORD", ""))
-TENANT_ID = os.environ.get("MicrosoftAppTenantId", "common")  # Defaults to 'common' for MultiTenant
+TENANT_ID = os.environ.get("MicrosoftAppTenantId", "common")
 
-# Explicitly pass the configuration using correct parameter names
 SETTINGS = BotFrameworkAdapterSettings(
     app_id=APP_ID,
     app_password=APP_PASSWORD,
-    channel_auth_tenant=TENANT_ID  # Correct parameter name for tenant
+    channel_auth_tenant=TENANT_ID
 )
 
 ADAPTER = BotFrameworkAdapter(SETTINGS)
 
 async def messages(req: web.Request) -> web.Response:
-    # Check for empty body to prevent JSON parsing crashes
-    if not req.has_body:
+    if not req.can_read_body:
         return web.Response(status=400, text="Missing request body")
         
     body = await req.json()
@@ -33,16 +31,15 @@ async def messages(req: web.Request) -> web.Response:
     auth = req.headers.get("Authorization", "")
 
     async def turn_handler(turn_context: TurnContext):
-        # Extract student metadata safely
         from_property = turn_context.activity.from_property
         student_id = from_property.id if from_property and from_property.id else None
+        
         if not student_id:
-            await turn_context.send_activity("I couldn't identify your user ID. Please reopen the chat and try again.")
+            await turn_context.send_activity("I couldn't identify your user ID.")
             return
 
         async def send_agent_responses(responses):
             for r in responses:
-                # CRITICAL FIX: Map raw dicts to Attachment objects for the Bot Framework SDK
                 attachments = []
                 if r.get("attachments"):
                     for att in r["attachments"]:
@@ -91,11 +88,13 @@ async def messages(req: web.Request) -> web.Response:
         if document_attachments:
             profile = get_profile(student_id)
             has_active_draft = bool(profile and profile.get("last_scholarship_id"))
+            
             await turn_context.send_activity(
                 "📄 Processing your application form... please wait."
                 if has_active_draft else
                 "📄 Processing your CV... please wait."
             )
+            
             for att in document_attachments:
                 try:
                     file_bytes, filename = await download_document_attachment(att)
@@ -113,18 +112,15 @@ async def messages(req: web.Request) -> web.Response:
             "value": turn_context.activity.value or {}
         }
         
-        # Process logic via your custom agent handler
         responses = handle_message(student_id, message)
         await send_agent_responses(responses)
 
-    # Process the incoming pipeline activity
     try:
         await ADAPTER.process_activity(activity, auth, turn_handler)
         return web.Response(status=200)
     except Exception as e:
-        # Prevent completely silent failures inside the aiohttp thread
         print(f"Error during process_activity: {str(e)}")
-        return web.Response(status=500, text="Internal server error processing bot activity")
+        return web.Response(status=500, text="Internal server error")
 
 app = web.Application()
 app.router.add_post("/api/messages", messages)
