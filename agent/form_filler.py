@@ -23,7 +23,7 @@ def _fill_pdf(input_path: str, output_path: str, profile: dict, scholarship: dic
     try:
         doc = fitz.open(input_path)
         
-        # Build a flat mapping of common field names to values
+        # Build a flat mapping of expected form field names to values
         academic = profile.get("academic", {})
         financial = profile.get("financial", {})
         

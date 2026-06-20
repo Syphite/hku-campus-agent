@@ -12,7 +12,7 @@ load_dotenv()
 # Securely fetch all required parameters
 APP_ID = os.environ.get("MicrosoftAppId", os.environ.get("BOT_APP_ID", ""))
 APP_PASSWORD = os.environ.get("MicrosoftAppPassword", os.environ.get("BOT_APP_PASSWORD", ""))
-TENANT_ID = os.environ.get("MicrosoftAppTenantId", "common")
+TENANT_ID = os.environ.get("MicrosoftAppTenantId", "")
 
 SETTINGS = BotFrameworkAdapterSettings(
     app_id=APP_ID,

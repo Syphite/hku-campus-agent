@@ -128,7 +128,7 @@ def _scholarship_cards(scholarships: list, tier: str) -> list:
         card = {
             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
             "type": "AdaptiveCard",
-            "version": "1.5",
+            "version": "1.3",
             "body": body,
             "actions": actions
         }
@@ -188,7 +188,7 @@ def _event_card(event: dict) -> dict:
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
-        "version": "1.5",
+        "version": "1.3",
         "body": body,
         "actions": actions
     }
@@ -203,7 +203,7 @@ def _archive_review_card(review_item: dict) -> dict:
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
-        "version": "1.5",
+        "version": "1.3",
         "body": [
             {
                 "type": "TextBlock",
@@ -478,7 +478,7 @@ def _question_selection_card(scholarship_id: str, questions: list[dict]) -> dict
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
-        "version": "1.5",
+        "version": "1.3",
         "body": body,
         "actions": [
             {
@@ -640,7 +640,7 @@ def handle_generate_draft(student_id: str, form_data: dict) -> list:
     card = {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
-        "version": "1.5",
+        "version": "1.3",
         "body": body
     }
 
@@ -792,7 +792,9 @@ def handle_message(student_id: str, message: dict) -> list:
     if not profile or not profile.get("onboarding_complete"):
         card = _load_card("onboarding_card")
         return [_card_response(
-            "Hi! Let me set up your profile first:", card
+            "Hi! I'm your HKU Campus Agent. I find scholarships, competitions, "
+            "and opportunities tailored to you, and help you apply. Let's get you set up:",
+            card
         )]
 
     return handle_get_digest(student_id)
