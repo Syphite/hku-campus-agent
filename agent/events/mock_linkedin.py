@@ -240,32 +240,6 @@ MOCK_LINKEDIN_POSTS = [
         "scraped_at": SCRAPED_AT
     },
     {
-        "id": "li_009",
-        "source": "linkedin",
-        "source_url": "https://www.linkedin.com/posts/hkjc-scholarship",
-        "raw_text": """
-        🏆 HKJC Scholarship for Excellence in Sports and Academics 2026
-        
-        The Hong Kong Jockey Club is offering scholarships for student athletes 
-        who excel in both academics and sport.
-        
-        Requirements:
-        - Represented HK or university at competitive level
-        - CGPA 3.0 or above
-        - Full-time undergraduate student
-        - Demonstrated community contribution
-        
-        Award: HK$40,000 per year, renewable
-        Application deadline: July 10, 2026
-        Apply: hkjc.com/scholarships
-        
-        #HKJC #ScholarshipHK #StudentAthlete #HongKong
-        """,
-        "poster": "Hong Kong Jockey Club",
-        "posted_date": "2026-06-01",
-        "scraped_at": SCRAPED_AT
-    },
-    {
         "id": "li_010",
         "source": "linkedin",
         "source_url": "https://www.linkedin.com/posts/hku-robotics-team",

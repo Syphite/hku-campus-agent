@@ -817,8 +817,19 @@ def _scholarship_url(scholarship: dict) -> str:
         or ""
     )
 
+def _strong_scholarships(scholarships: list) -> list:
+    strict_matches = []
+    for scholarship in scholarships or []:
+        if str(scholarship.get("match_strength", "")).lower() != "strong":
+            continue
+        if scholarship.get("qualifies") is not True:
+            continue
+        strict_matches.append(scholarship)
+    return strict_matches
+
 def _append_scholarship_cards(responses: list, scholarships: list, tier: str, offset: int = 0, limit: int = 3) -> None:
-    for card in _scholarship_cards(scholarships[offset:offset + limit], tier):
+    strict_scholarships = _strong_scholarships(scholarships)
+    for card in _scholarship_cards(strict_scholarships[offset:offset + limit], tier):
         responses.append({
             "type": "message",
             "text": "Scholarship match" if tier == "apply_now" else "Scholarship to prepare",
@@ -828,9 +839,9 @@ def _append_scholarship_cards(responses: list, scholarships: list, tier: str, of
 def _scholarship_cards(scholarships: list, tier: str) -> list:
     """Build a list of Adaptive Card attachments for scholarship results."""
     cards = []
-    for s in scholarships:
+    for s in _strong_scholarships(scholarships):
         is_open   = s.get("is_open", False)
-        strength  = s.get("match_strength", "partial")
+        strength  = s.get("match_strength", "strong")
         strength_emoji = "🟢" if strength == "strong" else "🟡"
         source_label = _scholarship_source_label(s)
 
@@ -1206,7 +1217,7 @@ def handle_get_digest(student_id: str) -> list:
     responses = [_text_response(format_digest_message(digest))]
 
     # Scholarship cards — apply now
-    apply_now = digest["scholarships"]["apply_now"]
+    apply_now = _strong_scholarships(digest["scholarships"]["apply_now"])
     if apply_now:
         responses.append(_text_response("**📋 Apply Now**"))
         _append_scholarship_cards(responses, apply_now, "apply_now", limit=3)
@@ -1216,7 +1227,7 @@ def handle_get_digest(student_id: str) -> list:
             ))
 
     # Scholarship cards — prepare
-    prepare = digest["scholarships"]["prepare"]
+    prepare = _strong_scholarships(digest["scholarships"]["prepare"])
     if prepare:
         responses.append(_text_response("**🗓️ Prepare For**"))
         _append_scholarship_cards(responses, prepare, "prepare", limit=3)
@@ -1224,6 +1235,11 @@ def handle_get_digest(student_id: str) -> list:
             responses.append(_text_response(
                 f"Showing 3 of {len(prepare)} scholarships. Type 'show more scholarships' to see the rest."
             ))
+
+    if "scholarships" in modules and not apply_now and not prepare:
+        responses.append(_text_response(
+            "No scholarships with strong matches found right now. Try updating your profile or check back later."
+        ))
 
     # Event cards — urgent
     if digest["events"]["urgent"]:
@@ -1268,8 +1284,8 @@ def handle_show_more_scholarships(student_id: str) -> list:
         return [_text_response("I had trouble loading more scholarships. Please try again later.")]
 
     responses = []
-    apply_now = scholarship_result.get("apply_now", [])
-    prepare = scholarship_result.get("prepare", [])
+    apply_now = _strong_scholarships(scholarship_result.get("apply_now", []))
+    prepare = _strong_scholarships(scholarship_result.get("prepare", []))
 
     if len(apply_now) > 3:
         responses.append(_text_response("**📋 More Apply Now Scholarships**"))

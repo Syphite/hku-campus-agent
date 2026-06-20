@@ -73,10 +73,12 @@ def _stage1_search(profile: dict) -> list[dict]:
     # Level: match student level OR "all"
     filters.append(f"(level/any(l: l eq '{level}') or level/any(l: l eq 'all'))")
 
-    # GPA: no requirement, or requirement student meets
+    # GPA: no requirement, or requirement student meets. No near-miss buffer.
     if gpa and gpa > 0:
-        filters.append(f"(gpa_requirement eq null or gpa_requirement le {gpa + 0.5})")
-        # +0.5 to catch near misses — Stage 2 will filter more precisely
+        filters.append(f"(gpa_requirement eq null or gpa_requirement le {gpa})")
+
+    # Year: match student year OR all when the index has structured year data.
+    filters.append(f"(year_of_study/any(y: y eq '{year}') or year_of_study/any(y: y eq 'all'))")
 
     # Financial need: if student opted out, exclude need-only scholarships
     if not need_opt_in:
@@ -143,6 +145,71 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
         "cv_summary":       profile.get("cv_text", "")[:300],  # first 1000 chars
         "upcoming_deadlines": profile.get("timetable", {}).get("upcoming_deadlines", []),
     }
+
+    def value_matches_student(values, student_value: str) -> bool:
+        if values in (None, "", []):
+            return True
+        if not isinstance(values, list):
+            values = [values]
+        normalized = {str(value).strip().lower() for value in values if str(value).strip()}
+        return not normalized or "all" in normalized or str(student_value).strip().lower() in normalized
+
+    def core_requirements_met(item: dict) -> bool:
+        academic = profile.get("academic", {})
+        financial = profile.get("financial", {})
+        local_status = academic.get("nationality", {}).get("local_status", "local")
+
+        if not value_matches_student(item.get("faculty"), academic.get("faculty", "")):
+            return False
+        if not value_matches_student(item.get("level"), academic.get("level", "undergraduate")):
+            return False
+        if not value_matches_student(item.get("year_of_study"), str(academic.get("year_of_study", ""))):
+            return False
+        if not value_matches_student(item.get("nationality"), local_status):
+            return False
+
+        if item.get("financial_need") and not financial.get("financial_need_opt_in", False):
+            return False
+
+        gpa_requirement = item.get("gpa_requirement")
+        student_gpa = academic.get("gpa", 0.0)
+        if gpa_requirement not in (None, ""):
+            try:
+                if float(student_gpa or 0) < float(gpa_requirement):
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        return True
+
+    def has_non_closeable_gap(item: dict) -> bool:
+        gap_text = str(item.get("gap") or "").strip().lower()
+        if not gap_text or gap_text in ("none", "null", "n/a"):
+            return False
+        non_closeable_terms = (
+            "resident", "residence", "hall", "r.c. lee", "rc lee",
+            "financial need", "opted out", "wrong faculty", "wrong programme",
+            "wrong program", "wrong year", "wrong level", "wrong nationality",
+            "non-local", "local status", "gpa below", "below requirement",
+            "postgraduate only", "undergraduate only", "publication",
+            "published paper", "patent", "certification", "national award",
+            "international award", "not eligible", "does not meet"
+        )
+        return True if gap_text else any(term in gap_text for term in non_closeable_terms)
+
+    def strict_result_filter(results: list[dict]) -> list[dict]:
+        strict_results = []
+        for result in results:
+            if result.get("qualifies") is not True:
+                continue
+            if str(result.get("match_strength", "")).lower() != "strong":
+                continue
+            if has_non_closeable_gap(result):
+                continue
+            if not core_requirements_met(result):
+                continue
+            strict_results.append(result)
+        return strict_results
 
     def candidate_payload(candidate: dict) -> dict:
         return {
@@ -227,8 +294,8 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
             logger.error(f"Stage 2 OpenAI error: {e}")
             return []
 
-    results = run_batch(candidates)
-    logger.info(f"Stage 2: {len(results)} matches/near-misses returned")
+    results = strict_result_filter(run_batch(candidates))
+    logger.info(f"Stage 2: {len(results)} strong qualified matches returned")
     return results
 
 
@@ -236,7 +303,7 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
 # Stage 3 — Sort and package
 # ---------------------------------------------------------------------------
 
-def _sort_and_package(matches: list, near_misses: list) -> dict:
+def _sort_and_package(matches: list) -> dict:
     apply_now = []
     prepare   = []
 
@@ -274,24 +341,19 @@ def _sort_and_package(matches: list, near_misses: list) -> dict:
             m["tier"] = "prepare"
             prepare.append(m)
 
-    # Near misses always go into prepare with their gap info
-    for m in near_misses:
-        m["tier"] = "near_miss"
-        prepare.append(m)
-
     # Sort apply_now: deadline ascending then strength
-    strength_order = {"strong": 0, "partial": 1}
+    strength_order = {"strong": 0}
     apply_now.sort(key=lambda m: (
         m.get("deadline_iso") or "9999-12-31",
-        strength_order.get(m.get("match_strength", "partial"), 1)
+        strength_order.get(m.get("match_strength", "strong"), 1)
     ))
 
-    # Sort prepare: eligible items first, then near_miss; earlier deadlines first.
-    tier_order = {"prepare": 0, "eligible_not_open": 0, "near_miss": 1}
+    # Sort prepare: earlier deadlines first, then strength.
+    tier_order = {"prepare": 0}
     prepare.sort(key=lambda m: (
-        tier_order.get(m.get("tier", "eligible_not_open"), 0),
+        tier_order.get(m.get("tier", "prepare"), 0),
         m.get("deadline_iso") or "9999-12-31",
-        strength_order.get(m.get("match_strength", "partial"), 1)
+        strength_order.get(m.get("match_strength", "strong"), 1)
     ))
 
     return {
@@ -331,9 +393,11 @@ def run_matching(student_id: str) -> dict:
         }
 
     matches     = _stage2_reasoning(profile, candidates)
-    matched     = [m for m in matches if m.get("match_strength") in ("strong", "partial")]
-    near_misses = [m for m in matches if m.get("match_strength") == "near_miss"]
-    result      = _sort_and_package(matched, near_misses)
+    matched     = [
+        m for m in matches
+        if m.get("qualifies") is True and str(m.get("match_strength", "")).lower() == "strong"
+    ]
+    result      = _sort_and_package(matched)
     result["student_id"]   = student_id
     result["student_name"] = profile.get("name", "")
     return result
@@ -395,12 +459,11 @@ if __name__ == "__main__":
                 print(f"  Calendar : {m['calendar_note']}")
 
         print("\n" + "="*60)
-        print("TIER 2 — PREPARE (opens later this year + near misses)")
+        print("TIER 2 — PREPARE")
         print("="*60)
         for m in result["prepare"]:
-            tier_label = "NEAR MISS" if m.get("tier") == "near_miss" else "ELIGIBLE"
-            print(f"\n  [{tier_label}] {m['name']}")
-            print(f"  Strength : {m.get('match_strength','near_miss')}")
+            print(f"\n  [STRONG] {m['name']}")
+            print(f"  Strength : {m.get('match_strength','strong')}")
             print(f"  Deadline : {m.get('deadline_raw','N/A')}")
             if m.get("reason"):
                 print(f"  Reason   : {m['reason']}")

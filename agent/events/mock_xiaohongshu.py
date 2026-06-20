@@ -92,58 +92,6 @@ MOCK_XHS_POSTS = [
         "scraped_at": SCRAPED_AT
     },
     {
-        "id": "xhs_004",
-        "source": "xiaohongshu",
-        "source_url": "https://www.xiaohongshu.com/explore/xhs_004",
-        "raw_text": """
-【奖学金】粤港澳大湾区青年发展奖学金2026开放申请！💰
-
-申请资格：
-✅ 在香港、澳门或广东省高校就读的全日制本科生
-✅ 成绩良好（无具体GPA要求，以个人陈述为主）
-✅ 有志于推动大湾区文化、教育或社会发展
-
-奖励：每人RMB 20,000（约HK$22,000）
-
-材料：个人陈述 + 两封推荐信 + 成绩单
-截止：2026年7月15日
-申请：gba-youth.org.hk/scholarship
-
-人文、社科、艺术类学生特别欢迎！不需要高GPA 🎉
-
-#大湾区奖学金 #港大 #内地生
-        """,
-        "poster": "大湾区青年发展基金",
-        "posted_date": "2026-06-01",
-        "scraped_at": SCRAPED_AT
-    },
-    {
-        "id": "xhs_005",
-        "source": "xiaohongshu",
-        "source_url": "https://www.xiaohongshu.com/explore/xhs_005",
-        "raw_text": """
-【干货】2026香港金融行业秋招时间线整理📊
-
-投行类：
-- Goldman Sachs: 申请截止 2026年7月15日
-- Morgan Stanley: 申请截止 2026年7月31日
-- JPMorgan: 申请截止 2026年8月1日
-
-本地银行：
-- HSBC Graduate Programme: 申请截止 2026年7月31日
-- Bank of China HK: 申请截止 2026年8月15日
-
-四大会计师事务所：Big4均在2026年7-9月开放申请
-
-✅ 港大BBA背景在本地金融圈认可度很高
-
-#香港金融 #秋招 #应届毕业生 #港大BBA
-        """,
-        "poster": "香港金融求职攻略",
-        "posted_date": "2026-06-03",
-        "scraped_at": SCRAPED_AT
-    },
-    {
         "id": "xhs_006",
         "source": "xiaohongshu",
         "source_url": "https://www.xiaohongshu.com/explore/xhs_006",

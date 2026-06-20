@@ -32,8 +32,10 @@ Extract structured event information from the provided text (which may be from a
 
 For each item, extract the following fields. If a field is not mentioned, use null or an empty list.
 
-- is_relevant: true if this is a genuine student opportunity (competition, hackathon, scholarship, internship, talk, cultural programme, volunteering). false if it is noise (food reviews, generic job ads for non-students, unrelated content).
-- type: "competition" | "hackathon" | "scholarship" | "internship" | "workshop" | "talk" | "cultural_exchange" | "volunteering" | "career_fair" | "recruitment" | "research" | "other"
+- is_relevant: true only if this is a genuine student event or opportunity such as a competition, hackathon, internship with a specific application deadline, workshop, talk, cultural programme, volunteering opportunity, career fair, recruitment event, or research opportunity. false if it is noise (food reviews, generic job ads for non-students, unrelated content).
+- Set is_relevant: false for posts primarily about scholarship applications. Scholarship matching comes from the Azure AI Search scholarship index, not social media scraping.
+- Set is_relevant: false for purely informational posts such as job recruitment timelines, general application calendars, or industry guides without one specific event/application workflow.
+- type: "competition" | "hackathon" | "internship" | "workshop" | "talk" | "cultural_exchange" | "volunteering" | "career_fair" | "recruitment" | "research" | "other"
 - title: clean, concise event name
 - organiser: who is running it
 - deadline: application/registration deadline as ISO date YYYY-MM-DD (or null)

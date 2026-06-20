@@ -61,21 +61,6 @@ def assemble_digest(
     urgent_events  = []
     upcoming_events = []
 
-    def external_scholarship_from_event(event: dict, days_left: int | None) -> dict:
-        return {
-            "scholarship_id": event.get("source_id") or event.get("id") or event.get("title"),
-            "name": event.get("title", "External scholarship opportunity"),
-            "match_strength": "partial",
-            "reason": event.get("summary", "External opportunity matched from event feeds."),
-            "deadline_raw": event.get("deadline") or "See opportunity page",
-            "deadline_iso": event.get("deadline"),
-            "is_open": days_left is None or days_left >= 0,
-            "source_url": event.get("source_url"),
-            "application_url": event.get("source_url"),
-            "application_notes": event.get("eligibility"),
-            "calendar_note": event.get("calendar_note"),
-        }
-
     for e in events:
         if not isinstance(e, dict):
             continue
@@ -92,11 +77,7 @@ def assemble_digest(
                 days_left = None
 
         if str(e.get("type", "")).lower() == "scholarship":
-            external_scholarship = external_scholarship_from_event(e, days_left)
-            if days_left is not None and 0 <= days_left <= 30:
-                apply_now.append(external_scholarship)
-            else:
-                prepare.append(external_scholarship)
+            # Scholarship applications are handled by Azure AI Search, not event feeds.
             continue
 
         if days_left is not None and days_left <= 30:
