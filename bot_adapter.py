@@ -39,8 +39,12 @@ async def messages(req: web.Request) -> web.Response:
             channel_data = {}
         event_type = str(channel_data.get("eventType") or channel_data.get("event_type") or "").lower()
         activity_name = str(getattr(turn_context.activity, "name", "") or "").lower()
-        if "edit" in event_type or "update" in event_type or "edit" in activity_name or "update" in activity_name:
-            return
+        is_edit = (
+            "edit" in event_type
+            or "update" in event_type
+            or "edit" in activity_name
+            or "update" in activity_name
+        )
 
         from_property = turn_context.activity.from_property
         student_id = from_property.id if from_property and from_property.id else None
@@ -120,7 +124,10 @@ async def messages(req: web.Request) -> web.Response:
         message = {
             "type": turn_context.activity.type,
             "text": turn_context.activity.text or "",
-            "value": turn_context.activity.value or {}
+            "value": turn_context.activity.value or {},
+            "is_edit": is_edit,
+            "event_type": event_type,
+            "activity_name": activity_name
         }
 
         responses = handle_message(student_id, message)

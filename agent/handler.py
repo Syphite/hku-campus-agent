@@ -125,6 +125,73 @@ def _build_onboarding_card(num_rows: int = 1) -> dict:
     """Build the onboarding card."""
     return deepcopy(_load_card("onboarding_card"))
 
+def _walk_card_items(items: list):
+    """Yield every Adaptive Card element nested under body/items/columns."""
+    for item in items:
+        yield item
+        if item.get("items"):
+            yield from _walk_card_items(item["items"])
+        for column in item.get("columns", []):
+            yield from _walk_card_items(column.get("items", []))
+
+def _set_card_input_value(card: dict, input_id: str, value) -> None:
+    if value is None:
+        return
+    for item in _walk_card_items(card.get("body", [])):
+        if item.get("id") == input_id:
+            item["value"] = str(value)
+
+def _format_prefill_list(value) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+def _build_prefilled_onboarding_card(profile: dict) -> dict:
+    """Build an edit-profile card using the onboarding schema and saved values."""
+    card = _build_onboarding_card()
+    body = card.get("body", [])
+    if body and body[0].get("type") == "TextBlock":
+        body[0]["text"] = "Update Your Profile"
+    if len(body) > 1 and body[1].get("type") == "TextBlock":
+        body[1]["text"] = "Review and update your saved preferences below."
+
+    academic = profile.get("academic", {})
+    financial = profile.get("financial", {})
+    nationality = academic.get("nationality", {})
+    preferences = profile.get("preferences", {})
+    modules_enabled = set(preferences.get("modules_enabled", ["scholarships", "events", "inbox"]))
+
+    input_values = {
+        "name": profile.get("name"),
+        "faculty": academic.get("faculty"),
+        "programme": academic.get("programme"),
+        "year_of_study": academic.get("year_of_study"),
+        "local_status": nationality.get("local_status"),
+        "gpa": academic.get("gpa"),
+        "financial_need_opt_in": str(bool(financial.get("financial_need_opt_in"))).lower(),
+        "interests": _format_prefill_list(profile.get("interests", [])),
+        "activities": _format_prefill_list(profile.get("activities", [])),
+        "module_scholarships": "true" if "scholarships" in modules_enabled else "false",
+        "module_events": "true" if "events" in modules_enabled else "false",
+        "module_inbox": "true" if "inbox" in modules_enabled else "false",
+        "notification_preference": preferences.get("notification_preference", "daily_morning")
+    }
+
+    for input_id, value in input_values.items():
+        _set_card_input_value(card, input_id, value)
+
+    for index, slot in enumerate(profile.get("timetable", {}).get("blocked_slots", [])[:3], start=1):
+        _set_card_input_value(card, f"class{index}_code", slot.get("label"))
+        _set_card_input_value(card, f"class{index}_day", slot.get("day"))
+        _set_card_input_value(card, f"class{index}_start", slot.get("start"))
+        _set_card_input_value(card, f"class{index}_end", slot.get("end"))
+
+    for action in card.get("actions", []):
+        if action.get("type") == "Action.Submit":
+            action["title"] = "Save profile changes"
+
+    return card
+
 # ---------------------------------------------------------------------------
 # Response builders
 # ---------------------------------------------------------------------------
@@ -500,6 +567,163 @@ def _format_time_value(value) -> str:
 def _looks_like_timetable_message(text: str) -> bool:
     return bool(re.search(r"\b[a-z]{3,5}\d{4}\b", text or "", re.IGNORECASE))
 
+PROFILE_UPDATE_SYSTEM_PROMPT = """You are an intelligent university campus agent. Analyze the user's message to determine their intent and extract relevant information.
+
+You can handle these main intents:
+1. "update_profile": Changing personal details. Valid fields: name, faculty, programme, year_of_study, local_status, gpa, financial_need, notification_preference, module_scholarships (bool), module_events (bool), module_inbox (bool).
+2. "update_interests": Adding or removing items from the user's 'interests' list.
+3. "update_activities": Adding or removing items from the user's 'activities' list.
+4. "add_timetable": Adding a class to their schedule (requires: course_code, day, start_time, end_time).
+
+Return ONLY a raw JSON object with this exact structure:
+{
+  "intent": "update_profile" | "update_interests" | "update_activities" | "add_timetable" | "unknown",
+  "extracted_data": { ...key-value pairs of what the user provided... },
+  "missing_fields": [ "list of fields still needed to complete the action" ],
+  "agent_response": "A natural, friendly response to the user. If there are missing_fields, ask them for the missing info. If the action is complete, confirm it."
+}
+
+Examples of expected behavior:
+- If the user says "add comp1111", intent is "add_timetable", extracted_data has course_code="COMP1111", missing_fields are ["day", "start_time", "end_time"]. agent_response should ask for the missing times.
+- If the user says "comp1111 at 10am", extracted_data has course_code="COMP1111", start_time="10:00", missing_fields are ["day", "end_time"].
+- If the user says "change faculty to business", map "business" to "Business and Economics". intent is "update_profile", extracted_data has faculty="Business and Economics", missing_fields is empty.
+- If the user says "add AI and robotics to my interests", intent is "update_interests", extracted_data has action="add", items=["AI", "robotics"].
+- If the user says "remove robotics from interests", intent is "update_interests", extracted_data has action="remove", items=["robotics"].
+- If the user says "turn off events but keep scholarships", intent is "update_profile", extracted_data has module_events=false, module_scholarships=true.
+- If the user says "change my name to Alex", intent is "update_profile", extracted_data has name="Alex".
+- If the user says "make my digest weekly", intent is "update_profile", extracted_data has notification_preference="weekly".
+- If you cannot understand the intent, return intent="unknown".
+- Capitalize field names in your agent_response (e.g. use "Faculty" instead of "faculty").
+"""
+
+def _parse_profile_update(text: str) -> dict:
+    response = openai_client.chat.completions.create(
+        model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+        messages=[
+            {"role": "system", "content": PROFILE_UPDATE_SYSTEM_PROMPT},
+            {"role": "user", "content": text}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0
+    )
+    return json.loads(response.choices[0].message.content)
+
+def _merge_timetable_data(existing: dict, new_data: dict) -> dict:
+    merged = dict(existing or {})
+    for key, value in (new_data or {}).items():
+        if value not in (None, ""):
+            merged[key] = value
+    return merged
+
+def _extract_timetable_fields_locally(text: str) -> dict:
+    data = {}
+    raw_text = text or ""
+    lowered = raw_text.lower()
+    day_aliases = {
+        "mon": "Monday",
+        "monday": "Monday",
+        "tue": "Tuesday",
+        "tues": "Tuesday",
+        "tuesday": "Tuesday",
+        "wed": "Wednesday",
+        "wednesday": "Wednesday",
+        "thu": "Thursday",
+        "thur": "Thursday",
+        "thurs": "Thursday",
+        "thursday": "Thursday",
+        "fri": "Friday",
+        "friday": "Friday"
+    }
+    for alias, day in day_aliases.items():
+        if re.search(rf"\b{alias}\b", lowered):
+            data["day"] = day
+            break
+
+    course_match = re.search(r"\b([a-z]{3,5}\d{4})\b", raw_text, re.IGNORECASE)
+    if course_match:
+        data["course_code"] = course_match.group(1).upper()
+
+    time_matches = re.findall(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b", lowered)
+    if time_matches:
+        data["start_time"] = _format_time_value(time_matches[0])
+    if len(time_matches) > 1:
+        data["end_time"] = _format_time_value(time_matches[1])
+    return data
+
+def _missing_timetable_fields(data: dict) -> list[str]:
+    required = {
+        "course_code": data.get("course_code"),
+        "day": data.get("day"),
+        "start_time": _format_time_value(data.get("start_time")),
+        "end_time": _format_time_value(data.get("end_time"))
+    }
+    return [field for field, value in required.items() if not str(value or "").strip()]
+
+def _timetable_missing_prompt(data: dict, missing_fields: list[str]) -> str:
+    course = str(data.get("course_code") or "that class").upper()
+    labels = {
+        "course_code": "course code",
+        "day": "day",
+        "start_time": "start time",
+        "end_time": "end time"
+    }
+    missing_text = ", ".join(labels.get(field, field) for field in missing_fields)
+    return f"I can add {course} to your timetable. Please send the missing {missing_text}."
+
+def _append_timetable_slot(profile: dict, data: dict) -> str:
+    course_code = str(data.get("course_code", "") or "").strip().upper()
+    day = str(data.get("day", "") or "").strip()
+    start_time = _format_time_value(data.get("start_time"))
+    end_time = _format_time_value(data.get("end_time"))
+    timetable = profile.setdefault("timetable", {})
+    blocked_slots = timetable.setdefault("blocked_slots", [])
+    blocked_slots.append({
+        "day": day,
+        "start": start_time,
+        "end": end_time,
+        "label": course_code
+    })
+    return f"Added {course_code} on {day} from {start_time} to {end_time} to your timetable."
+
+def _save_pending_timetable(profile: dict, data: dict, response_text: str | None = None) -> list:
+    missing_fields = _missing_timetable_fields(data)
+    profile["pending_action"] = "complete_timetable"
+    profile["pending_data"] = data
+    save_profile(profile)
+    return [_text_response(response_text or _timetable_missing_prompt(data, missing_fields))]
+
+def _clear_pending_state(profile: dict) -> None:
+    profile.pop("pending_action", None)
+    profile.pop("pending_data", None)
+
+def _handle_pending_timetable(profile: dict, text: str) -> list:
+    try:
+        parsed = {}
+        try:
+            parsed = _parse_profile_update(text)
+        except Exception as e:
+            logger.warning(f"Pending timetable parser fallback: {e}")
+        new_data = _merge_timetable_data(
+            parsed.get("extracted_data", {}) or {},
+            _extract_timetable_fields_locally(text)
+        )
+        data = _merge_timetable_data(profile.get("pending_data", {}), new_data)
+        missing_fields = _missing_timetable_fields(data)
+        if missing_fields:
+            return _save_pending_timetable(
+                profile,
+                data,
+                parsed.get("agent_response") or _timetable_missing_prompt(data, missing_fields)
+            )
+
+        message = _append_timetable_slot(profile, data)
+        _clear_pending_state(profile)
+        save_profile(profile)
+        return [_text_response(message)]
+    except Exception as e:
+        logger.error(f"Pending timetable update error: {e}")
+        return [_text_response("I had trouble completing that timetable update. Please send the class details again.")]
+
 def _apply_profile_update(profile: dict, field: str, value, operation: str = "set") -> None:
     operation = (operation or "set").lower()
     if field == "interests":
@@ -802,7 +1026,7 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         missing_fields.append("At least one module")
     if missing_fields:
         missing_text = "\n".join(f"• {field}" for field in missing_fields)
-        return [_text_response(f"⚠️ Please fill in these required fields:\n{missing_text}")]
+        return [_text_response(f"Please fill in these required fields:\n\n{missing_text}")]
 
     raw_gpa = form_data.get("gpa")
     gpa_missing = raw_gpa is None or str(raw_gpa).strip() == ""
@@ -869,10 +1093,9 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
     responses = [_text_response(
         f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences. "
         "What would you like to do now?\n\n"
-        "• Type 'digest' for your daily update\n"
-        "• Type 'scholarships' to browse matches\n"
-        "• Type 'help' to see all commands\n"
-        "• Type 'help' anytime to see these commands again"
+        "• Type 'digest' for your daily update\n\n"
+        "• Type 'scholarships' to browse matches\n\n"
+        "• Type 'help' to see all commands"
     )]
     return responses
 
@@ -1204,44 +1427,7 @@ def handle_generate_draft(student_id: str, form_data: dict) -> list:
 def handle_profile_update(student_id: str, text: str) -> list:
     """Uses OpenAI to parse natural language profile updates."""
     try:
-        system_prompt = """You are an intelligent university campus agent. Analyze the user's message to determine their intent and extract relevant information. 
-
-You can handle these main intents:
-1. "update_profile": Changing personal details. Valid fields: name, faculty, programme, year_of_study, local_status, gpa, financial_need, notification_preference, module_scholarships (bool), module_events (bool), module_inbox (bool).
-2. "update_interests": Adding or removing items from the user's 'interests' list.
-3. "update_activities": Adding or removing items from the user's 'activities' list.
-4. "add_timetable": Adding a class to their schedule (requires: course_code, day, start_time, end_time).
-
-Return ONLY a raw JSON object with this exact structure:
-{
-  "intent": "update_profile" | "update_interests" | "update_activities" | "add_timetable" | "unknown",
-  "extracted_data": { ...key-value pairs of what the user provided... },
-  "missing_fields": [ "list of fields still needed to complete the action" ],
-  "agent_response": "A natural, friendly response to the user. If there are missing_fields, ask them for the missing info. If the action is complete, confirm it."
-}
-
-Examples of expected behavior:
-- If the user says "add comp1111", intent is "add_timetable", extracted_data has course_code="COMP1111", missing_fields are ["day", "start_time", "end_time"]. agent_response should ask for the missing times.
-- If the user says "comp1111 at 10am", extracted_data has course_code="COMP1111", start_time="10:00", missing_fields are ["day", "end_time"].
-- If the user says "change faculty to business", map "business" to "Business and Economics". intent is "update_profile", extracted_data has faculty="Business and Economics", missing_fields is empty.
-- If the user says "add AI and robotics to my interests", intent is "update_interests", extracted_data has action="add", items=["AI", "robotics"].
-- If the user says "remove robotics from interests", intent is "update_interests", extracted_data has action="remove", items=["robotics"].
-- If the user says "turn off events but keep scholarships", intent is "update_profile", extracted_data has module_events=false, module_scholarships=true.
-- If the user says "change my name to Alex", intent is "update_profile", extracted_data has name="Alex".
-- If the user says "make my digest weekly", intent is "update_profile", extracted_data has notification_preference="weekly".
-- If you cannot understand the intent, return intent="unknown".
-- Capitalize field names in your agent_response (e.g. use "Faculty" instead of "faculty").
-"""
-        response = openai_client.chat.completions.create(
-            model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0
-        )
-        parsed = json.loads(response.choices[0].message.content)
+        parsed = _parse_profile_update(text)
         intent = parsed.get("intent", "unknown")
         extracted_data = parsed.get("extracted_data", {}) or {}
         missing_fields = parsed.get("missing_fields", []) or []
@@ -1249,12 +1435,15 @@ Examples of expected behavior:
 
         if intent == "unknown":
             return [_text_response(agent_response)]
-        if missing_fields:
-            return [_text_response(agent_response)]
 
         profile = get_profile(student_id)
         if not profile:
             return [_text_response("Please complete onboarding first.")]
+
+        if missing_fields:
+            if intent == "add_timetable":
+                return _save_pending_timetable(profile, extracted_data, agent_response)
+            return [_text_response(agent_response)]
 
         if intent == "update_profile":
             normalized_updates = {}
@@ -1331,22 +1520,12 @@ Examples of expected behavior:
             )]
 
         if intent == "add_timetable":
-            course_code = str(extracted_data.get("course_code", "") or "").strip().upper()
-            day = str(extracted_data.get("day", "") or "").strip()
-            start_time = _format_time_value(extracted_data.get("start_time"))
-            end_time = _format_time_value(extracted_data.get("end_time"))
-            if not all([course_code, day, start_time, end_time]):
-                return [_text_response(agent_response)]
-            timetable = profile.setdefault("timetable", {})
-            blocked_slots = timetable.setdefault("blocked_slots", [])
-            blocked_slots.append({
-                "day": day,
-                "start": start_time,
-                "end": end_time,
-                "label": course_code
-            })
+            missing_timetable_fields = _missing_timetable_fields(extracted_data)
+            if missing_timetable_fields:
+                return _save_pending_timetable(profile, extracted_data, agent_response)
+            message = _append_timetable_slot(profile, extracted_data)
             save_profile(profile)
-            return [_text_response(f"Added {course_code} on {day} from {start_time} to {end_time} to your timetable.")]
+            return [_text_response(message)]
 
         return [_text_response(agent_response)]
 
@@ -1385,9 +1564,22 @@ def handle_message(student_id: str, message: dict) -> list:
     activity_type = message.get("type", "message")
     text          = (message.get("text") or " ").strip().lower()
     value         = message.get("value") or {}
-    action        = value.get("action", " ")
+    action        = str(value.get("action", " "))
+    profile       = get_profile(student_id)
+    is_edit       = bool(message.get("is_edit"))
 
     logger.info(f"Message from {student_id}: type={activity_type} action={action} text={text[:50]}")
+
+    if (
+        is_edit
+        and profile
+        and profile.get("onboarding_complete")
+        and not profile.get("pending_action")
+    ):
+        return [_text_response("For security, I cannot process edits to previous messages. Please send a new message instead.")]
+
+    if profile and profile.get("pending_action") == "complete_timetable" and not action.strip():
+        return _handle_pending_timetable(profile, message.get("text") or "")
 
     # ─ Adaptive Card submissions ────────────────────────────────────────────
     if action == "onboarding_submit":
@@ -1418,7 +1610,9 @@ def handle_message(student_id: str, message: dict) -> list:
         return [_text_response("No problem — I cancelled that profile change.")]
 
     if action == "edit_profile":
-        return [_card_response("Update your profile below:", _build_onboarding_card())]
+        if profile:
+            return [_card_response("Update your profile below:", _build_prefilled_onboarding_card(profile))]
+        return [_card_response("Please complete onboarding first.", _build_onboarding_card())]
 
     if action == "semester_refresh_submit":
         return handle_semester_refresh(student_id, value)
@@ -1491,7 +1685,12 @@ def handle_message(student_id: str, message: dict) -> list:
         return [_text_response("No email ID provided to restore.")]
 
     # ── Text messages ────────────────────────────────────────────────────────
-    if any(kw in text for kw in ["show my profile", "my settings", "what do you know about me", "view profile"]):
+    if any(kw in text for kw in ["edit profile", "my settings"]):
+        if profile:
+            return [_card_response("Update your profile below:", _build_prefilled_onboarding_card(profile))]
+        return [_card_response("Please complete onboarding first.", _build_onboarding_card())]
+
+    if any(kw in text for kw in ["show my profile", "what do you know about me", "view profile"]):
         return [_profile_card_response(student_id)]
 
     if any(kw in text for kw in ["help", "commands", "what can you do"]):
@@ -1508,7 +1707,6 @@ def handle_message(student_id: str, message: dict) -> list:
     if "upload cv" in text or text == "cv":
         return [_text_response("Please attach your PDF CV to the chat first, then type CV again.")]
 
-    profile = get_profile(student_id)
     if profile and profile.get("last_scholarship_id") and text:
         digest_terms = ["digest", "update", "what's new", "show me", "scholarships", "opportunities", "events", "inbox"]
         help_terms = ["hello", "hi", "hey", "start", "help"]
@@ -1536,8 +1734,7 @@ def handle_message(student_id: str, message: dict) -> list:
         else:
             return handle_get_digest(student_id)
 
-    # Default — return digest
-    profile = get_profile(student_id)
+    # Default — onboard new users, otherwise ask for clarification.
     if not profile or not profile.get("onboarding_complete"):
         card = _build_onboarding_card()
         return [_card_response(
@@ -1546,7 +1743,10 @@ def handle_message(student_id: str, message: dict) -> list:
             card
         )]
 
-    return handle_get_digest(student_id)
+    return [_text_response(
+        "I didn't quite understand that.\n\n"
+        "Did you mean to update your profile, add a class to your timetable, or see your daily digest?"
+    )]
 
 # ---------------------------------------------------------------------------
 # Local test

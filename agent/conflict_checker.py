@@ -89,6 +89,7 @@ def check_session_conflicts(
                 conflicts.append({
                     "type":          "session_conflict",
                     "day":           slot.get("day"),
+                    "class_code":    t_label,
                     "event_session": f"{s_label} ({s_start}–{s_end})",
                     "clashes_with":  f"{t_label} ({t_start}–{t_end})",
                     "message": (
@@ -219,7 +220,9 @@ def run_conflict_check(event: dict, profile: dict) -> dict:
     blocked_slots    = timetable.get("blocked_slots", [])
     upcoming_deadlines = timetable.get("upcoming_deadlines", [])
 
-    event_sessions   = event.get("event_sessions", [])
+    event_sessions   = event.get("event_sessions") or []
+    if not isinstance(event_sessions, list):
+        event_sessions = []
     event_deadline   = event.get("deadline")
 
     flags = []
@@ -240,7 +243,7 @@ def run_conflict_check(event: dict, profile: dict) -> dict:
     # Build a single human-readable calendar note for the digest
     notes = []
     for f in session_conflicts:
-        notes.append(f["message"])
+        notes.append(f"⚠️ This event clashes with your {f.get('class_code', 'class')} on {f.get('day', 'that day')}")
     if dl_warning:
         notes.append(dl_warning["message"])
 
@@ -254,7 +257,16 @@ def run_conflict_checks_batch(events: list, profile: dict) -> list:
     Run conflict checks on a list of matched events.
     Returns events sorted by: no conflict first, then deadline ascending.
     """
-    checked = [run_conflict_check(e, profile) for e in events]
+    checked = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+
+        event_sessions = event.get("event_sessions")
+        if not isinstance(event_sessions, list):
+            event["event_sessions"] = []
+
+        checked.append(run_conflict_check(event, profile))
 
     def sort_key(e):
         has_conflict = 1 if e.get("has_conflict") else 0
