@@ -792,6 +792,39 @@ def _profile_update_confirmation_card(field: str, old_value, new_value, operatio
     }
     return _card_response("Please confirm this profile change:", card)
 
+def _scholarship_identifier(scholarship: dict) -> str:
+    return str(
+        scholarship.get("scholarship_id")
+        or scholarship.get("id")
+        or scholarship.get("source_id")
+        or ""
+    ).strip()
+
+def _is_internal_scholarship(scholarship: dict) -> bool:
+    return _scholarship_identifier(scholarship).startswith("ss_")
+
+def _scholarship_source_label(scholarship: dict) -> str:
+    return "HKU Internal" if _is_internal_scholarship(scholarship) else "External Opportunity"
+
+def _scholarship_url(scholarship: dict) -> str:
+    scholarship_id = _scholarship_identifier(scholarship)
+    if scholarship_id.startswith("ss_"):
+        return f"https://scholar.aas.hku.hk/?action=showonesscheme&ss_id={scholarship_id}"
+    return (
+        scholarship.get("source_url")
+        or scholarship.get("application_url")
+        or scholarship.get("url")
+        or ""
+    )
+
+def _append_scholarship_cards(responses: list, scholarships: list, tier: str, offset: int = 0, limit: int = 3) -> None:
+    for card in _scholarship_cards(scholarships[offset:offset + limit], tier):
+        responses.append({
+            "type": "message",
+            "text": "Scholarship match" if tier == "apply_now" else "Scholarship to prepare",
+            "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
+        })
+
 def _scholarship_cards(scholarships: list, tier: str) -> list:
     """Build a list of Adaptive Card attachments for scholarship results."""
     cards = []
@@ -799,6 +832,7 @@ def _scholarship_cards(scholarships: list, tier: str) -> list:
         is_open   = s.get("is_open", False)
         strength  = s.get("match_strength", "partial")
         strength_emoji = "🟢" if strength == "strong" else "🟡"
+        source_label = _scholarship_source_label(s)
 
         body = [
             {
@@ -810,6 +844,7 @@ def _scholarship_cards(scholarships: list, tier: str) -> list:
             {
                 "type": "FactSet",
                 "facts": [
+                    {"title": "Source",    "value": source_label},
                     {"title": "Match",     "value": strength.capitalize()},
                     {"title": "Deadline",  "value": s.get("deadline_raw", "See scholarship page")},
                     {"title": "Reason",    "value": s.get("reason", " ")},
@@ -857,11 +892,13 @@ def _scholarship_cards(scholarships: list, tier: str) -> list:
                 }
             })
 
-        actions.append({
-            "type": "Action.OpenUrl",
-            "title": "View Scholarship",
-            "url": s.get("application_url", "https://aas.hku.hk/apply-scholarships/")
-        })
+        scholarship_url = _scholarship_url(s)
+        if scholarship_url:
+            actions.append({
+                "type": "Action.OpenUrl",
+                "title": "View Scholarship",
+                "url": scholarship_url
+            })
 
         card = {
             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -1026,7 +1063,7 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         missing_fields.append("At least one module")
     if missing_fields:
         missing_text = "\n".join(f"• {field}" for field in missing_fields)
-        return [_text_response(f"Please fill in these required fields:\n\n{missing_text}")]
+        return [_text_response(f"⚠️ Please fill in these required fields:\n{missing_text}")]
 
     raw_gpa = form_data.get("gpa")
     gpa_missing = raw_gpa is None or str(raw_gpa).strip() == ""
@@ -1093,9 +1130,11 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
     responses = [_text_response(
         f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences. "
         "What would you like to do now?\n\n"
-        "• Type 'digest' for your daily update\n\n"
-        "• Type 'scholarships' to browse matches\n\n"
-        "• Type 'help' to see all commands"
+        "• Type 'digest' for your daily update\n"
+        "• Type 'scholarships' to browse matches\n"
+        "• Type 'events' to see upcoming competitions and events\n"
+        "• Type 'inbox' to review your archived emails\n"
+        "• Type 'help' anytime to see all commands"
     )]
     return responses
 
@@ -1167,24 +1206,24 @@ def handle_get_digest(student_id: str) -> list:
     responses = [_text_response(format_digest_message(digest))]
 
     # Scholarship cards — apply now
-    if digest["scholarships"]["apply_now"]:
-        responses.append(_text_response("**📋 Scholarships — Apply Now:**"))
-        for card in _scholarship_cards(digest["scholarships"]["apply_now"], "apply_now"):
-            responses.append({
-                "type": "message",
-                "text": "Scholarship match",
-                "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
-            })
+    apply_now = digest["scholarships"]["apply_now"]
+    if apply_now:
+        responses.append(_text_response("**📋 Apply Now**"))
+        _append_scholarship_cards(responses, apply_now, "apply_now", limit=3)
+        if len(apply_now) > 3:
+            responses.append(_text_response(
+                f"Showing 3 of {len(apply_now)} scholarships. Type 'show more scholarships' to see the rest."
+            ))
 
     # Scholarship cards — prepare
-    if digest["scholarships"]["prepare"]:
-        responses.append(_text_response("** Scholarships — Prepare Now:**"))
-        for card in _scholarship_cards(digest["scholarships"]["prepare"][:3], "prepare"):
-            responses.append({
-                "type": "message",
-                "text": "Scholarship to prepare",
-                "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
-            })
+    prepare = digest["scholarships"]["prepare"]
+    if prepare:
+        responses.append(_text_response("**🗓️ Prepare For**"))
+        _append_scholarship_cards(responses, prepare, "prepare", limit=3)
+        if len(prepare) > 3:
+            responses.append(_text_response(
+                f"Showing 3 of {len(prepare)} scholarships. Type 'show more scholarships' to see the rest."
+            ))
 
     # Event cards — urgent
     if digest["events"]["urgent"]:
@@ -1210,6 +1249,38 @@ def handle_get_digest(student_id: str) -> list:
             ]
         })
 
+    return responses
+
+def handle_show_more_scholarships(student_id: str) -> list:
+    """Render scholarship cards beyond the first digest batch."""
+    profile = get_profile(student_id)
+    if not profile:
+        return [_card_response("I don't have your profile yet. Let's get you set up:", _build_onboarding_card())]
+
+    modules = profile.get("preferences", {}).get("modules_enabled", ["scholarships", "events", "inbox"])
+    if "scholarships" not in modules:
+        return [_text_response("Scholarship matching is currently turned off in your profile settings.")]
+
+    try:
+        scholarship_result = run_matching(student_id)
+    except Exception as e:
+        logger.error(f"Show more scholarship matching error: {e}")
+        return [_text_response("I had trouble loading more scholarships. Please try again later.")]
+
+    responses = []
+    apply_now = scholarship_result.get("apply_now", [])
+    prepare = scholarship_result.get("prepare", [])
+
+    if len(apply_now) > 3:
+        responses.append(_text_response("**📋 More Apply Now Scholarships**"))
+        _append_scholarship_cards(responses, apply_now, "apply_now", offset=3, limit=10)
+
+    if len(prepare) > 3:
+        responses.append(_text_response("**🗓️ More Scholarships To Prepare For**"))
+        _append_scholarship_cards(responses, prepare, "prepare", offset=3, limit=10)
+
+    if not responses:
+        return [_text_response("You're already seeing all current scholarship matches.")]
     return responses
 
 def _normalize_question_items(questions: list) -> list[dict]:
@@ -1695,6 +1766,9 @@ def handle_message(student_id: str, message: dict) -> list:
 
     if any(kw in text for kw in ["help", "commands", "what can you do"]):
         return [_help_card_response()]
+
+    if "show more scholarships" in text:
+        return handle_show_more_scholarships(student_id)
 
     update_terms = [
         "change my", "update my", "set my", "add to my", "remove from my",

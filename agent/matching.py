@@ -117,7 +117,6 @@ def _stage1_search(profile: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
-    
     """
     One GPT-4o call to reason over all candidates.
     Returns qualified and near-miss scholarships with reasons.
@@ -145,68 +144,92 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
         "upcoming_deadlines": profile.get("timetable", {}).get("upcoming_deadlines", []),
     }
 
-    # Build compact scholarship list for the prompt
-    scholarship_list = []
-    for c in candidates:
-        scholarship_list.append({
-            "id":               c.get("id"),
-            "name":             c.get("name"),
-            "faculty":          c.get("faculty"),
-            "level":            c.get("level"),
-            "year_of_study":    c.get("year_of_study"),
-            "nationality":      c.get("nationality"),
-            "gpa_requirement":  c.get("gpa_requirement"),
-            "financial_need":   c.get("financial_need"),
-            "merit_based":      c.get("merit_based"),
-            "is_entrance":      c.get("is_entrance"),
-            "is_enrichment":    c.get("is_enrichment"),
-            "amount":           f"{c.get('amount', '')} {c.get('currency', 'HKD')}",
-            "provider":         c.get("provider"),
-            "is_open":          c.get("is_open", False),
-            "deadline_raw":     c.get("deadline_raw", ""),
-            "deadline_iso":     c.get("deadline_iso"),
-            "application_method": c.get("application_method", ""),
-            "eligibility_raw":  c.get("eligibility_raw", "")[:400],  # cap to save tokens
-        })
+    def candidate_payload(candidate: dict) -> dict:
+        return {
+            "id":               candidate.get("id"),
+            "name":             candidate.get("name"),
+            "faculty":          candidate.get("faculty"),
+            "level":            candidate.get("level"),
+            "year_of_study":    candidate.get("year_of_study"),
+            "nationality":      candidate.get("nationality"),
+            "gpa_requirement":  candidate.get("gpa_requirement"),
+            "financial_need":   candidate.get("financial_need"),
+            "merit_based":      candidate.get("merit_based"),
+            "is_entrance":      candidate.get("is_entrance"),
+            "is_enrichment":    candidate.get("is_enrichment"),
+            "amount":           f"{candidate.get('amount', '')} {candidate.get('currency', 'HKD')}",
+            "provider":         candidate.get("provider"),
+            "is_open":          candidate.get("is_open", False),
+            "deadline_raw":     candidate.get("deadline_raw", ""),
+            "deadline_iso":     candidate.get("deadline_iso"),
+            "application_method": candidate.get("application_method", ""),
+            "application_url":  candidate.get("application_url"),
+            "source_url":       candidate.get("source_url"),
+            "submission_materials": candidate.get("submission_materials"),
+            "eligibility_raw":  candidate.get("eligibility_raw", "")[:400],
+        }
 
-    prompt = PROMPT_TEMPLATE.format(
-        student_profile=json.dumps(profile_summary, indent=2, ensure_ascii=False),
-        scholarship_candidates=json.dumps(scholarship_list, indent=2, ensure_ascii=False)
-    )
-
-    try:
-        response = openai_client.chat.completions.create(
-            model=DEPLOYMENT,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=6000,
-            temperature=0.1  # low temperature for consistent structured output
-        )
-        raw = response.choices[0].message.content
-
-        # The prompt asks for a JSON array but response_format forces an object
-        # Wrap handling for both cases
+    def parse_stage2_raw(raw: str) -> list[dict]:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
-            results = parsed
-        elif isinstance(parsed, dict):
-            # GPT sometimes wraps in {"results": [...]} or {"scholarships": [...]}
-            results = next(
-                (v for v in parsed.values() if isinstance(v, list)),
-                []
+            return parsed
+        if isinstance(parsed, dict):
+            return next((v for v in parsed.values() if isinstance(v, list)), [])
+        return []
+
+    def enrich_results(results: list[dict], batch: list[dict]) -> list[dict]:
+        candidate_lookup = {str(c.get("id")): c for c in batch if c.get("id")}
+        enriched = []
+        for result in results:
+            scholarship_id = str(result.get("scholarship_id") or result.get("id") or "")
+            candidate = candidate_lookup.get(scholarship_id, {})
+            merged = {
+                **candidate,
+                **result,
+                "scholarship_id": scholarship_id or candidate.get("id"),
+                "application_url": result.get("application_url") or candidate.get("application_url"),
+                "source_url": result.get("source_url") or candidate.get("source_url"),
+                "submission_materials": result.get("submission_materials") or candidate.get("submission_materials"),
+            }
+            enriched.append(merged)
+        return enriched
+
+    def run_batch(batch: list[dict], allow_retry: bool = True) -> list[dict]:
+        scholarship_list = [candidate_payload(c) for c in batch]
+        prompt = PROMPT_TEMPLATE.format(
+            student_profile=json.dumps(profile_summary, indent=2, ensure_ascii=False),
+            scholarship_candidates=json.dumps(scholarship_list, indent=2, ensure_ascii=False)
+        )
+
+        raw = ""
+        finish_reason = None
+        try:
+            response = openai_client.chat.completions.create(
+                model=DEPLOYMENT,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=6000,
+                temperature=0.1
             )
-        else:
-            results = []
+            choice = response.choices[0]
+            raw = choice.message.content or ""
+            finish_reason = getattr(choice, "finish_reason", None)
+            results = parse_stage2_raw(raw)
+            return enrich_results(results, batch)
+        except json.JSONDecodeError as e:
+            logger.error(f"Stage 2 JSON parse error: {e}; finish_reason={finish_reason}")
+            logger.error(f"Raw Stage 2 response was: {raw!r}")
+            if allow_retry and len(batch) > 1:
+                midpoint = max(1, len(batch) // 2)
+                logger.info(f"Retrying Stage 2 in smaller batches: {midpoint} and {len(batch) - midpoint}")
+                return run_batch(batch[:midpoint], allow_retry=False) + run_batch(batch[midpoint:], allow_retry=False)
+            return []
+        except Exception as e:
+            logger.error(f"Stage 2 OpenAI error: {e}")
+            return []
 
-        logger.info(f"Stage 2: {len(results)} matches/near-misses returned")
-        return results
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Stage 2 JSON parse error: {e}")
-        logger.error(f"Raw response was: '{raw[:500]}'")
-        return []
-    except Exception as e:
-        logger.error(f"Stage 2 OpenAI error: {e}")
-        return []
+    results = run_batch(candidates)
+    logger.info(f"Stage 2: {len(results)} matches/near-misses returned")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -214,17 +237,41 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _sort_and_package(matches: list, near_misses: list) -> dict:
-    from datetime import date
-
     apply_now = []
     prepare   = []
 
-    # Separate open vs not open from full matches
+    today = date.today()
+
+    def days_until_deadline(item: dict) -> int | None:
+        deadline = item.get("deadline_iso")
+        if not deadline:
+            return None
+        try:
+            return (date.fromisoformat(str(deadline)[:10]) - today).days
+        except ValueError:
+            return None
+
+    def requires_preparation(item: dict) -> bool:
+        materials = item.get("submission_materials") or item.get("application_notes") or ""
+        if isinstance(materials, list):
+            materials_text = " ".join(str(part) for part in materials)
+        else:
+            materials_text = str(materials)
+        materials_text = materials_text.lower()
+        return any(keyword in materials_text for keyword in ("cv", "reference", "referee", "transcript", "proposal"))
+
+    # Apply Now is strictly open and due within 30 days; later/prep-heavy items go into Prepare.
     for m in matches:
-        if m.get("is_open"):
+        days_left = days_until_deadline(m)
+        if (
+            m.get("is_open")
+            and days_left is not None
+            and 0 <= days_left <= 30
+            and not requires_preparation(m)
+        ):
             apply_now.append(m)
         else:
-            m["tier"] = "eligible_not_open"
+            m["tier"] = "prepare"
             prepare.append(m)
 
     # Near misses always go into prepare with their gap info
@@ -239,10 +286,11 @@ def _sort_and_package(matches: list, near_misses: list) -> dict:
         strength_order.get(m.get("match_strength", "partial"), 1)
     ))
 
-    # Sort prepare: strength first, then near_miss after eligible_not_open
-    tier_order = {"eligible_not_open": 0, "near_miss": 1}
+    # Sort prepare: eligible items first, then near_miss; earlier deadlines first.
+    tier_order = {"prepare": 0, "eligible_not_open": 0, "near_miss": 1}
     prepare.sort(key=lambda m: (
         tier_order.get(m.get("tier", "eligible_not_open"), 0),
+        m.get("deadline_iso") or "9999-12-31",
         strength_order.get(m.get("match_strength", "partial"), 1)
     ))
 

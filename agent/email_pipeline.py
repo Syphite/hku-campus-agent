@@ -14,7 +14,7 @@ def run_inbox_pipeline(student_id: str, profile: dict = None) -> dict:
     Returns structured summary for digest.py.
     """
     profile = profile or {}
-    user_email = profile.get("email") or USER_EMAIL
+    user_email = USER_EMAIL or profile.get("email")
     emails  = get_unread_emails(user_email)
     processed_email_ids = profile.get("processed_email_ids", [])
     if not isinstance(processed_email_ids, list):

@@ -49,8 +49,8 @@ def assemble_digest(
     """
 
     # ── Scholarships ────────────────────────────────────────────────────────
-    apply_now = scholarship_result.get("apply_now", [])
-    prepare   = scholarship_result.get("prepare", [])
+    apply_now = list(scholarship_result.get("apply_now", []))
+    prepare   = list(scholarship_result.get("prepare", []))
 
     # ── Events ──────────────────────────────────────────────────────────────
     # Split into: apply now (has deadline within 30 days or no deadline)
@@ -61,18 +61,46 @@ def assemble_digest(
     urgent_events  = []
     upcoming_events = []
 
+    def external_scholarship_from_event(event: dict, days_left: int | None) -> dict:
+        return {
+            "scholarship_id": event.get("source_id") or event.get("id") or event.get("title"),
+            "name": event.get("title", "External scholarship opportunity"),
+            "match_strength": "partial",
+            "reason": event.get("summary", "External opportunity matched from event feeds."),
+            "deadline_raw": event.get("deadline") or "See opportunity page",
+            "deadline_iso": event.get("deadline"),
+            "is_open": days_left is None or days_left >= 0,
+            "source_url": event.get("source_url"),
+            "application_url": event.get("source_url"),
+            "application_notes": event.get("eligibility"),
+            "calendar_note": event.get("calendar_note"),
+        }
+
     for e in events:
+        if not isinstance(e, dict):
+            continue
+        event_sessions = e.get("event_sessions")
+        if not isinstance(event_sessions, list):
+            e["event_sessions"] = []
         dl = e.get("deadline")
+        days_left = None
         if dl:
             try:
-                dl_date = date.fromisoformat(dl)
+                dl_date = date.fromisoformat(str(dl)[:10])
                 days_left = (dl_date - today).days
-                if days_left <= 30:
-                    urgent_events.append(e)
-                else:
-                    upcoming_events.append(e)
             except ValueError:
-                upcoming_events.append(e)
+                days_left = None
+
+        if str(e.get("type", "")).lower() == "scholarship":
+            external_scholarship = external_scholarship_from_event(e, days_left)
+            if days_left is not None and 0 <= days_left <= 30:
+                apply_now.append(external_scholarship)
+            else:
+                prepare.append(external_scholarship)
+            continue
+
+        if days_left is not None and days_left <= 30:
+            urgent_events.append(e)
         else:
             upcoming_events.append(e)
 
@@ -155,7 +183,7 @@ def format_digest_message(digest: dict) -> str:
     if s["events_urgent"] > 0:
         lines.append(
             f"🏆 **{s['events_urgent']} event(s) with upcoming deadlines** — "
-            f"competitions, talks, and opportunities closing soon."
+            f"competitions and events closing soon."
         )
     if s["events_upcoming"] > 0:
         lines.append(

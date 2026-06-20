@@ -37,7 +37,7 @@ For each item, extract the following fields. If a field is not mentioned, use nu
 - title: clean, concise event name
 - organiser: who is running it
 - deadline: application/registration deadline as ISO date YYYY-MM-DD (or null)
-- event_sessions: list of recurring session times if mentioned (e.g., [{"day": "Tuesday", "start": "14:", "end": "17:00", "label": "Team sessions"}])
+- event_sessions: list of recurring session times if mentioned (e.g., [{{"day": "Tuesday", "start": "14:00", "end": "17:00", "label": "Team sessions"}}])
 - eligibility: plain English description of who can apply
 - faculty_relevant: list of relevant faculties (e.g., ["Engineering", "all"])
 - year_relevant: list of eligible years (e.g., ["1", "2", "3", "4", "all"])
