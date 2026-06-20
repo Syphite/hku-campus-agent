@@ -13,14 +13,14 @@ Two-stage scholarship matching:
 import os
 import json
 import logging
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from typing import Optional
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 
-from agent.profile import get_profile
+from agent.profile import get_profile, save_profile
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -182,6 +182,50 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
 
         return True
 
+    def scholarship_identifier(item: dict) -> str:
+        return str(item.get("scholarship_id") or item.get("id") or item.get("name") or "unknown")
+
+    def combined_requirement_text(item: dict) -> str:
+        parts = [
+            item.get("name", ""),
+            item.get("eligibility_raw", ""),
+            item.get("application_method", ""),
+            item.get("reason", ""),
+            item.get("gap", ""),
+        ]
+        materials = item.get("submission_materials")
+        if isinstance(materials, list):
+            parts.extend(str(part) for part in materials)
+        else:
+            parts.append(str(materials or ""))
+        return " ".join(str(part or "") for part in parts).lower()
+
+    def source_requirement_text(item: dict) -> str:
+        parts = [
+            item.get("eligibility_raw", ""),
+            item.get("application_method", ""),
+            item.get("name", ""),
+        ]
+        materials = item.get("submission_materials")
+        if isinstance(materials, list):
+            parts.extend(str(part) for part in materials)
+        else:
+            parts.append(str(materials or ""))
+        return " ".join(str(part or "") for part in parts).lower()
+
+    def remove_unsupported_application_notes(item: dict) -> None:
+        note = str(item.get("application_notes") or "").strip()
+        if not note:
+            return
+        note_text = note.lower()
+        source_text = source_requirement_text(item)
+        requirement_terms = ("reference", "referee", "interview", "essay", "personal statement", "portfolio")
+        if any(term in note_text for term in requirement_terms) and not any(term in source_text for term in requirement_terms):
+            logger.info(
+                f"Removed unsupported application note for {scholarship_identifier(item)}: {note}"
+            )
+            item["application_notes"] = None
+
     def has_non_closeable_gap(item: dict) -> bool:
         gap_text = str(item.get("gap") or "").strip().lower()
         if not gap_text or gap_text in ("none", "null", "n/a"):
@@ -193,21 +237,88 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
             "non-local", "local status", "gpa below", "below requirement",
             "postgraduate only", "undergraduate only", "publication",
             "published paper", "patent", "certification", "national award",
-            "international award", "not eligible", "does not meet"
+            "international award", "not eligible", "does not meet",
+            "exchange student", "exchange status", "specific programme",
+            "specific program", "not enrolled", "not a resident", "not from",
+            "college", "school requirement"
         )
-        return True if gap_text else any(term in gap_text for term in non_closeable_terms)
+        return any(term in gap_text for term in non_closeable_terms)
+
+    def programme_keywords(text: str) -> set[str]:
+        text = text.lower()
+        keyword_groups = {
+            "surveying": ("surveying", "surveyor", "real estate", "urban planning"),
+            "architecture": ("architecture", "architectural studies", "architectural"),
+            "civil engineering": ("civil engineering", "civil engineer"),
+            "computer science": ("computer science", "computing", "data science", "artificial intelligence", "ai"),
+            "medicine": ("medicine", "medical", "mbbs", "clinical"),
+            "law": ("law", "legal", "llb"),
+            "business": ("business", "economics", "finance", "accounting", "bba"),
+            "engineering": ("engineering", "engineer"),
+            "education": ("education", "teaching"),
+            "social sciences": ("social sciences", "social science", "psychology", "sociology"),
+            "arts": ("arts", "humanities", "literature", "linguistics", "history"),
+            "science": ("science", "physics", "chemistry", "biology", "mathematics"),
+            "dentistry": ("dentistry", "dental"),
+        }
+        found = set()
+        for label, keywords in keyword_groups.items():
+            if any(keyword in text for keyword in keywords):
+                found.add(label)
+        return found
+
+    def deterministic_program_match(item: dict) -> str:
+        student_programme = str(academic.get("programme", "")).lower()
+        student_faculty = str(academic.get("faculty", "")).lower()
+        result_program_match = str(item.get("program_match") or "").strip().lower()
+        if result_program_match in ("exact", "faculty_only", "mismatch"):
+            return result_program_match
+
+        text = combined_requirement_text(item)
+        scholarship_programmes = programme_keywords(text)
+        student_programmes = programme_keywords(student_programme)
+
+        if scholarship_programmes and student_programmes.intersection(scholarship_programmes):
+            return "exact"
+        if scholarship_programmes:
+            return "mismatch"
+        if student_faculty and student_faculty in text:
+            return "faculty_only"
+        return "faculty_only"
+
+    def is_programme_specific_mismatch(item: dict) -> bool:
+        text = combined_requirement_text(item)
+        scholarship_programmes = programme_keywords(text)
+        if not scholarship_programmes:
+            return False
+        student_programmes = programme_keywords(str(academic.get("programme", "")))
+        return not student_programmes.intersection(scholarship_programmes)
 
     def strict_result_filter(results: list[dict]) -> list[dict]:
         strict_results = []
         for result in results:
+            scholarship_id = scholarship_identifier(result)
             if result.get("qualifies") is not True:
                 continue
             if str(result.get("match_strength", "")).lower() != "strong":
                 continue
             if has_non_closeable_gap(result):
+                logger.info(f"Filtered out {scholarship_id}: hard requirement mismatch - {result.get('gap')}")
                 continue
             if not core_requirements_met(result):
+                logger.info(f"Filtered out {scholarship_id}: hard requirement mismatch - core requirements not met")
                 continue
+            program_match = deterministic_program_match(result)
+            result["program_match"] = program_match
+            if program_match not in ("exact", "faculty_only"):
+                logger.info(f"Filtered out {scholarship_id}: hard requirement mismatch - program_match={program_match}")
+                continue
+            if program_match == "faculty_only" and is_programme_specific_mismatch(result):
+                logger.info(
+                    f"Filtered out {scholarship_id}: hard requirement mismatch - specific programme requirement"
+                )
+                continue
+            remove_unsupported_application_notes(result)
             strict_results.append(result)
         return strict_results
 
@@ -343,7 +454,9 @@ def _sort_and_package(matches: list) -> dict:
 
     # Sort apply_now: deadline ascending then strength
     strength_order = {"strong": 0}
+    program_order = {"exact": 0, "faculty_only": 1}
     apply_now.sort(key=lambda m: (
+        program_order.get(m.get("program_match", "faculty_only"), 1),
         m.get("deadline_iso") or "9999-12-31",
         strength_order.get(m.get("match_strength", "strong"), 1)
     ))
@@ -351,6 +464,7 @@ def _sort_and_package(matches: list) -> dict:
     # Sort prepare: earlier deadlines first, then strength.
     tier_order = {"prepare": 0}
     prepare.sort(key=lambda m: (
+        program_order.get(m.get("program_match", "faculty_only"), 1),
         tier_order.get(m.get("tier", "prepare"), 0),
         m.get("deadline_iso") or "9999-12-31",
         strength_order.get(m.get("match_strength", "strong"), 1)
@@ -378,12 +492,26 @@ def run_matching(student_id: str) -> dict:
         logger.error(f"Profile not found: {student_id}")
         return {"error": f"Profile not found: {student_id}"}
 
+    cache = profile.get("scholarship_cache") or {}
+    cached_result = cache.get("result")
+    cached_timestamp = cache.get("timestamp")
+    if cached_result and cached_timestamp:
+        try:
+            cached_at = datetime.fromisoformat(str(cached_timestamp).replace("Z", "+00:00"))
+            if cached_at.tzinfo is None:
+                cached_at = cached_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - cached_at < timedelta(hours=1):
+                logger.info(f"Using cached scholarship matches for {student_id}")
+                return cached_result
+        except (TypeError, ValueError):
+            logger.warning(f"Ignoring invalid scholarship cache timestamp for {student_id}")
+
     logger.info(f"Running matching for {profile.get('name', student_id)}...")
 
     candidates = _stage1_search(profile)
     if not candidates:
         logger.warning("No candidates from Stage 1 — check index has data")
-        return {
+        result = {
             "apply_now": [],
             "prepare": [],
             "apply_now_count": 0,
@@ -391,6 +519,12 @@ def run_matching(student_id: str) -> dict:
             "student_id": student_id,
             "student_name": profile.get("name", "")
         }
+        profile["scholarship_cache"] = {
+            "result": result,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        save_profile(profile)
+        return result
 
     matches     = _stage2_reasoning(profile, candidates)
     matched     = [
@@ -400,6 +534,11 @@ def run_matching(student_id: str) -> dict:
     result      = _sort_and_package(matched)
     result["student_id"]   = student_id
     result["student_name"] = profile.get("name", "")
+    profile["scholarship_cache"] = {
+        "result": result,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    save_profile(profile)
     return result
 
 

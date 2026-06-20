@@ -25,6 +25,12 @@ SCHOLARSHIP CANDIDATES:
 IMPORTANT: Be conservative. If the student is missing any core requirement,
 do not include the scholarship in the output.
 
+IMPORTANT: Only include information that is explicitly mentioned in the
+scholarship data. Do NOT hallucinate or infer requirements like reference
+letters, interviews, essays, portfolios, or extra documents unless they are
+clearly stated in the source data. If you are unsure about a requirement, set
+that field to null.
+
 ---
 
 RUBRIC — only output strong matches:
@@ -51,6 +57,22 @@ DISQUALIFIED — do not include in output at all:
   the student is not part of
 - Any missing requirement that cannot realistically be fixed before application
 
+PROGRAMME MATCHING:
+- For each scholarship, determine program_match:
+  * "exact" if the scholarship is specifically for the student's programme
+    or the student's programme clearly matches the named subject area.
+  * "faculty_only" if the scholarship is for the same faculty but does not name
+    a specific programme that excludes the student.
+  * "mismatch" if it is for a different faculty or a specific programme the
+    student is not enrolled in.
+- If a scholarship is specifically for surveying, architecture, civil
+  engineering, medicine, law, business, or another named programme, the
+  student's programme must match that named programme. Otherwise set
+  qualifies=false and explain the mismatch in gap.
+- If the scholarship requires residence in a specific hall, exchange status, or
+  another hard requirement the student does not meet, set qualifies=false and
+  explain the hard requirement in gap.
+
 APPLICATION NOTES — add these to qualified matches where relevant:
 - "You may want to highlight your volunteering experience"
 - "Your robotics background strengthens this application significantly"
@@ -72,9 +94,10 @@ Return ONLY valid JSON — no preamble, no explanation, no markdown:
     "name": "Scholarship Name",
     "qualifies": true,
     "match_strength": "strong",
+    "program_match": "exact|faculty_only|mismatch",
     "reason": "One sentence explaining why this student clearly matches, quoting specific criteria where possible.",
     "gap": null,
-    "application_notes": "Optional practical tip for this student. Null if nothing specific to add.",
+    "application_notes": "Optional practical tip explicitly supported by the scholarship source data. Null if nothing specific is clearly stated.",
     "calendar_note": "Deadline planning note if relevant. Null otherwise.",
     "is_open": true,
     "deadline_raw": "exact deadline string from scholarship record",
