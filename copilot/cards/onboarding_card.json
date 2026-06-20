@@ -16,15 +16,24 @@
       "wrap": true
     },
     {
+      "type": "Input.Text",
+      "id": "name",
+      "label": "Display Name * (required)",
+      "placeholder": "e.g. Alex Chen",
+      "spacing": "Medium"
+    },
+    {
       "type": "TextBlock",
       "text": "Basic Info",
+      "size": "Medium",
       "weight": "Bolder",
-      "separator": true
+      "separator": true,
+      "spacing": "Medium"
     },
     {
       "type": "Input.ChoiceSet",
       "id": "faculty",
-      "label": "Faculty",
+      "label": "Faculty * (required)",
       "style": "compact",
       "choices": [
         { "title": "Architecture", "value": "Architecture" },
@@ -43,13 +52,13 @@
     {
       "type": "Input.Text",
       "id": "programme",
-      "label": "Programme",
+      "label": "Programme * (required)",
       "placeholder": "e.g. Bachelor of Engineering in Computer Science"
     },
     {
       "type": "Input.ChoiceSet",
       "id": "year_of_study",
-      "label": "Year of Study",
+      "label": "Year of Study * (required)",
       "style": "compact",
       "choices": [
         { "title": "Year 1", "value": "1" },
@@ -61,15 +70,9 @@
       ]
     },
     {
-      "type": "Input.Text",
-      "id": "gpa",
-      "label": "Current CGPA (leave blank if first semester)",
-      "placeholder": "e.g. 3.7"
-    },
-    {
       "type": "Input.ChoiceSet",
       "id": "local_status",
-      "label": "Student Status",
+      "label": "Student Status * (required)",
       "style": "compact",
       "value": "local",
       "choices": [
@@ -79,39 +82,48 @@
     },
     {
       "type": "Input.Text",
-      "id": "country_of_origin",
-      "label": "Country / Place of Origin (if non-local)",
-      "placeholder": "e.g. Mainland China, United Kingdom"
+      "id": "gpa",
+      "label": "CGPA (Optional)",
+      "placeholder": "e.g. 3.7"
     },
     {
       "type": "Input.ChoiceSet",
       "id": "financial_need_opt_in",
-      "label": "Include need-based scholarships in my matches?",
+      "label": "Financial Need (Optional)",
       "style": "compact",
-      "value": "false",
       "choices": [
         { "title": "Yes", "value": "true" },
         { "title": "No", "value": "false" }
       ]
     },
     {
+      "type": "TextBlock",
+      "text": "Interests & Activities",
+      "size": "Medium",
+      "weight": "Bolder",
+      "separator": true,
+      "spacing": "Medium"
+    },
+    {
       "type": "Input.Text",
       "id": "interests",
-      "label": "Interests (comma-separated)",
+      "label": "Interests * (required)",
       "placeholder": "e.g. AI, robotics, hackathons, creative writing"
     },
     {
       "type": "Input.Text",
       "id": "activities",
-      "label": "Activities & Achievements",
+      "label": "Activities & Achievements (Optional)",
       "isMultiline": true,
       "placeholder": "e.g. HKU Robotics Team, Dean's List, volunteer work"
     },
     {
       "type": "TextBlock",
-      "text": "Module Opt-ins",
+      "text": "Module Opt-ins * (select at least one)",
+      "size": "Medium",
       "weight": "Bolder",
-      "separator": true
+      "separator": true,
+      "spacing": "Medium"
     },
     {
       "type": "Input.Toggle",
@@ -120,6 +132,12 @@
       "value": "true",
       "valueOn": "true",
       "valueOff": "false"
+    },
+    {
+      "type": "TextBlock",
+      "text": "💡 If you enable Scholarship Matching, I'll ask you for your CGPA and financial need information in the next step to find the best matches.",
+      "wrap": true,
+      "spacing": "Small"
     },
     {
       "type": "Input.Toggle",
@@ -140,8 +158,10 @@
     {
       "type": "TextBlock",
       "text": "Notification Preference",
+      "size": "Medium",
       "weight": "Bolder",
-      "separator": true
+      "separator": true,
+      "spacing": "Medium"
     },
     {
       "type": "Input.ChoiceSet",
@@ -157,33 +177,127 @@
     },
     {
       "type": "TextBlock",
-      "text": "Timetable",
+      "text": "Timetable (Optional - add if you want conflict checking)",
+      "size": "Medium",
       "weight": "Bolder",
-      "separator": true
+      "separator": true,
+      "spacing": "Medium"
     },
     {
       "type": "TextBlock",
-      "text": "Optional: add up to 3 regular classes so I can flag event conflicts.",
+      "text": "Add your first regular class. You can add more rows later.",
       "wrap": true,
       "size": "Small"
     },
-    { "type": "Input.Text", "id": "class1_code", "label": "Class 1 Course Code", "placeholder": "e.g. COMP3230" },
-    { "type": "Input.ChoiceSet", "id": "class1_day", "label": "Class 1 Day", "style": "compact", "choices": [ { "title": "Mon", "value": "Monday" }, { "title": "Tue", "value": "Tuesday" }, { "title": "Wed", "value": "Wednesday" }, { "title": "Thu", "value": "Thursday" }, { "title": "Fri", "value": "Friday" } ] },
-    { "type": "Input.ChoiceSet", "id": "class1_start", "label": "Class 1 Start", "style": "compact", "choices": [ { "title": "09:00", "value": "09:00" }, { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" } ] },
-    { "type": "Input.ChoiceSet", "id": "class1_end", "label": "Class 1 End", "style": "compact", "choices": [ { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" }, { "title": "19:00", "value": "19:00" } ] },
-    { "type": "Input.Text", "id": "class2_code", "label": "Class 2 Course Code", "placeholder": "Optional" },
-    { "type": "Input.ChoiceSet", "id": "class2_day", "label": "Class 2 Day", "style": "compact", "choices": [ { "title": "Mon", "value": "Monday" }, { "title": "Tue", "value": "Tuesday" }, { "title": "Wed", "value": "Wednesday" }, { "title": "Thu", "value": "Thursday" }, { "title": "Fri", "value": "Friday" } ] },
-    { "type": "Input.ChoiceSet", "id": "class2_start", "label": "Class 2 Start", "style": "compact", "choices": [ { "title": "09:00", "value": "09:00" }, { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" } ] },
-    { "type": "Input.ChoiceSet", "id": "class2_end", "label": "Class 2 End", "style": "compact", "choices": [ { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" }, { "title": "19:00", "value": "19:00" } ] },
-    { "type": "Input.Text", "id": "class3_code", "label": "Class 3 Course Code", "placeholder": "Optional" },
-    { "type": "Input.ChoiceSet", "id": "class3_day", "label": "Class 3 Day", "style": "compact", "choices": [ { "title": "Mon", "value": "Monday" }, { "title": "Tue", "value": "Tuesday" }, { "title": "Wed", "value": "Wednesday" }, { "title": "Thu", "value": "Thursday" }, { "title": "Fri", "value": "Friday" } ] },
-    { "type": "Input.ChoiceSet", "id": "class3_start", "label": "Class 3 Start", "style": "compact", "choices": [ { "title": "09:00", "value": "09:00" }, { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" } ] },
-    { "type": "Input.ChoiceSet", "id": "class3_end", "label": "Class 3 End", "style": "compact", "choices": [ { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" }, { "title": "19:00", "value": "19:00" } ] },
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "Input.Text",
+              "id": "class1_code",
+              "label": "Course Code",
+              "placeholder": "e.g. COMP3230"
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "Input.ChoiceSet",
+              "id": "class1_day",
+              "label": "Day",
+              "style": "compact",
+              "choices": [
+                { "title": "Mon", "value": "Monday" },
+                { "title": "Tue", "value": "Tuesday" },
+                { "title": "Wed", "value": "Wednesday" },
+                { "title": "Thu", "value": "Thursday" },
+                { "title": "Fri", "value": "Friday" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "Input.ChoiceSet",
+              "id": "class1_start",
+              "label": "Start",
+              "style": "compact",
+              "choices": [
+                { "title": "09:00", "value": "09:00" },
+                { "title": "10:00", "value": "10:00" },
+                { "title": "11:00", "value": "11:00" },
+                { "title": "12:00", "value": "12:00" },
+                { "title": "13:00", "value": "13:00" },
+                { "title": "14:00", "value": "14:00" },
+                { "title": "15:00", "value": "15:00" },
+                { "title": "16:00", "value": "16:00" },
+                { "title": "17:00", "value": "17:00" },
+                { "title": "18:00", "value": "18:00" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "Input.ChoiceSet",
+              "id": "class1_end",
+              "label": "End",
+              "style": "compact",
+              "choices": [
+                { "title": "10:00", "value": "10:00" },
+                { "title": "11:00", "value": "11:00" },
+                { "title": "12:00", "value": "12:00" },
+                { "title": "13:00", "value": "13:00" },
+                { "title": "14:00", "value": "14:00" },
+                { "title": "15:00", "value": "15:00" },
+                { "title": "16:00", "value": "16:00" },
+                { "title": "17:00", "value": "17:00" },
+                { "title": "18:00", "value": "18:00" },
+                { "title": "19:00", "value": "19:00" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "ActionSet",
+      "actions": [
+        {
+          "type": "Action.Submit",
+          "title": "➕ Add Another Class",
+          "data": {
+            "action": "add_timetable_row"
+          }
+        }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "CV Upload (Optional)",
+      "size": "Medium",
+      "weight": "Bolder",
+      "separator": true,
+      "spacing": "Medium"
+    },
     {
       "type": "TextBlock",
       "text": "CV Upload: Attach your PDF CV to this chat and type upload cv after submitting this form.",
       "wrap": true,
-      "separator": true
+      "color": "Good"
     }
   ],
   "actions": [

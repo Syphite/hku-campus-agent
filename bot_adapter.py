@@ -25,7 +25,7 @@ ADAPTER = BotFrameworkAdapter(SETTINGS)
 async def messages(req: web.Request) -> web.Response:
     if not req.can_read_body:
         return web.Response(status=400, text="Missing request body")
-        
+
     body = await req.json()
     activity = Activity().deserialize(body)
     auth = req.headers.get("Authorization", "")
@@ -36,7 +36,7 @@ async def messages(req: web.Request) -> web.Response:
 
         from_property = turn_context.activity.from_property
         student_id = from_property.id if from_property and from_property.id else None
-        
+
         if not student_id:
             await turn_context.send_activity("I couldn't identify your user ID.")
             return
@@ -91,13 +91,13 @@ async def messages(req: web.Request) -> web.Response:
         if document_attachments:
             profile = get_profile(student_id)
             has_active_draft = bool(profile and profile.get("last_scholarship_id"))
-            
+
             await turn_context.send_activity(
                 "📄 Processing your application form... please wait."
                 if has_active_draft else
                 "📄 Processing your CV... please wait."
             )
-            
+
             for att in document_attachments:
                 try:
                     file_bytes, filename = await download_document_attachment(att)
@@ -108,13 +108,13 @@ async def messages(req: web.Request) -> web.Response:
                 except Exception as e:
                     await turn_context.send_activity(f"Sorry, I couldn't process that attachment: {e}")
             return
-        
+
         message = {
             "type": turn_context.activity.type,
             "text": turn_context.activity.text or "",
             "value": turn_context.activity.value or {}
         }
-        
+
         responses = handle_message(student_id, message)
         await send_agent_responses(responses)
 

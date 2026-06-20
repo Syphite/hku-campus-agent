@@ -5,11 +5,19 @@ Copilot Chat entry point for the HKU Campus Agent.
 import os
 import json
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from openai import AzureOpenAI
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+openai_client = AzureOpenAI(
+    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+    api_key=os.environ["AZURE_OPENAI_API_KEY"],
+    api_version="2024-12-01-preview"
+)
 
 # Import agent modules using absolute paths from project root
 from agent.profile  import get_profile, save_profile, build_profile_from_form, update_profile_fields, extract_cv_text
@@ -36,6 +44,146 @@ def _load_card(card_name: str) -> dict:
     with open(card_path) as f:
         return json.load(f)
 
+def _choice_set(input_id: str, label: str, choices: list[dict]) -> dict:
+    """Build a compact ChoiceSet for dynamically generated onboarding rows."""
+    return {
+        "type": "Input.ChoiceSet",
+        "id": input_id,
+        "label": label,
+        "style": "compact",
+        "choices": choices
+    }
+
+def _timetable_row(row_num: int) -> dict:
+    """Build one timetable row for the onboarding card."""
+    day_choices = [
+        {"title": "Mon", "value": "Monday"},
+        {"title": "Tue", "value": "Tuesday"},
+        {"title": "Wed", "value": "Wednesday"},
+        {"title": "Thu", "value": "Thursday"},
+        {"title": "Fri", "value": "Friday"}
+    ]
+    start_choices = [
+        {"title": "09:00", "value": "09:00"},
+        {"title": "10:00", "value": "10:00"},
+        {"title": "11:00", "value": "11:00"},
+        {"title": "12:00", "value": "12:00"},
+        {"title": "13:00", "value": "13:00"},
+        {"title": "14:00", "value": "14:00"},
+        {"title": "15:00", "value": "15:00"},
+        {"title": "16:00", "value": "16:00"},
+        {"title": "17:00", "value": "17:00"},
+        {"title": "18:00", "value": "18:00"}
+    ]
+    end_choices = start_choices[1:] + [{"title": "19:00", "value": "19:00"}]
+
+    return {
+        "type": "ColumnSet",
+        "columns": [
+            {
+                "type": "Column",
+                "width": "stretch",
+                "items": [
+                    {
+                        "type": "Input.Text",
+                        "id": f"class{row_num}_code",
+                        "label": "Course Code",
+                        "placeholder": "e.g. COMP3230"
+                    }
+                ]
+            },
+            {
+                "type": "Column",
+                "width": "auto",
+                "items": [_choice_set(f"class{row_num}_day", "Day", day_choices)]
+            },
+            {
+                "type": "Column",
+                "width": "auto",
+                "items": [_choice_set(f"class{row_num}_start", "Start", start_choices)]
+            },
+            {
+                "type": "Column",
+                "width": "auto",
+                "items": [_choice_set(f"class{row_num}_end", "End", end_choices)]
+            }
+        ]
+    }
+
+def _remove_default_value(items: list, input_id: str) -> None:
+    """Remove default values from optional fields in a card tree."""
+    for item in items:
+        if item.get("id") == input_id:
+            item.pop("value", None)
+        if item.get("items"):
+            _remove_default_value(item["items"], input_id)
+        for column in item.get("columns", []):
+            _remove_default_value(column.get("items", []), input_id)
+
+def _build_onboarding_card(num_rows: int = 1) -> dict:
+    """Build the onboarding card and dynamically size the timetable section."""
+    try:
+        num_rows = max(1, min(int(num_rows), 3))
+    except (TypeError, ValueError):
+        num_rows = 1
+
+    card = deepcopy(_load_card("onboarding_card"))
+    body = card.get("body", [])
+    _remove_default_value(body, "financial_need_opt_in")
+
+    timetable_start = next(
+        (
+            idx for idx, item in enumerate(body)
+            if item.get("type") == "TextBlock"
+            and str(item.get("text", "")).startswith("Timetable")
+        ),
+        None
+    )
+    cv_start = next(
+        (
+            idx for idx, item in enumerate(body)
+            if item.get("type") == "TextBlock"
+            and str(item.get("text", "")).startswith("CV Upload")
+        ),
+        None
+    )
+    if timetable_start is None or cv_start is None or cv_start <= timetable_start:
+        return card
+
+    timetable_section = [
+        {
+            "type": "TextBlock",
+            "text": "Timetable (Optional - add if you want conflict checking)",
+            "size": "Medium",
+            "weight": "Bolder",
+            "separator": True,
+            "spacing": "Medium"
+        },
+        {
+            "type": "TextBlock",
+            "text": "Add your regular classes. You can add up to 3 rows.",
+            "wrap": True,
+            "size": "Small"
+        },
+        *[_timetable_row(row_num) for row_num in range(1, num_rows + 1)]
+    ]
+    if num_rows < 3:
+        timetable_section.append({
+            "type": "ActionSet",
+            "actions": [
+                {
+                    "type": "Action.Submit",
+                    "title": "➕ Add Another Class",
+                    "data": {
+                        "action": "add_timetable_row"
+                    }
+                }
+            ]
+        })
+
+    card["body"] = body[:timetable_start] + timetable_section + body[cv_start:]
+    return card
+
 # ---------------------------------------------------------------------------
 # Response builders
 # ---------------------------------------------------------------------------
@@ -53,6 +201,67 @@ def _card_response(text: str, card: dict) -> dict:
             }
         ]
     }
+
+def _help_card_response() -> dict:
+    try:
+        card = _load_card("help_card")
+        return _card_response("Here is how I can help you:", card)
+    except Exception:
+        return _text_response("Type 'digest' for updates, 'scholarships' to browse, or 'help' for commands.")
+
+def _get_profile_field(profile: dict, field: str):
+    academic = profile.get("academic", {})
+    financial = profile.get("financial", {})
+    nationality = academic.get("nationality", {})
+
+    if field in ("faculty", "programme"):
+        return academic.get(field)
+    if field == "gpa":
+        return academic.get("gpa")
+    if field == "local_status":
+        return nationality.get("local_status")
+    if field == "financial_need_opt_in":
+        return financial.get("financial_need_opt_in")
+    return profile.get(field)
+
+def _set_profile_field(profile: dict, field: str, value) -> None:
+    if field in ("faculty", "programme"):
+        profile.setdefault("academic", {})[field] = value
+    elif field == "gpa":
+        try:
+            profile.setdefault("academic", {})["gpa"] = float(value)
+        except (TypeError, ValueError):
+            profile.setdefault("academic", {})["gpa"] = value
+    elif field == "local_status":
+        profile.setdefault("academic", {}).setdefault("nationality", {})["local_status"] = value
+    elif field == "financial_need_opt_in":
+        if isinstance(value, str):
+            value = value.strip().lower() in ("true", "yes", "y", "1")
+        profile.setdefault("financial", {})["financial_need_opt_in"] = bool(value)
+    elif field == "interests":
+        current_interests = profile.get("interests", [])
+        if not isinstance(current_interests, list):
+            current_interests = []
+        if isinstance(value, list):
+            new_values = value
+        else:
+            new_values = [value]
+        seen = {str(item).strip().lower() for item in current_interests if str(item).strip()}
+        for item in new_values:
+            cleaned = str(item).strip()
+            key = cleaned.lower()
+            if cleaned and key not in seen:
+                current_interests.append(cleaned)
+                seen.add(key)
+        profile["interests"] = current_interests
+    else:
+        profile[field] = value
+
+def _restore_profile_field(profile: dict, field: str, value) -> None:
+    if field == "interests":
+        profile["interests"] = value if isinstance(value, list) else []
+    else:
+        _set_profile_field(profile, field, value)
 
 def _scholarship_cards(scholarships: list, tier: str) -> list:
     """Build a list of Adaptive Card attachments for scholarship results."""
@@ -266,19 +475,31 @@ def _archive_review_card(review_item: dict) -> dict:
 def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
     """Process onboarding form submission, save profile, return first digest."""
     logger.info(f"Onboarding submit for {student_id}")
-    
+
+    raw_gpa = form_data.get("gpa")
+    gpa_missing = raw_gpa is None or str(raw_gpa).strip() == ""
+    gpa_for_profile = raw_gpa if not gpa_missing else 0
+
+    raw_financial_need = form_data.get("financial_need_opt_in")
+    financial_need_missing = raw_financial_need is None or str(raw_financial_need).strip() == ""
+    financial_need_value = (
+        str(raw_financial_need).lower() == "true"
+        if not financial_need_missing
+        else False
+    )
+
     # Build and save profile
     profile = build_profile_from_form({
-        "name":                  form_data.get("name", "Student"),
+        "name":                  form_data.get("name") or "Student",
         "email":                 form_data.get("email", f"{student_id}@connect.hku.hk"),
         "faculty":               form_data.get("faculty", " "),
         "programme":             form_data.get("programme", " "),
         "year_of_study":         form_data.get("year_of_study", "1"),
-        "gpa":                   form_data.get("gpa") or 0,
+        "gpa":                   gpa_for_profile,
         "level":                 "postgraduate" if form_data.get("year_of_study") == "postgraduate" else "undergraduate",
         "local_status":          form_data.get("local_status", "local"),
         "country_of_origin":     form_data.get("country_of_origin", "Hong Kong"),
-        "financial_need_opt_in": form_data.get("financial_need_opt_in") == "true",
+        "financial_need_opt_in": financial_need_value,
         "interests":             [i.strip() for i in form_data.get("interests", " ").split(",") if i.strip()],
         "activities":            [form_data.get("activities", " ")],
         "notification_preference": form_data.get("notification_preference", "daily_morning"),
@@ -287,16 +508,19 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         "module_inbox":          form_data.get("module_inbox", "true"),
         "expected_graduation_year": 2028,
     })
-    
-    # NEW: Parse Timetable from the 3 rows
+
+    # Parse any submitted timetable rows, up to the demo limit of 3.
     blocked_slots = []
     for i in range(1, 4):
-        code  = form_data.get(f"class{i}_code", "").strip()
-        day   = form_data.get(f"class{i}_day", "").strip()
-        start = form_data.get(f"class{i}_start", "").strip()
-        end   = form_data.get(f"class{i}_end", "").strip()
-        
-        # Only add if all fields for the row are filled
+        row_keys = [f"class{i}_code", f"class{i}_day", f"class{i}_start", f"class{i}_end"]
+        if not any(key in form_data for key in row_keys):
+            continue
+
+        code  = str(form_data.get(f"class{i}_code", "") or "").strip()
+        day   = str(form_data.get(f"class{i}_day", "") or "").strip()
+        start = str(form_data.get(f"class{i}_start", "") or "").strip()
+        end   = str(form_data.get(f"class{i}_end", "") or "").strip()
+
         if code and day and start and end:
             blocked_slots.append({
                 "day": day,
@@ -310,13 +534,16 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         "blocked_slots": blocked_slots,
         "upcoming_deadlines": []
     }
-    
+
     profile["id"] = student_id
     save_profile(profile)
 
     responses = [_text_response(
-        f"Profile set up! Welcome, {profile.get('name', 'Student')}. "
-        f"I've saved your timetable. Running your first digest now..."
+        f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences. "
+        f"What would you like to do now?\n\n"
+        f"• Type **'digest'** for your daily update\n"
+        f"• Type **'scholarships'** to browse matches\n"
+        f"• Type **'help'** to see all commands"
     )]
     responses.extend(handle_get_digest(student_id))
     return responses
@@ -339,7 +566,7 @@ def handle_get_digest(student_id: str) -> list:
     """Run full matching pipeline and return digest as Adaptive Cards."""
     profile = get_profile(student_id)
     if not profile:
-        card = _load_card("onboarding_card")
+        card = _build_onboarding_card()
         return [_card_response(
             "I don't have your profile yet. Let's get you set up:",
             card
@@ -509,7 +736,7 @@ def handle_start_draft(student_id: str, scholarship_id: str, scholarship_name: s
     logger.info(f"Starting upload-first draft flow for {scholarship_id} / {student_id}")
     profile = get_profile(student_id)
     if not profile:
-        card = _load_card("onboarding_card")
+        card = _build_onboarding_card()
         return [_card_response("Please complete onboarding before drafting an application.", card)]
 
     profile["last_scholarship_id"] = scholarship_id
@@ -646,11 +873,85 @@ def handle_generate_draft(student_id: str, form_data: dict) -> list:
 
     return [_card_response("Here are your draft answers. Please review and personalize before submitting.", card)]
 
+def handle_profile_update(student_id: str, text: str) -> list:
+    """Uses OpenAI to parse natural language profile updates."""
+    try:
+        response = openai_client.chat.completions.create(
+            model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an assistant that extracts profile update intents from user text. "
+                        "Return ONLY a raw JSON object with keys: 'field' and 'value'. "
+                        "If the text is not a profile update, return {\"field\": null, \"value\": null}. "
+                        "Valid fields: faculty, programme, interests, gpa, local_status, financial_need_opt_in."
+                    )
+                },
+                {"role": "user", "content": text}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0
+        )
+        intent = json.loads(response.choices[0].message.content)
+
+        if not intent.get("field"):
+            return [_text_response("I didn't quite catch that. Type 'help' to see what I can do!")]
+
+        field = intent["field"]
+        new_value = intent["value"]
+
+        profile = get_profile(student_id)
+        if not profile:
+            return [_text_response("Please complete onboarding first.")]
+
+        old_value = _get_profile_field(profile, field)
+        _set_profile_field(profile, field, new_value)
+        save_profile(profile)
+
+        card = {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.4",
+            "body": [
+                {
+                    "type": "TextBlock",
+                    "text": f"✅ Updated! I changed your **{field}** to **{new_value}**.",
+                    "wrap": True
+                }
+            ],
+            "actions": [
+                {
+                    "type": "Action.Submit",
+                    "title": "↩️ Revert Change",
+                    "data": {
+                        "action": "revert_profile",
+                        "field": field,
+                        "old_value": old_value
+                    }
+                }
+            ]
+        }
+        return [{
+            "type": "message",
+            "text": " ",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": card
+                }
+            ]
+        }]
+
+    except Exception as e:
+        logger.error(f"Profile update error: {e}")
+        return [_text_response("I had trouble updating that. Please try again.")]
+
 def handle_semester_refresh(student_id: str, form_data: dict, dismissed: bool = False) -> list:
     """Handle semester refresh form submission."""
     if dismissed:
         return [_text_response("No problem — your profile is unchanged. I'll keep finding opportunities for you.")]
-    
+
     updates = {}
     if form_data.get("gpa"):
         updates["academic"] = {"gpa": float(form_data["gpa"])}
@@ -684,6 +985,22 @@ def handle_message(student_id: str, message: dict) -> list:
     # ─ Adaptive Card submissions ────────────────────────────────────────────
     if action == "onboarding_submit":
         return handle_onboarding_submit(student_id, value)
+
+    if action == "add_timetable_row":
+        return [_card_response(
+            "Sure — I've added another class row. Please complete the form below:",
+            _build_onboarding_card(num_rows=2)
+        )]
+
+    if action == "revert_profile":
+        field = value.get("field")
+        old_value = value.get("old_value")
+        profile = get_profile(student_id)
+        if profile and field:
+            _restore_profile_field(profile, field, old_value)
+            save_profile(profile)
+            return [_text_response(f"↩️ Reverted! Your {field} is back to {old_value}.")]
+        return [_text_response("Could not revert that change.")]
 
     if action == "semester_refresh_submit":
         return handle_semester_refresh(student_id, value)
@@ -756,6 +1073,12 @@ def handle_message(student_id: str, message: dict) -> list:
         return [_text_response("No email ID provided to restore.")]
 
     # ── Text messages ────────────────────────────────────────────────────────
+    if any(kw in text for kw in ["help", "commands", "what can you do"]):
+        return [_help_card_response()]
+
+    if any(kw in text for kw in ["change my", "update my", "set my", "add to my"]):
+        return handle_profile_update(student_id, text)
+
     if "upload cv" in text:
         return [_text_response("Please attach your PDF CV to the chat first!")]
 
@@ -778,7 +1101,7 @@ def handle_message(student_id: str, message: dict) -> list:
 
     if any(kw in text for kw in ["hello", "hi", "hey", "start", "help"]):
         if not profile or not profile.get("onboarding_complete"):
-            card = _load_card("onboarding_card")
+            card = _build_onboarding_card()
             return [_card_response(
                 "Hi! I'm your HKU Campus Agent. I find scholarships, competitions, "
                 "and opportunities tailored to you, and help you apply. Let's get you set up:",
@@ -790,7 +1113,7 @@ def handle_message(student_id: str, message: dict) -> list:
     # Default — return digest
     profile = get_profile(student_id)
     if not profile or not profile.get("onboarding_complete"):
-        card = _load_card("onboarding_card")
+        card = _build_onboarding_card()
         return [_card_response(
             "Hi! I'm your HKU Campus Agent. I find scholarships, competitions, "
             "and opportunities tailored to you, and help you apply. Let's get you set up:",

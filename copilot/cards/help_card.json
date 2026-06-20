@@ -1,0 +1,29 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.4",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": " HKU Campus Agent Help",
+      "weight": "Bolder",
+      "size": "Large",
+      "color": "Accent"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Here is what I can do for you:",
+      "wrap": true
+    },
+    {
+      "type": "FactSet",
+      "facts": [
+        { "title": "📋 Digest", "value": "Type 'digest' or 'update' to see your daily opportunities." },
+        { "title": "🎓 Scholarships", "value": "Type 'scholarships' to browse matches." },
+        { "title": "📅 Events", "value": "Type 'events' to see upcoming hackathons and talks." },
+        { "title": "📧 Inbox", "value": "Type 'inbox' to review your archived emails." },
+        { "title": "✏️ Update Profile", "value": "Type 'change my [field] to [value]' (e.g., 'change faculty to Arts')." }
+      ]
+    }
+  ]
+}
