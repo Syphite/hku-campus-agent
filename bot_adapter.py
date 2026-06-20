@@ -31,6 +31,9 @@ async def messages(req: web.Request) -> web.Response:
     auth = req.headers.get("Authorization", "")
 
     async def turn_handler(turn_context: TurnContext):
+        if turn_context.activity.type != "message":
+            return
+
         from_property = turn_context.activity.from_property
         student_id = from_property.id if from_property and from_property.id else None
         
