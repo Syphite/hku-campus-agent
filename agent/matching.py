@@ -348,7 +348,16 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
         }
 
     def parse_stage2_raw(raw: str) -> list[dict]:
-        parsed = json.loads(raw)
+        text = (raw or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        parsed = json.loads(text)
         if isinstance(parsed, list):
             return parsed
         if isinstance(parsed, dict):

@@ -18,6 +18,7 @@ openai==1.35.0
 
 # PDF & DOCX Writing
 PyMuPDF>=1.23.0   # For PDF filling (imported as 'fitz')
+pypdf>=4.0.0      # For PDF text extraction
 python-docx>=1.1.0 # For DOCX filling
 
 botbuilder-core

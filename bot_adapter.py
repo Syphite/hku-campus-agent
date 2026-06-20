@@ -2,7 +2,8 @@ from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, Tu
 from botbuilder.schema import Activity, Attachment
 from aiohttp import ClientSession, web
 import os
-from agent.handler import handle_cv_upload, handle_form_uploaded, handle_message
+import secrets
+from agent.handler import handle_application_form_upload, handle_cv_upload, handle_form_uploaded, handle_message
 from agent.profile import get_profile
 from dotenv import load_dotenv
 
@@ -21,6 +22,37 @@ SETTINGS = BotFrameworkAdapterSettings(
 )
 
 ADAPTER = BotFrameworkAdapter(SETTINGS)
+DOWNLOAD_STORE = {}
+
+
+def _register_download(file_bytes: bytes, filename: str, content_type: str) -> str:
+    token = secrets.token_urlsafe(16)
+    DOWNLOAD_STORE[token] = {
+        "bytes": file_bytes,
+        "filename": filename,
+        "content_type": content_type,
+    }
+    return token
+
+
+def _public_base_url() -> str:
+    return os.environ.get("BOT_PUBLIC_URL", f"http://localhost:{os.environ.get('PORT', 3978)}").rstrip("/")
+
+
+async def download_file(req: web.Request) -> web.Response:
+    token = req.match_info.get("token", "")
+    entry = DOWNLOAD_STORE.get(token)
+    if not entry:
+        return web.Response(status=404, text="File not found or expired")
+
+    return web.Response(
+        body=entry["bytes"],
+        headers={
+            "Content-Type": entry["content_type"],
+            "Content-Disposition": f'attachment; filename="{entry["filename"]}"',
+        },
+    )
+
 
 async def messages(req: web.Request) -> web.Response:
     if not req.can_read_body:
@@ -63,6 +95,20 @@ async def messages(req: web.Request) -> web.Response:
                             content=att.get("content")
                         ))
 
+                file_download = r.get("file_download")
+                if file_download:
+                    token = _register_download(
+                        file_download["bytes"],
+                        file_download["filename"],
+                        file_download["content_type"],
+                    )
+                    download_url = f"{_public_base_url()}/download/{token}"
+                    attachments.append(Attachment(
+                        content_type=file_download["content_type"],
+                        content_url=download_url,
+                        name=file_download["filename"],
+                    ))
+
                 await turn_context.send_activity(Activity(
                     type="message",
                     text=r.get("text", ""),
@@ -73,15 +119,16 @@ async def messages(req: web.Request) -> web.Response:
             content_type = (getattr(att, "content_type", "") or "").lower()
             filename = (getattr(att, "name", "") or "").lower()
             return (
-                "pdf" in content_type
-                or "wordprocessingml.document" in content_type
+                content_type == "application/pdf"
+                or content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 or filename.endswith(".pdf")
                 or filename.endswith(".docx")
             )
 
-        async def download_document_attachment(att) -> tuple[bytes, str]:
+        async def download_document_attachment(att) -> tuple[bytes, str, str]:
             content_url = getattr(att, "content_url", None)
             filename = getattr(att, "name", None) or "upload.pdf"
+            content_type = getattr(att, "content_type", None) or ""
 
             if not content_url:
                 raise ValueError("Attachment is missing a content URL")
@@ -93,7 +140,7 @@ async def messages(req: web.Request) -> web.Response:
                         raise RuntimeError(f"Could not download attachment: HTTP {resp.status}")
                     file_bytes = await resp.read()
 
-            return file_bytes, filename
+            return file_bytes, filename, content_type
 
         document_attachments = []
         for att in turn_context.activity.attachments or []:
@@ -102,18 +149,23 @@ async def messages(req: web.Request) -> web.Response:
 
         if document_attachments:
             profile = get_profile(student_id)
+            has_pending_application = bool(profile and profile.get("pending_application"))
             has_active_draft = bool(profile and profile.get("last_scholarship_id"))
 
             await turn_context.send_activity(
                 "📄 Processing your application form... please wait."
-                if has_active_draft else
+                if has_pending_application or has_active_draft else
                 "📄 Processing your CV... please wait."
             )
 
             for att in document_attachments:
                 try:
-                    file_bytes, filename = await download_document_attachment(att)
-                    if has_active_draft:
+                    file_bytes, filename, content_type = await download_document_attachment(att)
+                    if has_pending_application:
+                        await send_agent_responses(handle_application_form_upload(
+                            student_id, file_bytes, filename, content_type
+                        ))
+                    elif has_active_draft:
                         await send_agent_responses(handle_form_uploaded(student_id, file_bytes, filename))
                     else:
                         await send_agent_responses(handle_cv_upload(student_id, file_bytes, filename))
@@ -142,6 +194,7 @@ async def messages(req: web.Request) -> web.Response:
 
 app = web.Application()
 app.router.add_post("/api/messages", messages)
+app.router.add_get("/download/{token}", download_file)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3978))

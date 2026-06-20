@@ -44,22 +44,36 @@ def _fill_pdf(input_path: str, output_path: str, profile: dict, scholarship: dic
             "nationality": academic.get("nationality", {}).get("country_of_origin", ""),
             "scholarship_name": scholarship.get("name", ""),
         }
+        answers_text = (
+            scholarship.get("application_answers_text")
+            or scholarship.get("drafted_cover_letter")
+            or ""
+        )
+        essay_keywords = (
+            "essay", "statement", "reason", "experience", "leadership",
+            "answer", "description", "motivation", "personal", "comment",
+        )
 
         filled_count = 0
         for widget in doc.widgets():
             if not widget.field_name:
                 continue
-                
-            # Normalize field name for matching
+
             field_name = widget.field_name.lower().replace(" ", "_").replace("-", "_")
-            
-            # Check if this field matches something in our profile
+            matched = False
+
             for key, value in field_mapping.items():
                 if key in field_name and value:
                     widget.field_value = str(value)
-                    widget.update()  # Apply the change visually
+                    widget.update()
                     filled_count += 1
+                    matched = True
                     break
+
+            if not matched and answers_text and any(key in field_name for key in essay_keywords):
+                widget.field_value = answers_text[:4000]
+                widget.update()
+                filled_count += 1
 
         doc.save(output_path)
         doc.close()
@@ -89,7 +103,12 @@ def _fill_docx(input_path: str, output_path: str, profile: dict, scholarship: di
         # Build replacement dictionary with {{placeholder}} syntax
         academic = profile.get("academic", {})
         financial = profile.get("financial", {})
-        
+        answers_text = (
+            scholarship.get("application_answers_text")
+            or scholarship.get("drafted_cover_letter")
+            or ""
+        )
+
         replacements = {
             "{{name}}": profile.get("name", ""),
             "{{full_name}}": profile.get("name", ""),
@@ -104,7 +123,8 @@ def _fill_docx(input_path: str, output_path: str, profile: dict, scholarship: di
             "{{cgpa}}": str(academic.get("gpa", "")),
             "{{nationality}}": academic.get("nationality", {}).get("country_of_origin", ""),
             "{{scholarship_name}}": scholarship.get("name", ""),
-            "{{cover_letter}}": scholarship.get("drafted_cover_letter", ""), # If drafter passed it in
+            "{{cover_letter}}": scholarship.get("drafted_cover_letter", ""),
+            "{{application_answers}}": answers_text,
         }
 
         replaced_count = 0

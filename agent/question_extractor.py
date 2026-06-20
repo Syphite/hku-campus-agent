@@ -30,30 +30,56 @@ def _get_openai_client() -> Optional[AzureOpenAI]:
     )
 
 
+def _extract_docx_text(source) -> str:
+    from docx import Document
+
+    doc = Document(source)
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                text = cell.text.strip()
+                if text:
+                    parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _extract_pdf_text(source) -> str:
+    from pypdf import PdfReader
+
+    if isinstance(source, (bytes, bytearray)):
+        reader = PdfReader(io.BytesIO(source))
+    else:
+        reader = PdfReader(source)
+    return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+
+
+def extract_text_from_application_file(file_path: str) -> str:
+    """Extract plain text from a saved PDF or DOCX application form."""
+    path_lower = (file_path or "").lower()
+    try:
+        if path_lower.endswith(".pdf"):
+            return _extract_pdf_text(file_path)
+        if path_lower.endswith(".docx"):
+            return _extract_docx_text(file_path)
+    except Exception as e:
+        logger.error(f"Application form text extraction failed for {file_path}: {e}")
+    return ""
+
+
 def _extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     filename_lower = (filename or "").lower()
 
     if filename_lower.endswith(".pdf"):
         try:
-            import pdfplumber
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                return "\n".join(page.extract_text() or "" for page in pdf.pages).strip()
+            return _extract_pdf_text(file_bytes)
         except Exception as e:
             logger.error(f"PDF question extraction failed for {filename}: {e}")
             return ""
 
     if filename_lower.endswith(".docx"):
         try:
-            from docx import Document
-            doc = Document(io.BytesIO(file_bytes))
-            parts = [p.text for p in doc.paragraphs if p.text.strip()]
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        text = cell.text.strip()
-                        if text:
-                            parts.append(text)
-            return "\n".join(parts).strip()
+            return _extract_docx_text(io.BytesIO(file_bytes))
         except Exception as e:
             logger.error(f"DOCX question extraction failed for {filename}: {e}")
             return ""

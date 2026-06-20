@@ -122,13 +122,19 @@ Pasted application text:
         return _fallback_extract_questions(raw_questions)
 
 
-def generate_draft_answers(student_id: str, scholarship_id: str, questions: list[str]) -> dict:
+def generate_draft_answers(
+    student_id: str,
+    scholarship_id: str,
+    questions: list[str],
+    scholarship: Optional[dict] = None,
+) -> dict:
     """
     Generate tailored answers for selected application questions.
     Returns {"answers": [{"question": "...", "answer": "..."}], "notes": "..."}.
     """
     profile = get_profile(student_id)
-    scholarship = _get_scholarship(scholarship_id)
+    if not scholarship:
+        scholarship = _get_scholarship(scholarship_id)
 
     if not profile:
         return {"error": f"Profile not found: {student_id}"}

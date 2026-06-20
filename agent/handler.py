@@ -24,7 +24,8 @@ openai_client = AzureOpenAI(
 from agent.profile  import get_profile, save_profile, build_profile_from_form, update_profile_fields, extract_cv_text
 from agent.matching import run_matching
 from agent.drafter  import extract_application_questions, generate_draft_answers
-from agent.question_extractor import extract_questions_from_file
+from agent.question_extractor import extract_questions_from_file, extract_text_from_application_file
+from agent.form_filler import fill_application_form
 from agent.digest   import assemble_digest, format_digest_message
 
 # Import event pipeline
@@ -33,6 +34,17 @@ from agent.conflict_checker        import run_conflict_checks_batch
 
 # Import email pipeline
 from agent.email_pipeline import run_inbox_pipeline
+
+APPLICATION_FORM_PDF = "/tmp/application_form.pdf"
+APPLICATION_FORM_DOCX = "/tmp/application_form.docx"
+
+DEMO_SCHOLARSHIP_472 = {
+    "id": "ss_472",
+    "scholarship_id": "ss_472",
+    "name": "D. H. Chen Foundation Scholarship",
+    "application_url": "https://scholar.aas.hku.hk/?action=showonesscheme&ss_id=472",
+    "source_url": "https://scholar.aas.hku.hk/?action=showonesscheme&ss_id=472",
+}
 
 # ---------------------------------------------------------------------------
 # Card loader
@@ -208,6 +220,17 @@ def _card_response(text: str, card: dict) -> dict:
                 "content": card
             }
         ]
+    }
+
+def _file_download_response(filename: str, file_bytes: bytes, content_type: str, text: str = "") -> dict:
+    return {
+        "type": "message",
+        "text": text,
+        "file_download": {
+            "filename": filename,
+            "content_type": content_type,
+            "bytes": file_bytes,
+        },
     }
 
 def _help_card_response() -> dict:
@@ -846,6 +869,8 @@ def _append_scholarship_cards(responses: list, scholarships: list, tier: str, of
         })
 
 def _append_scholarship_sections(responses: list, scholarship_result: dict, show_empty: bool = True) -> None:
+    _append_demo_application_scholarship(responses)
+
     apply_now = _strong_scholarships(scholarship_result.get("apply_now", []))
     if apply_now:
         responses.append(_text_response("**📋 Apply Now**"))
@@ -953,6 +978,60 @@ def _scholarship_cards(scholarships: list, tier: str) -> list:
         }
         cards.append(card)
     return cards
+
+def _demo_application_scholarship_card() -> dict:
+    scholarship = DEMO_SCHOLARSHIP_472
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.3",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": f"🟢 {scholarship['name']}",
+                "weight": "Bolder",
+                "wrap": True
+            },
+            {
+                "type": "FactSet",
+                "facts": [
+                    {"title": "Source", "value": "HKU Internal"},
+                    {"title": "Match", "value": "Strong"},
+                    {"title": "Demo", "value": "Upload a PDF or DOCX form to auto-fill"},
+                ]
+            }
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "Start Application",
+                "style": "positive",
+                "data": {"action": "start_app_472"}
+            },
+            {
+                "type": "Action.OpenUrl",
+                "title": "View Scholarship",
+                "url": scholarship["source_url"]
+            }
+        ]
+    }
+
+def _append_demo_application_scholarship(responses: list) -> None:
+    responses.append(_text_response("**📋 Featured Application**"))
+    responses.append(_card_response(
+        "Try the guided application flow for the D. H. Chen Foundation Scholarship:",
+        _demo_application_scholarship_card()
+    ))
+
+def _is_pdf_upload(content_type: str, filename: str) -> bool:
+    return (content_type or "").lower() == "application/pdf" or (filename or "").lower().endswith(".pdf")
+
+def _is_docx_upload(content_type: str, filename: str) -> bool:
+    content_type = (content_type or "").lower()
+    return (
+        content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        or (filename or "").lower().endswith(".docx")
+    )
 
 def _event_card(event: dict) -> dict:
     """Build an Adaptive Card for a single event."""
@@ -1420,6 +1499,274 @@ def handle_start_draft(student_id: str, scholarship_id: str, scholarship_name: s
     )]
 
 
+def handle_start_application(student_id: str) -> list:
+    """Begin the guided ss_472 application flow and wait for a form upload."""
+    profile = get_profile(student_id)
+    if not profile:
+        return [_card_response("Please complete onboarding before starting an application.", _build_onboarding_card())]
+
+    profile["pending_application"] = "ss_472"
+    _clear_application_review_state(profile)
+    profile.pop("last_scholarship_id", None)
+    profile.pop("last_application_questions", None)
+    save_profile(profile)
+
+    return [_text_response(
+        "Great choice! Please upload the application form (PDF or DOCX) to this chat."
+    )]
+
+
+def _application_review_card(scholarship_id: str, scholarship_name: str, draft: dict) -> dict:
+    body = [
+        {
+            "type": "TextBlock",
+            "text": f"Review Draft Answers: {scholarship_name}",
+            "weight": "Bolder",
+            "size": "Medium",
+            "wrap": True,
+        },
+        {
+            "type": "TextBlock",
+            "text": (
+                "I extracted every application question and drafted a response. "
+                "Review below, optionally add missing details, then approve to generate your filled form."
+            ),
+            "wrap": True,
+        },
+    ]
+
+    answers = draft.get("answers", [])
+    if answers:
+        for item in answers:
+            body.extend([
+                {
+                    "type": "TextBlock",
+                    "text": item.get("question", "Question"),
+                    "weight": "Bolder",
+                    "wrap": True,
+                    "spacing": "Medium",
+                },
+                {
+                    "type": "TextBlock",
+                    "text": item.get("answer", ""),
+                    "wrap": True,
+                },
+            ])
+    else:
+        body.append({
+            "type": "TextBlock",
+            "text": (
+                "No essay questions were detected in the form. "
+                "You can still approve to fill your basic profile fields."
+            ),
+            "wrap": True,
+            "color": "Accent",
+        })
+
+    if draft.get("notes"):
+        body.append({
+            "type": "TextBlock",
+            "text": f"Note: {draft['notes']}",
+            "wrap": True,
+            "size": "Small",
+            "color": "Accent",
+        })
+
+    body.append({
+        "type": "Input.Text",
+        "id": "additional_notes",
+        "placeholder": "Optional: add anything missing from your profile or CV",
+        "isMultiline": True,
+        "isRequired": False,
+    })
+
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.3",
+        "body": body,
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "Approve & Download Form",
+                "style": "positive",
+                "data": {"action": "approve_application", "scholarship_id": scholarship_id},
+            },
+            {
+                "type": "Action.Submit",
+                "title": "Cancel",
+                "data": {"action": "cancel_application_review"},
+            },
+        ],
+    }
+
+
+def _build_application_answers_text(draft_answers: list, additional_notes: str = "") -> str:
+    parts = []
+    for item in draft_answers or []:
+        question = str(item.get("question") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if question and answer:
+            parts.append(f"Q: {question}\nA: {answer}")
+    if additional_notes.strip():
+        parts.append(f"Additional notes:\n{additional_notes.strip()}")
+    return "\n\n".join(parts)
+
+
+def _clear_application_review_state(profile: dict) -> None:
+    for key in (
+        "pending_application_review",
+        "application_input_path",
+        "application_output_path",
+        "application_content_type",
+        "application_draft_answers",
+        "application_questions",
+    ):
+        profile.pop(key, None)
+
+
+def _looks_like_application_approval(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    approval_terms = (
+        "approve", "approved", "looks good", "look good", "go ahead",
+        "confirm", "yes download", "download form", "fill the form",
+        "proceed", "that's fine", "thats fine", "all good",
+    )
+    return any(term in normalized for term in approval_terms)
+
+
+def handle_application_form_upload(
+    student_id: str,
+    file_bytes: bytes,
+    filename: str,
+    content_type: str = ""
+) -> list:
+    """Save an uploaded form, extract all questions, draft answers, and ask for approval."""
+    profile = get_profile(student_id)
+    if not profile:
+        return [_text_response("I couldn't find your profile yet. Please complete onboarding first.")]
+
+    if profile.get("pending_application") != "ss_472":
+        return [_text_response(
+            "Tap **Start Application** on the D. H. Chen Foundation Scholarship card first."
+        )]
+
+    if _is_pdf_upload(content_type, filename):
+        input_path = APPLICATION_FORM_PDF
+        output_path = "/tmp/filled_application_form.pdf"
+        stored_content_type = "application/pdf"
+    elif _is_docx_upload(content_type, filename):
+        input_path = APPLICATION_FORM_DOCX
+        output_path = "/tmp/filled_application_form.docx"
+        stored_content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    else:
+        return [_text_response(
+            "Please upload a PDF (`application/pdf`) or DOCX "
+            "(`application/vnd.openxmlformats-officedocument.wordprocessingml.document`) file."
+        )]
+
+    with open(input_path, "wb") as handle:
+        handle.write(file_bytes)
+
+    raw_text = extract_text_from_application_file(input_path)
+    if not raw_text:
+        return [_text_response(
+            "I couldn't extract text from that file. Please upload a text-based PDF or DOCX form."
+        )]
+
+    questions = _normalize_question_items(extract_questions_from_file(file_bytes, filename))
+    question_texts = [q["text"] for q in questions]
+    scholarship = DEMO_SCHOLARSHIP_472.copy()
+
+    draft = {"answers": [], "notes": "", "scholarship_name": scholarship["name"]}
+    if question_texts:
+        draft = generate_draft_answers(
+            student_id,
+            "ss_472",
+            question_texts,
+            scholarship=scholarship,
+        )
+        if draft.get("error"):
+            return [_text_response(f"I couldn't draft answers yet: {draft['error']}")]
+
+    profile.pop("pending_application", None)
+    profile["pending_application_review"] = "ss_472"
+    profile["application_input_path"] = input_path
+    profile["application_output_path"] = output_path
+    profile["application_content_type"] = stored_content_type
+    profile["application_draft_answers"] = draft.get("answers", [])
+    profile["application_questions"] = questions
+    profile["last_scholarship_id"] = "ss_472"
+    profile["last_scholarship_name"] = scholarship["name"]
+    save_profile(profile)
+
+    summary = (
+        f"I extracted {len(question_texts)} question(s) and drafted responses for your review."
+        if question_texts else
+        "I couldn't detect essay questions, but you can still approve to fill your profile details."
+    )
+    return [
+        _text_response(summary),
+        _card_response(
+            "Review your draft answers. Approve when you're ready and I'll fill the form.",
+            _application_review_card("ss_472", scholarship["name"], draft),
+        ),
+    ]
+
+
+def handle_approve_application(student_id: str, form_data: dict | None = None) -> list:
+    """Fill the uploaded form after the student approves the drafted answers."""
+    form_data = form_data or {}
+    profile = get_profile(student_id)
+    if not profile or profile.get("pending_application_review") != "ss_472":
+        return [_text_response("No application is waiting for approval right now.")]
+
+    input_path = profile.get("application_input_path")
+    output_path = profile.get("application_output_path")
+    if not input_path or not output_path or not os.path.exists(input_path):
+        return [_text_response("I couldn't find your uploaded form. Please upload it again.")]
+
+    additional_notes = str(form_data.get("additional_notes") or "").strip()
+    draft_answers = profile.get("application_draft_answers", [])
+    scholarship = DEMO_SCHOLARSHIP_472.copy()
+    answers_text = _build_application_answers_text(draft_answers, additional_notes)
+    scholarship["drafted_cover_letter"] = answers_text
+    scholarship["application_answers_text"] = answers_text
+
+    filled = fill_application_form(input_path, output_path, profile, scholarship)
+    if not filled or not os.path.exists(output_path):
+        return [_text_response(
+            "I couldn't fill that form template. Please try a PDF with form fields or a DOCX with placeholders."
+        )]
+
+    with open(output_path, "rb") as handle:
+        file_bytes = handle.read()
+
+    filename = os.path.basename(output_path)
+    content_type = profile.get("application_content_type", "application/octet-stream")
+
+    _clear_application_review_state(profile)
+    save_profile(profile)
+
+    return [
+        _text_response("✅ Approved! Here is your filled application form:"),
+        _file_download_response(
+            filename,
+            file_bytes,
+            content_type,
+            f"Download `{filename}` below.",
+        ),
+    ]
+
+
+def handle_cancel_application_review(student_id: str) -> list:
+    profile = get_profile(student_id)
+    if profile:
+        _clear_application_review_state(profile)
+        save_profile(profile)
+    return [_text_response("Application review cancelled. Tap **Start Application** whenever you're ready to try again.")]
+
+
 def handle_form_uploaded(student_id: str, file_bytes: bytes, filename: str) -> list:
     """Extract questions from an uploaded application form."""
     profile = get_profile(student_id)
@@ -1693,6 +2040,7 @@ def handle_message(student_id: str, message: dict) -> list:
         and profile
         and profile.get("onboarding_complete")
         and not profile.get("pending_action")
+        and not profile.get("pending_application_review")
     ):
         return [_text_response("For security, I cannot process edits to previous messages. Please send a new message instead.")]
 
@@ -1737,6 +2085,15 @@ def handle_message(student_id: str, message: dict) -> list:
 
     if action == "semester_refresh_dismiss":
         return handle_semester_refresh(student_id, value, dismissed=True)
+
+    if action == "start_app_472":
+        return handle_start_application(student_id)
+
+    if action == "approve_application":
+        return handle_approve_application(student_id, value)
+
+    if action == "cancel_application_review":
+        return handle_cancel_application_review(student_id)
 
     if action == "start_draft":
         scholarship_id = value.get("scholarship_id", " ")
@@ -1832,6 +2189,15 @@ def handle_message(student_id: str, message: dict) -> list:
         "scholarship", "scholarships", "show scholarships",
         "browse scholarships", "show me scholarships", "scholarship matches"
     }
+    if profile and profile.get("pending_application_review") and _looks_like_application_approval(text):
+        return handle_approve_application(student_id, {})
+
+    if profile and profile.get("pending_application_review") and text:
+        return [_text_response(
+            "Your draft answers are ready for review. "
+            "Use **Approve & Download Form** on the card above, or reply **approve** when you're happy with them."
+        )]
+
     if text in scholarship_commands:
         return handle_get_scholarships(student_id)
 
