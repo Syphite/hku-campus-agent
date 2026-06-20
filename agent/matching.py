@@ -48,6 +48,86 @@ with open(PROMPT_PATH) as f:
 # Stage 1 — Structured Azure AI Search filter
 # ---------------------------------------------------------------------------
 
+def _student_gpa(profile: dict) -> float:
+    try:
+        return float(profile.get("academic", {}).get("gpa") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _faculty_matches(index_faculties, student_faculty: str) -> bool:
+    """Loose faculty match — handles 'Engineering' vs 'Faculty of Engineering'."""
+    if not student_faculty:
+        return True
+    if index_faculties in (None, "", []):
+        return True
+    if not isinstance(index_faculties, list):
+        index_faculties = [index_faculties]
+    student = str(student_faculty).strip().lower()
+    for value in index_faculties:
+        faculty = str(value).strip().lower()
+        if not faculty or faculty == "all":
+            return True
+        if student == faculty or student in faculty or faculty in student:
+            return True
+    return False
+
+
+def _year_matches(index_years, student_year: str) -> bool:
+    if index_years in (None, "", []):
+        return True
+    if not isinstance(index_years, list):
+        index_years = [index_years]
+    student_year = str(student_year).strip().lower()
+    normalized = {str(value).strip().lower() for value in index_years if str(value).strip()}
+    if not normalized or "all" in normalized:
+        return True
+    if student_year in normalized:
+        return True
+    if student_year == "1" and "new_student" in normalized:
+        return True
+    return False
+
+
+PROTOTYPE_SCHOLARSHIP_472 = {
+    "id": "ss_472",
+    "scholarship_id": "ss_472",
+    "name": "D. H. Chen Foundation Scholarship",
+    "qualifies": True,
+    "match_strength": "strong",
+    "program_match": "faculty_only",
+    "reason": "Your GPA meets the 3.5 minimum requirement for this scholarship.",
+    "gap": None,
+    "application_notes": "Tap Start Application to upload and auto-fill the form.",
+    "deadline_raw": "See scholarship page for deadline",
+    "deadline_iso": None,
+    "application_method": "https://aas.hku.hk/apply-scholarships/",
+    "application_url": "https://scholar.aas.hku.hk/?action=showonesscheme&ss_id=472",
+    "source_url": "https://scholar.aas.hku.hk/?action=showonesscheme&ss_id=472",
+    "is_prototype": True,
+    "gpa_requirement": 3.5,
+}
+
+
+def _inject_prototype_scholarship_472(result: dict, profile: dict) -> dict:
+    """Always include ss_472 in results when the student GPA is at least 3.5."""
+    if _student_gpa(profile) < 3.5:
+        return result
+
+    existing_ids = {
+        str(item.get("scholarship_id") or item.get("id") or "")
+        for item in result.get("apply_now", []) + result.get("prepare", [])
+    }
+    if "ss_472" in existing_ids:
+        return result
+
+    prepare = list(result.get("prepare", []))
+    prepare.insert(0, PROTOTYPE_SCHOLARSHIP_472.copy())
+    result["prepare"] = prepare
+    result["prepare_count"] = len(prepare)
+    return result
+
+
 def _stage1_search(profile: dict) -> list[dict]:
     """
     Filter scholarships using structured fields.
@@ -55,50 +135,32 @@ def _stage1_search(profile: dict) -> list[dict]:
     Costs essentially nothing — just a database query.
     """
     academic  = profile.get("academic", {})
-    financial = profile.get("financial", {})
 
     faculty      = academic.get("faculty", "")
     level        = academic.get("level", "undergraduate")
     gpa          = academic.get("gpa", 0.0)
     local_status = academic.get("nationality", {}).get("local_status", "local")
-    need_opt_in  = financial.get("financial_need_opt_in", False)
     year         = str(academic.get("year_of_study", 1))
 
-    # Build OData filter
+    # Build a relatively loose OData filter; faculty/year are checked in Python.
     filters = []
 
-    # Faculty: match student faculty OR "all"
-    filters.append(f"(faculty/any(f: f eq '{faculty}') or faculty/any(f: f eq 'all'))")
-
-    # Level: match student level OR "all"
     filters.append(f"(level/any(l: l eq '{level}') or level/any(l: l eq 'all'))")
 
-    # GPA: no requirement, or requirement student meets. No near-miss buffer.
     if gpa and gpa > 0:
         filters.append(f"(gpa_requirement eq null or gpa_requirement le {gpa})")
 
-    # Year: match student year OR all when the index has structured year data.
-    filters.append(f"(year_of_study/any(y: y eq '{year}') or year_of_study/any(y: y eq 'all'))")
-
-    # Financial need: if student opted out, exclude need-only scholarships
-    if not need_opt_in:
-        # Include scholarships that are not purely need-based
-        # (merit=True covers most; enrichment and entrance also fine)
-        filters.append("(merit_based eq true or is_enrichment eq true or is_entrance eq true or financial_need eq false)")
-
-    # Nationality: local/non-local
     if local_status == "local":
         filters.append("(nationality/any(n: n eq 'local') or nationality/any(n: n eq 'all'))")
     else:
         filters.append("(nationality/any(n: n eq 'non-local') or nationality/any(n: n eq 'all'))")
 
-    filter_str = " and ".join(filters)
+    filter_str = " and ".join(filters) if filters else None
 
     client  = SearchClient(SEARCH_ENDPOINT, INDEX_NAME, AzureKeyCredential(SEARCH_API_KEY))
-    results = client.search(
-        search_text="*",
-        filter=filter_str,
-        select=[
+    search_kwargs = {
+        "search_text": faculty or "*",
+        "select": [
             "id", "name", "faculty", "level", "year_of_study", "nationality",
             "gpa_requirement", "financial_need", "merit_based", "is_entrance",
             "is_enrichment", "deadline_raw", "deadline_iso", "is_open",
@@ -106,10 +168,21 @@ def _stage1_search(profile: dict) -> list[dict]:
             "eligibility_raw", "amount", "currency", "provider", "duration",
             "place_of_origin", "renewal_conditions"
         ],
-        top=15
-    )
+        "top": 25,
+    }
+    if filter_str:
+        search_kwargs["filter"] = filter_str
 
-    candidates = list(results)
+    results = client.search(**search_kwargs)
+
+    candidates = []
+    for candidate in results:
+        if not _faculty_matches(candidate.get("faculty"), faculty):
+            continue
+        if not _year_matches(candidate.get("year_of_study"), year):
+            continue
+        candidates.append(candidate)
+
     logger.info(f"Stage 1: {len(candidates)} candidates after structured filter")
     return candidates
 
@@ -159,11 +232,11 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
         financial = profile.get("financial", {})
         local_status = academic.get("nationality", {}).get("local_status", "local")
 
-        if not value_matches_student(item.get("faculty"), academic.get("faculty", "")):
+        if not _faculty_matches(item.get("faculty"), academic.get("faculty", "")):
             return False
         if not value_matches_student(item.get("level"), academic.get("level", "undergraduate")):
             return False
-        if not value_matches_student(item.get("year_of_study"), str(academic.get("year_of_study", ""))):
+        if not _year_matches(item.get("year_of_study"), str(academic.get("year_of_study", ""))):
             return False
         if not value_matches_student(item.get("nationality"), local_status):
             return False
@@ -312,11 +385,6 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
             result["program_match"] = program_match
             if program_match not in ("exact", "faculty_only"):
                 logger.info(f"Filtered out {scholarship_id}: hard requirement mismatch - program_match={program_match}")
-                continue
-            if program_match == "faculty_only" and is_programme_specific_mismatch(result):
-                logger.info(
-                    f"Filtered out {scholarship_id}: hard requirement mismatch - specific programme requirement"
-                )
                 continue
             remove_unsupported_application_notes(result)
             strict_results.append(result)
@@ -504,7 +572,8 @@ def run_matching(student_id: str) -> dict:
     cache = profile.get("scholarship_cache") or {}
     cached_result = cache.get("result")
     cached_timestamp = cache.get("timestamp")
-    if cached_result and cached_timestamp:
+    cached_version = cache.get("version", 1)
+    if cached_result and cached_timestamp and cached_version >= 2:
         try:
             cached_at = datetime.fromisoformat(str(cached_timestamp).replace("Z", "+00:00"))
             if cached_at.tzinfo is None:
@@ -528,9 +597,11 @@ def run_matching(student_id: str) -> dict:
             "student_id": student_id,
             "student_name": profile.get("name", "")
         }
+        result = _inject_prototype_scholarship_472(result, profile)
         profile["scholarship_cache"] = {
             "result": result,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": 2,
         }
         save_profile(profile)
         return result
@@ -541,11 +612,13 @@ def run_matching(student_id: str) -> dict:
         if m.get("qualifies") is True and str(m.get("match_strength", "")).lower() == "strong"
     ]
     result      = _sort_and_package(matched)
+    result      = _inject_prototype_scholarship_472(result, profile)
     result["student_id"]   = student_id
     result["student_name"] = profile.get("name", "")
     profile["scholarship_cache"] = {
         "result": result,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": 2,
     }
     save_profile(profile)
     return result

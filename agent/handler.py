@@ -869,8 +869,6 @@ def _append_scholarship_cards(responses: list, scholarships: list, tier: str, of
         })
 
 def _append_scholarship_sections(responses: list, scholarship_result: dict, show_empty: bool = True) -> None:
-    _append_demo_application_scholarship(responses)
-
     apply_now = _strong_scholarships(scholarship_result.get("apply_now", []))
     if apply_now:
         responses.append(_text_response("**📋 Apply Now**"))
@@ -949,14 +947,22 @@ def _scholarship_cards(scholarships: list, tier: str) -> list:
             })
 
         actions = []
-        if is_open:
+        scholarship_id = _scholarship_identifier(s)
+        if scholarship_id == "ss_472" or s.get("is_prototype"):
+            actions.append({
+                "type": "Action.Submit",
+                "title": "Start Application",
+                "style": "positive",
+                "data": {"action": "start_app_472"},
+            })
+        elif is_open:
             actions.append({
                 "type": "Action.Submit",
                 "title": "Start Draft",
                 "style": "positive",
                 "data": {
                     "action": "start_draft",
-                    "scholarship_id": s.get("scholarship_id") or s.get("id"),
+                    "scholarship_id": scholarship_id,
                     "scholarship_name": s.get("name", "Scholarship")
                 }
             })
@@ -978,50 +984,6 @@ def _scholarship_cards(scholarships: list, tier: str) -> list:
         }
         cards.append(card)
     return cards
-
-def _demo_application_scholarship_card() -> dict:
-    scholarship = DEMO_SCHOLARSHIP_472
-    return {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "type": "AdaptiveCard",
-        "version": "1.3",
-        "body": [
-            {
-                "type": "TextBlock",
-                "text": f"🟢 {scholarship['name']}",
-                "weight": "Bolder",
-                "wrap": True
-            },
-            {
-                "type": "FactSet",
-                "facts": [
-                    {"title": "Source", "value": "HKU Internal"},
-                    {"title": "Match", "value": "Strong"},
-                    {"title": "Demo", "value": "Upload a PDF or DOCX form to auto-fill"},
-                ]
-            }
-        ],
-        "actions": [
-            {
-                "type": "Action.Submit",
-                "title": "Start Application",
-                "style": "positive",
-                "data": {"action": "start_app_472"}
-            },
-            {
-                "type": "Action.OpenUrl",
-                "title": "View Scholarship",
-                "url": scholarship["source_url"]
-            }
-        ]
-    }
-
-def _append_demo_application_scholarship(responses: list) -> None:
-    responses.append(_text_response("**📋 Featured Application**"))
-    responses.append(_card_response(
-        "Try the guided application flow for the D. H. Chen Foundation Scholarship:",
-        _demo_application_scholarship_card()
-    ))
 
 def _is_pdf_upload(content_type: str, filename: str) -> bool:
     return (content_type or "").lower() == "application/pdf" or (filename or "").lower().endswith(".pdf")
