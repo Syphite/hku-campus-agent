@@ -22,6 +22,7 @@
         { "title": "🎓 Scholarships", "value": "Type 'scholarships' to browse matches." },
         { "title": "📅 Events", "value": "Type 'events' to see upcoming hackathons and talks." },
         { "title": "📧 Inbox", "value": "Type 'inbox' to review your archived emails." },
+        { "title": "👤 View Profile", "value": "Type 'show my profile' or 'my settings' to see your current preferences." },
         { "title": "✏️ Update Profile", "value": "Type 'change my [field] to [value]' (e.g., 'change faculty to Arts')." }
       ]
     }

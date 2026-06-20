@@ -34,6 +34,14 @@ async def messages(req: web.Request) -> web.Response:
         if turn_context.activity.type != "message":
             return
 
+        channel_data = turn_context.activity.channel_data or {}
+        if not isinstance(channel_data, dict):
+            channel_data = {}
+        event_type = str(channel_data.get("eventType") or channel_data.get("event_type") or "").lower()
+        activity_name = str(getattr(turn_context.activity, "name", "") or "").lower()
+        if "edit" in event_type or "update" in event_type or "edit" in activity_name or "update" in activity_name:
+            return
+
         from_property = turn_context.activity.from_property
         student_id = from_property.id if from_property and from_property.id else None
 

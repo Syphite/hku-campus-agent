@@ -16,37 +16,68 @@
       "wrap": true
     },
     {
+      "type": "TextBlock",
+      "text": "👤 Your Profile",
+      "weight": "Bolder",
+      "size": "Medium",
+      "color": "Accent",
+      "spacing": "Large",
+      "separator": true
+    },
+    {
       "type": "Input.Text",
       "id": "name",
       "label": "Display Name * (required)",
-      "placeholder": "e.g. Alex Chen",
-      "spacing": "Medium"
+      "placeholder": "e.g. Alex Chen"
     },
     {
-      "type": "TextBlock",
-      "text": "Basic Info",
-      "size": "Medium",
-      "weight": "Bolder",
-      "separator": true,
-      "spacing": "Medium"
-    },
-    {
-      "type": "Input.ChoiceSet",
-      "id": "faculty",
-      "label": "Faculty * (required)",
-      "style": "compact",
-      "choices": [
-        { "title": "Architecture", "value": "Architecture" },
-        { "title": "Arts", "value": "Arts" },
-        { "title": "Business and Economics", "value": "Business and Economics" },
-        { "title": "Dentistry", "value": "Dentistry" },
-        { "title": "Education", "value": "Education" },
-        { "title": "Engineering", "value": "Engineering" },
-        { "title": "Law", "value": "Law" },
-        { "title": "Medicine", "value": "Medicine" },
-        { "title": "Science", "value": "Science" },
-        { "title": "Social Sciences", "value": "Social Sciences" },
-        { "title": "School of Computing and Data Science", "value": "School of Computing and Data Science" }
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "Input.ChoiceSet",
+              "id": "faculty",
+              "label": "Faculty * (required)",
+              "style": "compact",
+              "choices": [
+                { "title": "Architecture", "value": "Architecture" },
+                { "title": "Arts", "value": "Arts" },
+                { "title": "Business and Economics", "value": "Business and Economics" },
+                { "title": "Dentistry", "value": "Dentistry" },
+                { "title": "Education", "value": "Education" },
+                { "title": "Engineering", "value": "Engineering" },
+                { "title": "Law", "value": "Law" },
+                { "title": "Medicine", "value": "Medicine" },
+                { "title": "Science", "value": "Science" },
+                { "title": "Social Sciences", "value": "Social Sciences" },
+                { "title": "School of Computing and Data Science", "value": "School of Computing and Data Science" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "Input.ChoiceSet",
+              "id": "year_of_study",
+              "label": "Year of Study * (required)",
+              "style": "compact",
+              "choices": [
+                { "title": "Year 1", "value": "1" },
+                { "title": "Year 2", "value": "2" },
+                { "title": "Year 3", "value": "3" },
+                { "title": "Year 4", "value": "4" },
+                { "title": "Year 5+", "value": "5" },
+                { "title": "Postgraduate", "value": "postgraduate" }
+              ]
+            }
+          ]
+        }
       ]
     },
     {
@@ -56,35 +87,47 @@
       "placeholder": "e.g. Bachelor of Engineering in Computer Science"
     },
     {
-      "type": "Input.ChoiceSet",
-      "id": "year_of_study",
-      "label": "Year of Study * (required)",
-      "style": "compact",
-      "choices": [
-        { "title": "Year 1", "value": "1" },
-        { "title": "Year 2", "value": "2" },
-        { "title": "Year 3", "value": "3" },
-        { "title": "Year 4", "value": "4" },
-        { "title": "Year 5+", "value": "5" },
-        { "title": "Postgraduate", "value": "postgraduate" }
-      ]
+      "type": "TextBlock",
+      "text": "🎓 Academic Details",
+      "weight": "Bolder",
+      "size": "Medium",
+      "color": "Accent",
+      "spacing": "Large",
+      "separator": true
     },
     {
-      "type": "Input.ChoiceSet",
-      "id": "local_status",
-      "label": "Student Status * (required)",
-      "style": "compact",
-      "value": "local",
-      "choices": [
-        { "title": "Local (Hong Kong)", "value": "local" },
-        { "title": "Non-local", "value": "non-local" }
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "Input.Text",
+              "id": "gpa",
+              "label": "CGPA (Optional)",
+              "placeholder": "e.g. 3.7"
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "Input.ChoiceSet",
+              "id": "local_status",
+              "label": "Student Status * (required)",
+              "style": "compact",
+              "value": "local",
+              "choices": [
+                { "title": "Local (Hong Kong)", "value": "local" },
+                { "title": "Non-local", "value": "non-local" }
+              ]
+            }
+          ]
+        }
       ]
-    },
-    {
-      "type": "Input.Text",
-      "id": "gpa",
-      "label": "CGPA (Optional)",
-      "placeholder": "e.g. 3.7"
     },
     {
       "type": "Input.ChoiceSet",
@@ -98,11 +141,12 @@
     },
     {
       "type": "TextBlock",
-      "text": "Interests & Activities",
-      "size": "Medium",
+      "text": "💡 Your Interests",
       "weight": "Bolder",
-      "separator": true,
-      "spacing": "Medium"
+      "size": "Medium",
+      "color": "Accent",
+      "spacing": "Large",
+      "separator": true
     },
     {
       "type": "Input.Text",
@@ -119,11 +163,17 @@
     },
     {
       "type": "TextBlock",
-      "text": "Module Opt-ins * (select at least one)",
-      "size": "Medium",
+      "text": "⚙️ What I Help With",
       "weight": "Bolder",
-      "separator": true,
-      "spacing": "Medium"
+      "size": "Medium",
+      "color": "Accent",
+      "spacing": "Large",
+      "separator": true
+    },
+    {
+      "type": "TextBlock",
+      "text": "Select at least one module.",
+      "wrap": true
     },
     {
       "type": "Input.Toggle",
@@ -135,7 +185,7 @@
     },
     {
       "type": "TextBlock",
-      "text": "💡 If you enable Scholarship Matching, I'll ask you for your CGPA and financial need information in the next step to find the best matches.",
+      "text": "💡 Recommended: Add your CGPA and financial need info for better scholarship matches (optional)",
       "wrap": true,
       "spacing": "Small"
     },
@@ -158,10 +208,11 @@
     {
       "type": "TextBlock",
       "text": "Notification Preference",
-      "size": "Medium",
       "weight": "Bolder",
-      "separator": true,
-      "spacing": "Medium"
+      "size": "Medium",
+      "color": "Accent",
+      "spacing": "Large",
+      "separator": true
     },
     {
       "type": "Input.ChoiceSet",
@@ -177,125 +228,70 @@
     },
     {
       "type": "TextBlock",
-      "text": "Timetable (Optional - add if you want conflict checking)",
-      "size": "Medium",
+      "text": "📅 Schedule (Optional - for conflict checking)",
       "weight": "Bolder",
-      "separator": true,
-      "spacing": "Medium"
+      "size": "Medium",
+      "color": "Accent",
+      "spacing": "Large",
+      "separator": true
     },
     {
       "type": "TextBlock",
-      "text": "Add your first regular class. You can add more rows later.",
-      "wrap": true,
-      "size": "Small"
+      "text": "Class 1",
+      "weight": "Bolder",
+      "wrap": true
     },
     {
       "type": "ColumnSet",
       "columns": [
-        {
-          "type": "Column",
-          "width": "stretch",
-          "items": [
-            {
-              "type": "Input.Text",
-              "id": "class1_code",
-              "label": "Course Code",
-              "placeholder": "e.g. COMP3230"
-            }
-          ]
-        },
-        {
-          "type": "Column",
-          "width": "auto",
-          "items": [
-            {
-              "type": "Input.ChoiceSet",
-              "id": "class1_day",
-              "label": "Day",
-              "style": "compact",
-              "choices": [
-                { "title": "Mon", "value": "Monday" },
-                { "title": "Tue", "value": "Tuesday" },
-                { "title": "Wed", "value": "Wednesday" },
-                { "title": "Thu", "value": "Thursday" },
-                { "title": "Fri", "value": "Friday" }
-              ]
-            }
-          ]
-        },
-        {
-          "type": "Column",
-          "width": "auto",
-          "items": [
-            {
-              "type": "Input.ChoiceSet",
-              "id": "class1_start",
-              "label": "Start",
-              "style": "compact",
-              "choices": [
-                { "title": "09:00", "value": "09:00" },
-                { "title": "10:00", "value": "10:00" },
-                { "title": "11:00", "value": "11:00" },
-                { "title": "12:00", "value": "12:00" },
-                { "title": "13:00", "value": "13:00" },
-                { "title": "14:00", "value": "14:00" },
-                { "title": "15:00", "value": "15:00" },
-                { "title": "16:00", "value": "16:00" },
-                { "title": "17:00", "value": "17:00" },
-                { "title": "18:00", "value": "18:00" }
-              ]
-            }
-          ]
-        },
-        {
-          "type": "Column",
-          "width": "auto",
-          "items": [
-            {
-              "type": "Input.ChoiceSet",
-              "id": "class1_end",
-              "label": "End",
-              "style": "compact",
-              "choices": [
-                { "title": "10:00", "value": "10:00" },
-                { "title": "11:00", "value": "11:00" },
-                { "title": "12:00", "value": "12:00" },
-                { "title": "13:00", "value": "13:00" },
-                { "title": "14:00", "value": "14:00" },
-                { "title": "15:00", "value": "15:00" },
-                { "title": "16:00", "value": "16:00" },
-                { "title": "17:00", "value": "17:00" },
-                { "title": "18:00", "value": "18:00" },
-                { "title": "19:00", "value": "19:00" }
-              ]
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "type": "ActionSet",
-      "actions": [
-        {
-          "type": "Action.Submit",
-          "title": "➕ Add Another Class",
-          "data": {
-            "action": "add_timetable_row"
-          }
-        }
+        { "type": "Column", "width": "stretch", "items": [ { "type": "Input.Text", "id": "class1_code", "label": "Course Code", "placeholder": "e.g. COMP3230" } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class1_day", "label": "Day", "style": "compact", "choices": [ { "title": "Mon", "value": "Monday" }, { "title": "Tue", "value": "Tuesday" }, { "title": "Wed", "value": "Wednesday" }, { "title": "Thu", "value": "Thursday" }, { "title": "Fri", "value": "Friday" } ] } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class1_start", "label": "Start", "style": "compact", "choices": [ { "title": "09:00", "value": "09:00" }, { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" } ] } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class1_end", "label": "End", "style": "compact", "choices": [ { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" }, { "title": "19:00", "value": "19:00" } ] } ] }
       ]
     },
     {
       "type": "TextBlock",
-      "text": "CV Upload (Optional)",
-      "size": "Medium",
+      "text": "Class 2",
       "weight": "Bolder",
-      "separator": true,
-      "spacing": "Medium"
+      "wrap": true
+    },
+    {
+      "type": "ColumnSet",
+      "columns": [
+        { "type": "Column", "width": "stretch", "items": [ { "type": "Input.Text", "id": "class2_code", "label": "Course Code", "placeholder": "Optional" } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class2_day", "label": "Day", "style": "compact", "choices": [ { "title": "Mon", "value": "Monday" }, { "title": "Tue", "value": "Tuesday" }, { "title": "Wed", "value": "Wednesday" }, { "title": "Thu", "value": "Thursday" }, { "title": "Fri", "value": "Friday" } ] } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class2_start", "label": "Start", "style": "compact", "choices": [ { "title": "09:00", "value": "09:00" }, { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" } ] } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class2_end", "label": "End", "style": "compact", "choices": [ { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" }, { "title": "19:00", "value": "19:00" } ] } ] }
+      ]
     },
     {
       "type": "TextBlock",
-      "text": "CV Upload: Attach your PDF CV to this chat and type upload cv after submitting this form.",
+      "text": "Class 3",
+      "weight": "Bolder",
+      "wrap": true
+    },
+    {
+      "type": "ColumnSet",
+      "columns": [
+        { "type": "Column", "width": "stretch", "items": [ { "type": "Input.Text", "id": "class3_code", "label": "Course Code", "placeholder": "Optional" } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class3_day", "label": "Day", "style": "compact", "choices": [ { "title": "Mon", "value": "Monday" }, { "title": "Tue", "value": "Tuesday" }, { "title": "Wed", "value": "Wednesday" }, { "title": "Thu", "value": "Thursday" }, { "title": "Fri", "value": "Friday" } ] } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class3_start", "label": "Start", "style": "compact", "choices": [ { "title": "09:00", "value": "09:00" }, { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" } ] } ] },
+        { "type": "Column", "width": "auto", "items": [ { "type": "Input.ChoiceSet", "id": "class3_end", "label": "End", "style": "compact", "choices": [ { "title": "10:00", "value": "10:00" }, { "title": "11:00", "value": "11:00" }, { "title": "12:00", "value": "12:00" }, { "title": "13:00", "value": "13:00" }, { "title": "14:00", "value": "14:00" }, { "title": "15:00", "value": "15:00" }, { "title": "16:00", "value": "16:00" }, { "title": "17:00", "value": "17:00" }, { "title": "18:00", "value": "18:00" }, { "title": "19:00", "value": "19:00" } ] } ] }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "📄 CV Upload",
+      "weight": "Bolder",
+      "size": "Medium",
+      "color": "Accent",
+      "spacing": "Large",
+      "separator": true
+    },
+    {
+      "type": "TextBlock",
+      "text": "Attach your PDF CV to this chat and type CV after submitting this form.",
       "wrap": true,
       "color": "Good"
     }

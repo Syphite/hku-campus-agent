@@ -5,6 +5,7 @@ Copilot Chat entry point for the HKU Campus Agent.
 import os
 import json
 import logging
+import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -121,68 +122,8 @@ def _remove_default_value(items: list, input_id: str) -> None:
             _remove_default_value(column.get("items", []), input_id)
 
 def _build_onboarding_card(num_rows: int = 1) -> dict:
-    """Build the onboarding card and dynamically size the timetable section."""
-    try:
-        num_rows = max(1, min(int(num_rows), 3))
-    except (TypeError, ValueError):
-        num_rows = 1
-
-    card = deepcopy(_load_card("onboarding_card"))
-    body = card.get("body", [])
-    _remove_default_value(body, "financial_need_opt_in")
-
-    timetable_start = next(
-        (
-            idx for idx, item in enumerate(body)
-            if item.get("type") == "TextBlock"
-            and str(item.get("text", "")).startswith("Timetable")
-        ),
-        None
-    )
-    cv_start = next(
-        (
-            idx for idx, item in enumerate(body)
-            if item.get("type") == "TextBlock"
-            and str(item.get("text", "")).startswith("CV Upload")
-        ),
-        None
-    )
-    if timetable_start is None or cv_start is None or cv_start <= timetable_start:
-        return card
-
-    timetable_section = [
-        {
-            "type": "TextBlock",
-            "text": "Timetable (Optional - add if you want conflict checking)",
-            "size": "Medium",
-            "weight": "Bolder",
-            "separator": True,
-            "spacing": "Medium"
-        },
-        {
-            "type": "TextBlock",
-            "text": "Add your regular classes. You can add up to 3 rows.",
-            "wrap": True,
-            "size": "Small"
-        },
-        *[_timetable_row(row_num) for row_num in range(1, num_rows + 1)]
-    ]
-    if num_rows < 3:
-        timetable_section.append({
-            "type": "ActionSet",
-            "actions": [
-                {
-                    "type": "Action.Submit",
-                    "title": "➕ Add Another Class",
-                    "data": {
-                        "action": "add_timetable_row"
-                    }
-                }
-            ]
-        })
-
-    card["body"] = body[:timetable_start] + timetable_section + body[cv_start:]
-    return card
+    """Build the onboarding card."""
+    return deepcopy(_load_card("onboarding_card"))
 
 # ---------------------------------------------------------------------------
 # Response builders
@@ -214,19 +155,29 @@ def _get_profile_field(profile: dict, field: str):
     financial = profile.get("financial", {})
     nationality = academic.get("nationality", {})
 
+    if field == "name":
+        return profile.get("name")
     if field in ("faculty", "programme"):
         return academic.get(field)
+    if field == "year_of_study":
+        return academic.get("year_of_study")
     if field == "gpa":
         return academic.get("gpa")
     if field == "local_status":
         return nationality.get("local_status")
     if field == "financial_need_opt_in":
         return financial.get("financial_need_opt_in")
+    if field == "notification_preference":
+        return profile.get("preferences", {}).get("notification_preference")
     return profile.get(field)
 
 def _set_profile_field(profile: dict, field: str, value) -> None:
-    if field in ("faculty", "programme"):
+    if field == "name":
+        profile["name"] = value
+    elif field in ("faculty", "programme"):
         profile.setdefault("academic", {})[field] = value
+    elif field == "year_of_study":
+        profile.setdefault("academic", {})["year_of_study"] = value
     elif field == "gpa":
         try:
             profile.setdefault("academic", {})["gpa"] = float(value)
@@ -238,6 +189,9 @@ def _set_profile_field(profile: dict, field: str, value) -> None:
         if isinstance(value, str):
             value = value.strip().lower() in ("true", "yes", "y", "1")
         profile.setdefault("financial", {})["financial_need_opt_in"] = bool(value)
+    elif field == "notification_preference":
+        profile.setdefault("preferences", {})["notification_preference"] = value
+        profile.setdefault("preferences", {})["digest_frequency"] = _digest_frequency_from_preference(value)
     elif field == "interests":
         current_interests = profile.get("interests", [])
         if not isinstance(current_interests, list):
@@ -254,6 +208,11 @@ def _set_profile_field(profile: dict, field: str, value) -> None:
                 current_interests.append(cleaned)
                 seen.add(key)
         profile["interests"] = current_interests
+    elif field == "activities":
+        if isinstance(value, list):
+            profile["activities"] = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            profile["activities"] = [str(value).strip()] if str(value).strip() else []
     else:
         profile[field] = value
 
@@ -262,6 +221,352 @@ def _restore_profile_field(profile: dict, field: str, value) -> None:
         profile["interests"] = value if isinstance(value, list) else []
     else:
         _set_profile_field(profile, field, value)
+
+FIELD_LABELS = {
+    "name": "Name",
+    "faculty": "Faculty",
+    "programme": "Programme",
+    "year_of_study": "Year of Study",
+    "local_status": "Student Status",
+    "interests": "Interests",
+    "activities": "Activities",
+    "gpa": "CGPA",
+    "financial_need_opt_in": "Financial Need",
+    "notification_preference": "Notification Preference",
+    "module_scholarships": "Scholarships Module",
+    "module_events": "Events Module",
+    "module_inbox": "Inbox Module"
+}
+
+SENSITIVE_PROFILE_FIELDS = {"faculty", "programme", "year_of_study", "local_status"}
+
+def _field_label(field: str) -> str:
+    return FIELD_LABELS.get(field, str(field).replace("_", " ").title())
+
+def _digest_frequency_from_preference(preference: str) -> dict:
+    return {
+        "daily_morning": {
+            "email": "daily",
+            "scholarships": "weekly",
+            "events": "daily"
+        },
+        "weekly_summary": {
+            "email": "weekly",
+            "scholarships": "weekly",
+            "events": "weekly"
+        },
+        "urgent_only": {
+            "email": "urgent",
+            "scholarships": "weekly",
+            "events": "urgent"
+        }
+    }.get(preference, {
+        "email": "daily",
+        "scholarships": "weekly",
+        "events": "daily"
+    })
+
+def _profile_card_response(student_id: str) -> dict:
+    profile = get_profile(student_id)
+    if not profile:
+        return _card_response("Please complete onboarding first.", _build_onboarding_card())
+
+    academic = profile.get("academic", {})
+    nationality = academic.get("nationality", {})
+    financial = profile.get("financial", {})
+    preferences = profile.get("preferences", {})
+    facts = [
+        {"title": "Name", "value": str(profile.get("name", "Student"))},
+        {"title": "Faculty", "value": str(academic.get("faculty", "Not set"))},
+        {"title": "Programme", "value": str(academic.get("programme", "Not set"))},
+        {"title": "Year of Study", "value": str(academic.get("year_of_study", "Not set"))},
+        {"title": "Student Status", "value": str(nationality.get("local_status", "Not set"))},
+        {"title": "CGPA", "value": str(academic.get("gpa", "Not set"))},
+        {"title": "Financial Need", "value": "Yes" if financial.get("financial_need_opt_in") else "No"},
+        {"title": "Interests", "value": ", ".join(profile.get("interests", [])) or "Not set"},
+        {"title": "Activities", "value": ", ".join(profile.get("activities", [])) or "Not set"},
+        {"title": "Enabled Modules", "value": ", ".join(preferences.get("modules_enabled", [])) or "None"},
+        {"title": "Notification Frequency", "value": json.dumps(preferences.get("digest_frequency", {}))}
+    ]
+    card = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "Your Profile",
+                "weight": "Bolder",
+                "size": "Medium",
+                "wrap": True
+            },
+            {
+                "type": "FactSet",
+                "facts": facts
+            }
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "Edit Profile",
+                "data": {
+                    "action": "edit_profile"
+                }
+            }
+        ]
+    }
+    return _card_response("Here are your current profile settings:", card)
+
+def _normalize_update_field(field: str) -> str | None:
+    if not field:
+        return None
+    field_key = str(field).strip().lower().replace(" ", "_")
+    aliases = {
+        "major": "programme",
+        "program": "programme",
+        "programme": "programme",
+        "year": "year_of_study",
+        "year_of_study": "year_of_study",
+        "status": "local_status",
+        "student_status": "local_status",
+        "local_status": "local_status",
+        "gpa": "gpa",
+        "cgpa": "gpa",
+        "faculty": "faculty",
+        "interests": "interests",
+        "interest": "interests",
+        "activities": "activities",
+        "activity": "activities",
+        "financial_need": "financial_need_opt_in",
+        "financial_need_opt_in": "financial_need_opt_in",
+        "financial_need_info": "financial_need_opt_in",
+        "name": "name",
+        "display_name": "name",
+        "notification": "notification_preference",
+        "notification_preference": "notification_preference",
+        "digest": "notification_preference",
+        "digest_frequency": "notification_preference",
+        "module_scholarships": "module_scholarships",
+        "module_events": "module_events",
+        "module_inbox": "module_inbox",
+        "scholarships": "module_scholarships",
+        "events": "module_events",
+        "inbox": "module_inbox"
+    }
+    return aliases.get(field_key)
+
+def _normalize_update_value(field: str, value):
+    if value is None:
+        return value
+    if field == "faculty":
+        key = str(value).strip().lower()
+        faculty_map = {
+            "business": "Business and Economics",
+            "business and economics": "Business and Economics",
+            "fbe": "Business and Economics",
+            "arts": "Arts",
+            "art": "Arts",
+            "eng": "Engineering",
+            "engineering": "Engineering",
+            "science": "Science",
+            "sci": "Science",
+            "law": "Law",
+            "medicine": "Medicine",
+            "med": "Medicine",
+            "dentistry": "Dentistry",
+            "education": "Education",
+            "architecture": "Architecture",
+            "social science": "Social Sciences",
+            "social sciences": "Social Sciences",
+            "computing": "School of Computing and Data Science",
+            "computer science": "School of Computing and Data Science",
+            "school of computing and data science": "School of Computing and Data Science"
+        }
+        return faculty_map.get(key, str(value).strip())
+    if field == "local_status":
+        key = str(value).strip().lower().replace(" ", "").replace("_", "-")
+        if key in ("nonlocal", "non-local", "international", "nonhk", "non-hk"):
+            return "non-local"
+        if key in ("local", "hk", "hongkong", "hong-kong"):
+            return "local"
+        return str(value).strip()
+    if field == "financial_need_opt_in":
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("true", "yes", "y", "1", "need", "needed")
+    if field in ("module_scholarships", "module_events", "module_inbox"):
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("true", "yes", "y", "1", "on", "enable", "enabled", "keep")
+    if field == "notification_preference":
+        key = str(value).strip().lower().replace(" ", "_")
+        if key in ("weekly", "weekly_summary", "week"):
+            return "weekly_summary"
+        if key in ("urgent", "urgent_only", "only_urgent"):
+            return "urgent_only"
+        if key in ("daily", "daily_morning", "morning"):
+            return "daily_morning"
+        return str(value).strip()
+    if field == "year_of_study":
+        text_value = str(value).strip().lower()
+        if "post" in text_value:
+            return "postgraduate"
+        digits = "".join(ch for ch in text_value if ch.isdigit())
+        return int(digits) if digits else value
+    if field == "gpa":
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
+    if field in ("interests", "activities"):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return [item.strip() for item in str(value).split(",") if item.strip()]
+    return value
+
+def _module_name_from_field(field: str) -> str | None:
+    return {
+        "module_scholarships": "scholarships",
+        "module_events": "events",
+        "module_inbox": "inbox"
+    }.get(field)
+
+def _apply_module_updates(profile: dict, module_updates: dict) -> bool:
+    preferences = profile.setdefault("preferences", {})
+    current_modules = preferences.get("modules_enabled", ["scholarships", "events", "inbox"])
+    if not isinstance(current_modules, list):
+        current_modules = ["scholarships", "events", "inbox"]
+    enabled = {str(module) for module in current_modules}
+
+    for field, value in module_updates.items():
+        module_name = _module_name_from_field(field)
+        if not module_name:
+            continue
+        if _normalize_update_value(field, value):
+            enabled.add(module_name)
+        else:
+            enabled.discard(module_name)
+
+    if not enabled:
+        return False
+
+    ordered = [module for module in ("scholarships", "events", "inbox") if module in enabled]
+    preferences["modules_enabled"] = ordered
+    return True
+
+def _apply_list_update(profile: dict, field: str, items, operation: str = "add") -> list:
+    operation = (operation or "add").lower()
+    current = profile.get(field, [])
+    if not isinstance(current, list):
+        current = []
+    values = _normalize_update_value(field, items)
+    if not isinstance(values, list):
+        values = [values]
+    cleaned_values = [str(item).strip() for item in values if str(item).strip()]
+
+    if operation == "remove":
+        remove_set = {item.lower() for item in cleaned_values}
+        profile[field] = [item for item in current if str(item).strip().lower() not in remove_set]
+    elif operation == "set":
+        profile[field] = cleaned_values
+    else:
+        seen = {str(item).strip().lower() for item in current if str(item).strip()}
+        for item in cleaned_values:
+            key = item.lower()
+            if key not in seen:
+                current.append(item)
+                seen.add(key)
+        profile[field] = current
+    return profile[field]
+
+def _format_time_value(value) -> str:
+    text_value = str(value or "").strip().lower()
+    if not text_value:
+        return ""
+    if ":" in text_value:
+        hour, minute = text_value.split(":", 1)
+        return f"{int(hour):02d}:{int(minute[:2]):02d}" if hour.isdigit() and minute[:2].isdigit() else text_value
+    suffix = "pm" if "pm" in text_value else "am" if "am" in text_value else ""
+    digits = "".join(ch for ch in text_value if ch.isdigit())
+    if not digits:
+        return text_value
+    hour = int(digits)
+    if suffix == "pm" and hour < 12:
+        hour += 12
+    if suffix == "am" and hour == 12:
+        hour = 0
+    return f"{hour:02d}:00"
+
+def _looks_like_timetable_message(text: str) -> bool:
+    return bool(re.search(r"\b[a-z]{3,5}\d{4}\b", text or "", re.IGNORECASE))
+
+def _apply_profile_update(profile: dict, field: str, value, operation: str = "set") -> None:
+    operation = (operation or "set").lower()
+    if field == "interests":
+        current = profile.get("interests", [])
+        if not isinstance(current, list):
+            current = []
+        values = value if isinstance(value, list) else [value]
+        cleaned_values = [str(item).strip() for item in values if str(item).strip()]
+        if operation == "remove":
+            remove_set = {item.lower() for item in cleaned_values}
+            profile["interests"] = [item for item in current if str(item).strip().lower() not in remove_set]
+        elif operation == "set":
+            profile["interests"] = cleaned_values
+        else:
+            seen = {str(item).strip().lower() for item in current if str(item).strip()}
+            for item in cleaned_values:
+                key = item.lower()
+                if key not in seen:
+                    current.append(item)
+                    seen.add(key)
+            profile["interests"] = current
+        return
+    _set_profile_field(profile, field, value)
+
+def _profile_update_confirmation_card(field: str, old_value, new_value, operation: str = "set") -> dict:
+    label = _field_label(field)
+    card = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": f"You're changing {label} from '{old_value}' to '{new_value}'.",
+                "weight": "Bolder",
+                "wrap": True
+            },
+            {
+                "type": "TextBlock",
+                "text": "This will affect your scholarship matches.",
+                "wrap": True,
+                "color": "Warning"
+            }
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "✅ Confirm",
+                "style": "positive",
+                "data": {
+                    "action": "confirm_profile_update",
+                    "field": field,
+                    "new_value": new_value,
+                    "old_value": old_value,
+                    "operation": operation
+                }
+            },
+            {
+                "type": "Action.Submit",
+                "title": "❌ Cancel",
+                "data": {
+                    "action": "cancel_profile_update"
+                }
+            }
+        ]
+    }
+    return _card_response("Please confirm this profile change:", card)
 
 def _scholarship_cards(scholarships: list, tier: str) -> list:
     """Build a list of Adaptive Card attachments for scholarship results."""
@@ -476,6 +781,29 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
     """Process onboarding form submission, save profile, return first digest."""
     logger.info(f"Onboarding submit for {student_id}")
 
+    required_fields = {
+        "name": "Display Name",
+        "faculty": "Faculty",
+        "programme": "Programme",
+        "year_of_study": "Year of Study",
+        "local_status": "Student Status",
+        "interests": "Interests"
+    }
+    missing_fields = [
+        label
+        for field, label in required_fields.items()
+        if not str(form_data.get(field, "") or "").strip()
+    ]
+    modules_enabled = any(
+        form_data.get(module, "true") == "true"
+        for module in ("module_scholarships", "module_events", "module_inbox")
+    )
+    if not modules_enabled:
+        missing_fields.append("At least one module")
+    if missing_fields:
+        missing_text = "\n".join(f"• {field}" for field in missing_fields)
+        return [_text_response(f"⚠️ Please fill in these required fields:\n{missing_text}")]
+
     raw_gpa = form_data.get("gpa")
     gpa_missing = raw_gpa is None or str(raw_gpa).strip() == ""
     gpa_for_profile = raw_gpa if not gpa_missing else 0
@@ -540,12 +868,12 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
 
     responses = [_text_response(
         f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences. "
-        f"What would you like to do now?\n\n"
-        f"• Type **'digest'** for your daily update\n"
-        f"• Type **'scholarships'** to browse matches\n"
-        f"• Type **'help'** to see all commands"
+        "What would you like to do now?\n\n"
+        "• Type 'digest' for your daily update\n"
+        "• Type 'scholarships' to browse matches\n"
+        "• Type 'help' to see all commands\n"
+        "• Type 'help' anytime to see these commands again"
     )]
-    responses.extend(handle_get_digest(student_id))
     return responses
 
 def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
@@ -621,7 +949,7 @@ def handle_get_digest(student_id: str) -> list:
         for card in _scholarship_cards(digest["scholarships"]["apply_now"], "apply_now"):
             responses.append({
                 "type": "message",
-                "text": " ",
+                "text": "Scholarship match",
                 "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
             })
 
@@ -631,7 +959,7 @@ def handle_get_digest(student_id: str) -> list:
         for card in _scholarship_cards(digest["scholarships"]["prepare"][:3], "prepare"):
             responses.append({
                 "type": "message",
-                "text": " ",
+                "text": "Scholarship to prepare",
                 "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
             })
 
@@ -642,7 +970,7 @@ def handle_get_digest(student_id: str) -> list:
             card = _event_card(event)
             responses.append({
                 "type": "message",
-                "text": " ",
+                "text": "Event opportunity",
                 "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
             })
 
@@ -650,7 +978,7 @@ def handle_get_digest(student_id: str) -> list:
         review_item = inbox_summary["archived_items"][0]
         responses.append({
             "type": "message",
-            "text": " ",
+            "text": "Archive review",
             "attachments": [
                 {
                     "contentType": "application/vnd.microsoft.card.adaptive",
@@ -876,72 +1204,151 @@ def handle_generate_draft(student_id: str, form_data: dict) -> list:
 def handle_profile_update(student_id: str, text: str) -> list:
     """Uses OpenAI to parse natural language profile updates."""
     try:
+        system_prompt = """You are an intelligent university campus agent. Analyze the user's message to determine their intent and extract relevant information. 
+
+You can handle these main intents:
+1. "update_profile": Changing personal details. Valid fields: name, faculty, programme, year_of_study, local_status, gpa, financial_need, notification_preference, module_scholarships (bool), module_events (bool), module_inbox (bool).
+2. "update_interests": Adding or removing items from the user's 'interests' list.
+3. "update_activities": Adding or removing items from the user's 'activities' list.
+4. "add_timetable": Adding a class to their schedule (requires: course_code, day, start_time, end_time).
+
+Return ONLY a raw JSON object with this exact structure:
+{
+  "intent": "update_profile" | "update_interests" | "update_activities" | "add_timetable" | "unknown",
+  "extracted_data": { ...key-value pairs of what the user provided... },
+  "missing_fields": [ "list of fields still needed to complete the action" ],
+  "agent_response": "A natural, friendly response to the user. If there are missing_fields, ask them for the missing info. If the action is complete, confirm it."
+}
+
+Examples of expected behavior:
+- If the user says "add comp1111", intent is "add_timetable", extracted_data has course_code="COMP1111", missing_fields are ["day", "start_time", "end_time"]. agent_response should ask for the missing times.
+- If the user says "comp1111 at 10am", extracted_data has course_code="COMP1111", start_time="10:00", missing_fields are ["day", "end_time"].
+- If the user says "change faculty to business", map "business" to "Business and Economics". intent is "update_profile", extracted_data has faculty="Business and Economics", missing_fields is empty.
+- If the user says "add AI and robotics to my interests", intent is "update_interests", extracted_data has action="add", items=["AI", "robotics"].
+- If the user says "remove robotics from interests", intent is "update_interests", extracted_data has action="remove", items=["robotics"].
+- If the user says "turn off events but keep scholarships", intent is "update_profile", extracted_data has module_events=false, module_scholarships=true.
+- If the user says "change my name to Alex", intent is "update_profile", extracted_data has name="Alex".
+- If the user says "make my digest weekly", intent is "update_profile", extracted_data has notification_preference="weekly".
+- If you cannot understand the intent, return intent="unknown".
+- Capitalize field names in your agent_response (e.g. use "Faculty" instead of "faculty").
+"""
         response = openai_client.chat.completions.create(
             model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an assistant that extracts profile update intents from user text. "
-                        "Return ONLY a raw JSON object with keys: 'field' and 'value'. "
-                        "If the text is not a profile update, return {\"field\": null, \"value\": null}. "
-                        "Valid fields: faculty, programme, interests, gpa, local_status, financial_need_opt_in."
-                    )
-                },
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text}
             ],
             response_format={"type": "json_object"},
             temperature=0
         )
-        intent = json.loads(response.choices[0].message.content)
+        parsed = json.loads(response.choices[0].message.content)
+        intent = parsed.get("intent", "unknown")
+        extracted_data = parsed.get("extracted_data", {}) or {}
+        missing_fields = parsed.get("missing_fields", []) or []
+        agent_response = parsed.get("agent_response") or "I need a bit more information to help with that."
 
-        if not intent.get("field"):
-            return [_text_response("I didn't quite catch that. Type 'help' to see what I can do!")]
-
-        field = intent["field"]
-        new_value = intent["value"]
+        if intent == "unknown":
+            return [_text_response(agent_response)]
+        if missing_fields:
+            return [_text_response(agent_response)]
 
         profile = get_profile(student_id)
         if not profile:
             return [_text_response("Please complete onboarding first.")]
 
-        old_value = _get_profile_field(profile, field)
-        _set_profile_field(profile, field, new_value)
-        save_profile(profile)
+        if intent == "update_profile":
+            normalized_updates = {}
+            module_updates = {}
+            for raw_field, raw_value in extracted_data.items():
+                field = _normalize_update_field(raw_field)
+                if not field:
+                    continue
+                value = _normalize_update_value(field, raw_value)
+                if field.startswith("module_"):
+                    module_updates[field] = value
+                else:
+                    normalized_updates[field] = value
 
-        card = {
-            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-            "type": "AdaptiveCard",
-            "version": "1.4",
-            "body": [
-                {
-                    "type": "TextBlock",
-                    "text": f"✅ Updated! I changed your **{field}** to **{new_value}**.",
-                    "wrap": True
+            sensitive_updates = {
+                field: value
+                for field, value in normalized_updates.items()
+                if field in SENSITIVE_PROFILE_FIELDS
+            }
+            if sensitive_updates:
+                field, new_value = next(iter(sensitive_updates.items()))
+                return [_profile_update_confirmation_card(
+                    field,
+                    _get_profile_field(profile, field),
+                    new_value,
+                    "set"
+                )]
+
+            old_values = {field: _get_profile_field(profile, field) for field in normalized_updates}
+            for field, value in normalized_updates.items():
+                _apply_profile_update(profile, field, value, "set")
+
+            if module_updates and not _apply_module_updates(profile, module_updates):
+                return [_text_response("At least one module must stay enabled. I kept your current module settings unchanged.")]
+
+            save_profile(profile)
+            if len(normalized_updates) == 1 and not module_updates:
+                field, new_value = next(iter(normalized_updates.items()))
+                old_value = old_values.get(field)
+                card = {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": f"Updated! I changed your **{_field_label(field)}** to **{new_value}**.",
+                            "wrap": True
+                        }
+                    ],
+                    "actions": [
+                        {
+                            "type": "Action.Submit",
+                            "title": "Revert Change",
+                            "data": {
+                                "action": "revert_profile",
+                                "field": field,
+                                "old_value": old_value
+                            }
+                        }
+                    ]
                 }
-            ],
-            "actions": [
-                {
-                    "type": "Action.Submit",
-                    "title": "↩️ Revert Change",
-                    "data": {
-                        "action": "revert_profile",
-                        "field": field,
-                        "old_value": old_value
-                    }
-                }
-            ]
-        }
-        return [{
-            "type": "message",
-            "text": " ",
-            "attachments": [
-                {
-                    "contentType": "application/vnd.microsoft.card.adaptive",
-                    "content": card
-                }
-            ]
-        }]
+                return [_card_response(f"Updated {_field_label(field)} to {new_value}.", card)]
+            return [_text_response(agent_response)]
+
+        if intent in ("update_interests", "update_activities"):
+            field = "interests" if intent == "update_interests" else "activities"
+            operation = (extracted_data.get("action") or "add").lower()
+            items = extracted_data.get("items", [])
+            updated_items = _apply_list_update(profile, field, items, operation)
+            save_profile(profile)
+            return [_text_response(
+                f"Updated {_field_label(field)}: {', '.join(updated_items) if updated_items else 'None'}."
+            )]
+
+        if intent == "add_timetable":
+            course_code = str(extracted_data.get("course_code", "") or "").strip().upper()
+            day = str(extracted_data.get("day", "") or "").strip()
+            start_time = _format_time_value(extracted_data.get("start_time"))
+            end_time = _format_time_value(extracted_data.get("end_time"))
+            if not all([course_code, day, start_time, end_time]):
+                return [_text_response(agent_response)]
+            timetable = profile.setdefault("timetable", {})
+            blocked_slots = timetable.setdefault("blocked_slots", [])
+            blocked_slots.append({
+                "day": day,
+                "start": start_time,
+                "end": end_time,
+                "label": course_code
+            })
+            save_profile(profile)
+            return [_text_response(f"Added {course_code} on {day} from {start_time} to {end_time} to your timetable.")]
+
+        return [_text_response(agent_response)]
 
     except Exception as e:
         logger.error(f"Profile update error: {e}")
@@ -986,12 +1393,6 @@ def handle_message(student_id: str, message: dict) -> list:
     if action == "onboarding_submit":
         return handle_onboarding_submit(student_id, value)
 
-    if action == "add_timetable_row":
-        return [_card_response(
-            "Sure — I've added another class row. Please complete the form below:",
-            _build_onboarding_card(num_rows=2)
-        )]
-
     if action == "revert_profile":
         field = value.get("field")
         old_value = value.get("old_value")
@@ -1001,6 +1402,23 @@ def handle_message(student_id: str, message: dict) -> list:
             save_profile(profile)
             return [_text_response(f"↩️ Reverted! Your {field} is back to {old_value}.")]
         return [_text_response("Could not revert that change.")]
+
+    if action == "confirm_profile_update":
+        field = value.get("field")
+        new_value = value.get("new_value")
+        operation = value.get("operation", "set")
+        profile = get_profile(student_id)
+        if profile and field:
+            _apply_profile_update(profile, field, new_value, operation)
+            save_profile(profile)
+            return [_text_response(f"✅ Updated! Your {_field_label(field)} is now {new_value}.")]
+        return [_text_response("Could not apply that profile change.")]
+
+    if action == "cancel_profile_update":
+        return [_text_response("No problem — I cancelled that profile change.")]
+
+    if action == "edit_profile":
+        return [_card_response("Update your profile below:", _build_onboarding_card())]
 
     if action == "semester_refresh_submit":
         return handle_semester_refresh(student_id, value)
@@ -1073,23 +1491,31 @@ def handle_message(student_id: str, message: dict) -> list:
         return [_text_response("No email ID provided to restore.")]
 
     # ── Text messages ────────────────────────────────────────────────────────
+    if any(kw in text for kw in ["show my profile", "my settings", "what do you know about me", "view profile"]):
+        return [_profile_card_response(student_id)]
+
     if any(kw in text for kw in ["help", "commands", "what can you do"]):
         return [_help_card_response()]
 
-    if any(kw in text for kw in ["change my", "update my", "set my", "add to my"]):
+    update_terms = [
+        "change my", "update my", "set my", "add to my", "remove from my",
+        "change ", "update ", "set ", "modify", "make me", "i want to be",
+        "add ", "remove ", "add class", "add course", "add timetable", "add schedule"
+    ]
+    if any(kw in text for kw in update_terms) or _looks_like_timetable_message(text):
         return handle_profile_update(student_id, text)
 
-    if "upload cv" in text:
-        return [_text_response("Please attach your PDF CV to the chat first!")]
+    if "upload cv" in text or text == "cv":
+        return [_text_response("Please attach your PDF CV to the chat first, then type CV again.")]
 
     profile = get_profile(student_id)
     if profile and profile.get("last_scholarship_id") and text:
-        digest_terms = ["digest", "update", "what's new", "show me", "scholarships", "opportunities"]
+        digest_terms = ["digest", "update", "what's new", "show me", "scholarships", "opportunities", "events", "inbox"]
         help_terms = ["hello", "hi", "hey", "start", "help"]
         if not any(kw in text for kw in digest_terms + help_terms):
             return handle_text_pasted(student_id, message.get("text") or "")
 
-    if any(kw in text for kw in ["digest", "update", "what's new", "show me", "scholarships", "opportunities"]):
+    if any(kw in text for kw in ["digest", "update", "what's new", "show me", "scholarships", "opportunities", "events", "inbox"]):
         return handle_get_digest(student_id)
 
     if any(kw in text for kw in ["draft", "apply", "application"]):
