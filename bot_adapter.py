@@ -97,6 +97,7 @@ async def messages(req: web.Request) -> web.Response:
 
                 file_download = r.get("file_download")
                 if file_download:
+                    # Application approval uses 0x0.st via handler; this path is for legacy callers only.
                     token = _register_download(
                         file_download["bytes"],
                         file_download["filename"],
@@ -149,12 +150,14 @@ async def messages(req: web.Request) -> web.Response:
 
         if document_attachments:
             profile = get_profile(student_id)
+            app_state = (profile or {}).get("application_state") or {}
             has_pending_application = bool(profile and profile.get("pending_application"))
+            has_active_collection = app_state.get("step") == "collecting_list"
             has_active_draft = bool(profile and profile.get("last_scholarship_id"))
 
             await turn_context.send_activity(
                 "📄 Processing your application form... please wait."
-                if has_pending_application or has_active_draft else
+                if has_pending_application or has_active_collection or has_active_draft else
                 "📄 Processing your CV... please wait."
             )
 

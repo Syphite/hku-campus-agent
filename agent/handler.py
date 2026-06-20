@@ -26,6 +26,25 @@ from agent.matching import run_matching
 from agent.drafter  import extract_application_questions, generate_draft_answers
 from agent.question_extractor import extract_questions_from_file, extract_text_from_application_file
 from agent.form_filler import fill_application_form
+from agent.application.docx_parser import extract_form_schema as extract_docx_schema
+from agent.application.pdf_parser import extract_form_schema as extract_pdf_schema
+from agent.application.form_ai import (
+    analyze_form_schema,
+    build_filled_data,
+    detect_gaps,
+    draft_long_text,
+    merge_filled_data,
+    parse_list_entry,
+)
+from agent.application.docx_filler import fill_docx_form
+from agent.application.pdf_filler import fill_pdf_form
+from agent.application.state import (
+    clear_application_state,
+    get_application_state,
+    init_application_state,
+    update_application_state,
+)
+from agent.file_hosting import upload_to_public_host
 from agent.digest   import assemble_digest, format_digest_message
 
 # Import event pipeline
@@ -232,6 +251,46 @@ def _file_download_response(filename: str, file_bytes: bytes, content_type: str,
             "bytes": file_bytes,
         },
     }
+
+
+def _filled_form_download_card(public_url: str) -> dict:
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.3",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "Your application form is filled and ready!",
+                "weight": "Bolder",
+                "size": "Large",
+                "wrap": True,
+            },
+            {
+                "type": "TextBlock",
+                "text": "Click the button below to download your completed form.",
+                "wrap": True,
+            },
+        ],
+        "actions": [
+            {
+                "type": "Action.OpenUrl",
+                "title": "Download Filled Form",
+                "url": public_url,
+            }
+        ],
+    }
+
+
+def _public_download_response(public_url: str) -> list:
+    return [
+        _text_response("Approved! Your filled application form is ready to download."),
+        _card_response(
+            "Download your completed application form:",
+            _filled_form_download_card(public_url),
+        ),
+    ]
+
 
 def _help_card_response() -> dict:
     try:
@@ -1478,60 +1537,126 @@ def handle_start_application(student_id: str) -> list:
     )]
 
 
-def _application_review_card(scholarship_id: str, scholarship_name: str, draft: dict) -> dict:
+def _build_application_answers_text(draft_answers: list, additional_notes: str = "") -> str:
+    parts = []
+    for item in draft_answers or []:
+        question = str(item.get("question") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if question and answer:
+            parts.append(f"Q: {question}\nA: {answer}")
+    if additional_notes.strip():
+        parts.append(f"Additional notes:\n{additional_notes.strip()}")
+    return "\n\n".join(parts)
+
+
+def _clear_application_review_state(profile: dict) -> None:
+    for key in (
+        "pending_application_review",
+        "application_input_path",
+        "application_output_path",
+        "application_content_type",
+        "application_draft_answers",
+        "application_questions",
+    ):
+        profile.pop(key, None)
+    clear_application_state(profile)
+
+
+def _application_state_active(profile: dict) -> bool:
+    state = get_application_state(profile)
+    return bool(state.get("step"))
+
+
+def _list_gaps(gaps: list) -> list:
+    return [gap for gap in gaps or [] if gap.get("type") == "repeating_list"]
+
+
+def _long_text_gaps(gaps: list) -> list:
+    return [gap for gap in gaps or [] if gap.get("type") == "long_text"]
+
+
+def _looks_like_section_advance(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return normalized in {
+        "next", "done", "move on", "skip", "no more", "continue",
+        "that's all", "thats all", "no more", "move to next section",
+    }
+
+
+def _application_review_card(scholarship_id: str, scholarship_name: str, state: dict) -> dict:
     body = [
         {
             "type": "TextBlock",
-            "text": f"Review Draft Answers: {scholarship_name}",
+            "text": f"Review Application: {scholarship_name}",
             "weight": "Bolder",
             "size": "Medium",
             "wrap": True,
         },
         {
             "type": "TextBlock",
-            "text": (
-                "I extracted every application question and drafted a response. "
-                "Review below, optionally add missing details, then approve to generate your filled form."
-            ),
+            "text": "Review the collected information below. Approve when you're ready and I'll fill the form.",
             "wrap": True,
         },
     ]
 
-    answers = draft.get("answers", [])
-    if answers:
-        for item in answers:
-            body.extend([
-                {
-                    "type": "TextBlock",
-                    "text": item.get("question", "Question"),
-                    "weight": "Bolder",
-                    "wrap": True,
-                    "spacing": "Medium",
-                },
-                {
-                    "type": "TextBlock",
-                    "text": item.get("answer", ""),
-                    "wrap": True,
-                },
-            ])
-    else:
-        body.append({
-            "type": "TextBlock",
-            "text": (
-                "No essay questions were detected in the form. "
-                "You can still approve to fill your basic profile fields."
-            ),
-            "wrap": True,
-            "color": "Accent",
-        })
+    filled_data = state.get("filled_data") or {}
+    pending_lists = state.get("pending_list_data") or {}
+    long_text_drafts = state.get("long_text_drafts") or {}
 
-    if draft.get("notes"):
+    simple_fields = filled_data.get("simple_fields") or {}
+    if simple_fields:
         body.append({
             "type": "TextBlock",
-            "text": f"Note: {draft['notes']}",
+            "text": "Profile fields",
+            "weight": "Bolder",
             "wrap": True,
-            "size": "Small",
-            "color": "Accent",
+            "spacing": "Medium",
+        })
+        for key, value in simple_fields.items():
+            if value:
+                body.append({
+                    "type": "TextBlock",
+                    "text": f"{key.replace('_', ' ').title()}: {value}",
+                    "wrap": True,
+                })
+
+    for list_key, items in pending_lists.items():
+        if not items:
+            continue
+        body.append({
+            "type": "TextBlock",
+            "text": list_key.replace("_", " ").title(),
+            "weight": "Bolder",
+            "wrap": True,
+            "spacing": "Medium",
+        })
+        for index, item in enumerate(items, start=1):
+            summary = ", ".join(
+                f"{field}: {value}"
+                for field, value in item.items()
+                if value
+            )
+            body.append({
+                "type": "TextBlock",
+                "text": f"{index}. {summary}",
+                "wrap": True,
+            })
+
+    for key, text in long_text_drafts.items():
+        if not text:
+            continue
+        body.append({
+            "type": "TextBlock",
+            "text": key.replace("_", " ").title(),
+            "weight": "Bolder",
+            "wrap": True,
+            "spacing": "Medium",
+        })
+        preview = text if len(text) <= 1200 else f"{text[:1200]}..."
+        body.append({
+            "type": "TextBlock",
+            "text": preview,
+            "wrap": True,
         })
 
     body.append({
@@ -1563,28 +1688,97 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, draft: 
     }
 
 
-def _build_application_answers_text(draft_answers: list, additional_notes: str = "") -> str:
-    parts = []
-    for item in draft_answers or []:
-        question = str(item.get("question") or "").strip()
-        answer = str(item.get("answer") or "").strip()
-        if question and answer:
-            parts.append(f"Q: {question}\nA: {answer}")
-    if additional_notes.strip():
-        parts.append(f"Additional notes:\n{additional_notes.strip()}")
-    return "\n\n".join(parts)
+def _begin_application_review(profile: dict, state: dict) -> list:
+    long_text_drafts = {}
+    for gap in _long_text_gaps(state.get("gap_queue", [])):
+        long_text_drafts[gap["key"]] = draft_long_text(
+            gap["schema"],
+            profile,
+            state.get("pending_list_data") or {},
+        )
+
+    state["long_text_drafts"] = long_text_drafts
+    state["step"] = "review"
+    state["current_gap"] = None
+    profile["pending_application_review"] = state.get("scholarship_id", "ss_472")
+    profile["application_input_path"] = state.get("input_path")
+    profile["application_output_path"] = state.get("output_path")
+    profile["application_content_type"] = state.get("content_type")
+    update_application_state(profile, **state)
+    save_profile(profile)
+
+    scholarship_name = DEMO_SCHOLARSHIP_472.get("name", "Scholarship")
+    return [
+        _text_response("I've gathered everything needed. Review the summary and approve when you're ready."),
+        _card_response(
+            "Review your application data before I fill the form.",
+            _application_review_card(state.get("scholarship_id", "ss_472"), scholarship_name, state),
+        ),
+    ]
 
 
-def _clear_application_review_state(profile: dict) -> None:
-    for key in (
-        "pending_application_review",
-        "application_input_path",
-        "application_output_path",
-        "application_content_type",
-        "application_draft_answers",
-        "application_questions",
-    ):
-        profile.pop(key, None)
+def _advance_application_gap(profile: dict, state: dict) -> list:
+    list_gap_items = _list_gaps(state.get("gap_queue", []))
+    current = state.get("current_gap") or {}
+    current_index = 0
+    if current:
+        for index, gap in enumerate(list_gap_items):
+            if gap.get("key") == current.get("key"):
+                current_index = index + 1
+                break
+
+    if current_index < len(list_gap_items):
+        next_gap = list_gap_items[current_index]
+        update_application_state(
+            profile,
+            current_gap=next_gap,
+            step="collecting_list",
+        )
+        save_profile(profile)
+        return [_text_response(next_gap.get("prompt") or "Please share the next entry.")]
+
+    return _begin_application_review(profile, get_application_state(profile))
+
+
+def handle_application_collection_message(student_id: str, text: str) -> list | None:
+    profile = get_profile(student_id)
+    if not profile:
+        return None
+
+    state = get_application_state(profile)
+    if state.get("step") != "collecting_list":
+        return None
+
+    if _looks_like_section_advance(text):
+        return _advance_application_gap(profile, state)
+
+    current_gap = state.get("current_gap") or {}
+    if current_gap.get("type") != "repeating_list":
+        return [_text_response("Say **next** when you're ready to continue.")]
+
+    list_schema = current_gap.get("schema") or {}
+    list_key = current_gap.get("key")
+    entry = parse_list_entry(text, list_schema)
+    if not any(entry.values()):
+        return [_text_response(
+            "I couldn't parse that entry. Please include organization, role, dates, and hours if possible."
+        )]
+
+    pending_list_data = dict(state.get("pending_list_data") or {})
+    entries = list(pending_list_data.get(list_key) or [])
+    entries.append(entry)
+    pending_list_data[list_key] = entries
+    update_application_state(profile, pending_list_data=pending_list_data)
+    save_profile(profile)
+
+    max_rows = int(list_schema.get("max_rows") or 5)
+    if len(entries) >= max_rows:
+        return _advance_application_gap(profile, get_application_state(profile))
+
+    label = current_gap.get("label") or list_key.replace("_", " ")
+    return [_text_response(
+        f"Got it! Do you have another {label} entry to add, or say **next** to move to the next section?"
+    )]
 
 
 def _looks_like_application_approval(text: str) -> bool:
@@ -1603,7 +1797,7 @@ def handle_application_form_upload(
     filename: str,
     content_type: str = ""
 ) -> list:
-    """Save an uploaded form, extract all questions, draft answers, and ask for approval."""
+    """Analyze an uploaded form, detect gaps, and start conversational collection."""
     profile = get_profile(student_id)
     if not profile:
         return [_text_response("I couldn't find your profile yet. Please complete onboarding first.")]
@@ -1630,95 +1824,118 @@ def handle_application_form_upload(
     with open(input_path, "wb") as handle:
         handle.write(file_bytes)
 
-    raw_text = extract_text_from_application_file(input_path)
-    if not raw_text:
+    try:
+        if stored_content_type == "application/pdf":
+            form_json = extract_pdf_schema(input_path)
+        else:
+            form_json = extract_docx_schema(input_path)
+
+        schema = analyze_form_schema(form_json)
+        filled_data = build_filled_data(schema, profile)
+        gaps = detect_gaps(schema, filled_data, profile)
+    except Exception as exc:
+        logger.error(f"Application form analysis failed: {exc}")
         return [_text_response(
-            "I couldn't extract text from that file. Please upload a text-based PDF or DOCX form."
+            "I couldn't analyze that form structure. Please upload a table-based DOCX or PDF application form."
         )]
 
-    questions = _normalize_question_items(extract_questions_from_file(file_bytes, filename))
-    question_texts = [q["text"] for q in questions]
-    scholarship = DEMO_SCHOLARSHIP_472.copy()
-
-    draft = {"answers": [], "notes": "", "scholarship_name": scholarship["name"]}
-    if question_texts:
-        draft = generate_draft_answers(
-            student_id,
-            "ss_472",
-            question_texts,
-            scholarship=scholarship,
-        )
-        if draft.get("error"):
-            return [_text_response(f"I couldn't draft answers yet: {draft['error']}")]
-
     profile.pop("pending_application", None)
-    profile["pending_application_review"] = "ss_472"
-    profile["application_input_path"] = input_path
-    profile["application_output_path"] = output_path
-    profile["application_content_type"] = stored_content_type
-    profile["application_draft_answers"] = draft.get("answers", [])
-    profile["application_questions"] = questions
+    _clear_application_review_state(profile)
+
+    list_gap_items = _list_gaps(gaps)
+    first_gap = list_gap_items[0] if list_gap_items else None
+    state = init_application_state(
+        profile,
+        scholarship_id="ss_472",
+        input_path=input_path,
+        output_path=output_path,
+        content_type=stored_content_type,
+        schema=schema,
+        filled_data=filled_data,
+        step="collecting_list" if first_gap else "review",
+    )
+    update_application_state(
+        profile,
+        form_json=form_json,
+        gap_queue=gaps,
+        current_gap=first_gap,
+        pending_list_data={},
+        long_text_drafts={},
+    )
     profile["last_scholarship_id"] = "ss_472"
-    profile["last_scholarship_name"] = scholarship["name"]
+    profile["last_scholarship_name"] = DEMO_SCHOLARSHIP_472["name"]
     save_profile(profile)
 
-    summary = (
-        f"I extracted {len(question_texts)} question(s) and drafted responses for your review."
-        if question_texts else
-        "I couldn't detect essay questions, but you can still approve to fill your profile details."
-    )
-    return [
-        _text_response(summary),
-        _card_response(
-            "Review your draft answers. Approve when you're ready and I'll fill the form.",
-            _application_review_card("ss_472", scholarship["name"], draft),
-        ),
-    ]
+    if first_gap:
+        return [
+            _text_response(
+                f"I analyzed your form and found {len(schema.get('simple_fields', []))} profile fields "
+                f"and {len(schema.get('repeating_lists', []))} repeating sections."
+            ),
+            _text_response(first_gap.get("prompt") or "Please share the first entry for this section."),
+        ]
+
+    return _begin_application_review(profile, get_application_state(profile))
 
 
 def handle_approve_application(student_id: str, form_data: dict | None = None) -> list:
-    """Fill the uploaded form after the student approves the drafted answers."""
+    """Fill the uploaded form after the student approves the collected application data."""
     form_data = form_data or {}
     profile = get_profile(student_id)
-    if not profile or profile.get("pending_application_review") != "ss_472":
+    state = get_application_state(profile) if profile else {}
+    if not profile or (
+        state.get("step") != "review"
+        and profile.get("pending_application_review") != "ss_472"
+    ):
         return [_text_response("No application is waiting for approval right now.")]
 
-    input_path = profile.get("application_input_path")
-    output_path = profile.get("application_output_path")
+    if not state:
+        state = {
+            "input_path": profile.get("application_input_path"),
+            "output_path": profile.get("application_output_path"),
+            "content_type": profile.get("application_content_type"),
+            "schema": {},
+            "filled_data": {},
+            "pending_list_data": {},
+            "long_text_drafts": {},
+        }
+
+    input_path = state.get("input_path") or profile.get("application_input_path")
+    output_path = state.get("output_path") or profile.get("application_output_path")
+    content_type = state.get("content_type") or profile.get("application_content_type")
     if not input_path or not output_path or not os.path.exists(input_path):
         return [_text_response("I couldn't find your uploaded form. Please upload it again.")]
 
     additional_notes = str(form_data.get("additional_notes") or "").strip()
-    draft_answers = profile.get("application_draft_answers", [])
-    scholarship = DEMO_SCHOLARSHIP_472.copy()
-    answers_text = _build_application_answers_text(draft_answers, additional_notes)
-    scholarship["drafted_cover_letter"] = answers_text
-    scholarship["application_answers_text"] = answers_text
+    merged_data = merge_filled_data(
+        state.get("filled_data") or {},
+        state.get("pending_list_data") or {},
+        state.get("long_text_drafts") or {},
+    )
+    if additional_notes:
+        merged_data.setdefault("long_text", {})
+        merged_data["long_text"]["additional_notes"] = additional_notes
 
-    filled = fill_application_form(input_path, output_path, profile, scholarship)
-    if not filled or not os.path.exists(output_path):
+    schema = state.get("schema") or {}
+    try:
+        if content_type == "application/pdf":
+            fill_pdf_form(input_path, merged_data, schema, output_path)
+        else:
+            fill_docx_form(input_path, merged_data, schema, output_path)
+    except Exception as exc:
+        logger.error(f"Application form fill failed: {exc}")
         return [_text_response(
-            "I couldn't fill that form template. Please try a PDF with form fields or a DOCX with placeholders."
+            "I couldn't fill that form template. Please try uploading the form again."
         )]
 
-    with open(output_path, "rb") as handle:
-        file_bytes = handle.read()
+    if not os.path.exists(output_path):
+        return [_text_response("The filled form could not be generated. Please try again.")]
 
-    filename = os.path.basename(output_path)
-    content_type = profile.get("application_content_type", "application/octet-stream")
-
+    public_url = upload_to_public_host(output_path)
     _clear_application_review_state(profile)
     save_profile(profile)
 
-    return [
-        _text_response("✅ Approved! Here is your filled application form:"),
-        _file_download_response(
-            filename,
-            file_bytes,
-            content_type,
-            f"Download `{filename}` below.",
-        ),
-    ]
+    return _public_download_response(public_url)
 
 
 def handle_cancel_application_review(student_id: str) -> list:
@@ -2003,11 +2220,20 @@ def handle_message(student_id: str, message: dict) -> list:
         and profile.get("onboarding_complete")
         and not profile.get("pending_action")
         and not profile.get("pending_application_review")
+        and get_application_state(profile).get("step") != "collecting_list"
     ):
         return [_text_response("For security, I cannot process edits to previous messages. Please send a new message instead.")]
 
     if profile and profile.get("pending_action") == "complete_timetable" and not action.strip():
         return _handle_pending_timetable(profile, message.get("text") or "")
+
+    if profile and get_application_state(profile).get("step") == "collecting_list" and not action.strip():
+        collection_response = handle_application_collection_message(
+            student_id,
+            message.get("text") or "",
+        )
+        if collection_response is not None:
+            return collection_response
 
     # ─ Adaptive Card submissions ────────────────────────────────────────────
     if action == "onboarding_submit":

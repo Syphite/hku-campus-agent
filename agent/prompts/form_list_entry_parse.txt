@@ -1,0 +1,12 @@
+Parse the user's message into one structured list entry for a scholarship application form.
+
+Return ONLY valid JSON in this shape:
+{{"organization": "...", "role": "...", "dates": "...", "hours": "...", "description": "..."}}
+
+Use empty strings for missing values. Do not invent organizations or dates not implied by the user.
+
+List section schema:
+{list_schema}
+
+User message:
+{user_text}

@@ -1,0 +1,18 @@
+Draft a scholarship application response for the field described below.
+
+Rules:
+- Write in first person as the student.
+- Be specific and credible using only the provided profile and collected list data.
+- Do not invent awards, jobs, or experiences not supported by the data.
+- Target approximately {target_words} words.
+- Return ONLY valid JSON in this shape:
+{{"text": "..."}}
+
+Field:
+{field_schema}
+
+Student profile:
+{profile_json}
+
+Collected list data:
+{collected_lists_json}
