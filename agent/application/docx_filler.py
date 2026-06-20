@@ -1,5 +1,7 @@
 """Anchor-based DOCX form filling."""
 
+from __future__ import annotations
+
 import logging
 import os
 import shutil
@@ -220,3 +222,49 @@ def fill_docx_form(original_path: str, filled_data: dict, schema: dict, output_p
     doc.save(target_path)
     logger.info("Filled DOCX saved to %s", target_path)
     return target_path
+
+
+def fill_free_fields_docx(
+    docx_path: str,
+    free_field_defs: list[dict],
+    free_field_values: dict,
+) -> int:
+    """Fill paragraph/content-control free fields in an already-saved DOCX."""
+    from docx import Document
+
+    if not free_field_values:
+        return 0
+
+    doc = Document(docx_path)
+    filled = 0
+
+    for field in free_field_defs or []:
+        key = field.get("key")
+        value = str((free_field_values or {}).get(key) or "").strip()
+        if not value:
+            continue
+
+        paragraph_index = field.get("paragraph_index")
+        if paragraph_index is not None:
+            try:
+                idx = int(paragraph_index)
+                if 0 <= idx < len(doc.paragraphs):
+                    paragraph = doc.paragraphs[idx]
+                    if texts_match(field.get("anchor_label", ""), paragraph.text):
+                        paragraph.text = f"{paragraph.text}\n{value}".strip()
+                    else:
+                        paragraph.text = value
+                    filled += 1
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+        anchor = field.get("anchor_label") or field.get("question_text", "")
+        for paragraph in doc.paragraphs:
+            if texts_match(anchor, paragraph.text):
+                paragraph.text = f"{paragraph.text}\n{value}".strip()
+                filled += 1
+                break
+
+    doc.save(docx_path)
+    return filled

@@ -7,7 +7,7 @@ import json
 import logging
 import re
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 
@@ -26,18 +26,15 @@ from agent.matching import run_matching
 from agent.drafter  import extract_application_questions, generate_draft_answers
 from agent.question_extractor import extract_questions_from_file, extract_text_from_application_file
 from agent.form_filler import fill_application_form
-from agent.application.docx_parser import extract_form_schema as extract_docx_schema
-from agent.application.pdf_parser import extract_form_schema as extract_pdf_schema
 from agent.application.form_ai import (
-    analyze_form_schema,
     build_filled_data,
     detect_gaps,
     draft_long_text,
     merge_filled_data,
     parse_list_entry,
 )
-from agent.application.docx_filler import fill_docx_form
-from agent.application.pdf_filler import fill_pdf_form
+from agent.application.fill_orchestrator import fill_application
+from agent.application.form_planner import build_form_plan, plan_has_fill_targets
 from agent.application.state import (
     clear_application_state,
     get_application_state,
@@ -53,6 +50,12 @@ from agent.conflict_checker        import run_conflict_checks_batch
 
 # Import email pipeline
 from agent.email_pipeline import run_inbox_pipeline
+from agent.graph import (
+    calendar_events_to_blocked_slots,
+    create_calendar_event,
+    get_calendar_events,
+    resolve_user_email,
+)
 
 APPLICATION_FORM_PDF = "/tmp/application_form.pdf"
 APPLICATION_FORM_DOCX = "/tmp/application_form.docx"
@@ -205,7 +208,9 @@ def _build_prefilled_onboarding_card(profile: dict) -> dict:
         "module_scholarships": "true" if "scholarships" in modules_enabled else "false",
         "module_events": "true" if "events" in modules_enabled else "false",
         "module_inbox": "true" if "inbox" in modules_enabled else "false",
-        "notification_preference": preferences.get("notification_preference", "daily_morning")
+        "notification_preference": preferences.get("notification_preference", "daily_morning"),
+        "consent_inbox": str(bool(profile.get("consent", {}).get("inbox"))).lower(),
+        "consent_calendar": str(bool(profile.get("consent", {}).get("calendar"))).lower(),
     }
 
     for input_id, value in input_values.items():
@@ -649,6 +654,467 @@ def _format_time_value(value) -> str:
 def _looks_like_timetable_message(text: str) -> bool:
     return bool(re.search(r"\b[a-z]{3,5}\d{4}\b", text or "", re.IGNORECASE))
 
+def _looks_like_calendar_add_message(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "add to my calendar",
+            "put on my calendar",
+            "add to calendar",
+            "put on calendar",
+            "schedule ",
+        )
+    )
+
+def _looks_like_event_registration_message(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in ("register for", "sign up for", "sign me up for", "join ")
+    )
+
+def _has_calendar_consent(profile: dict | None) -> bool:
+    return bool((profile or {}).get("consent", {}).get("calendar"))
+
+def _has_inbox_consent(profile: dict | None) -> bool:
+    return bool((profile or {}).get("consent", {}).get("inbox"))
+
+_WEEKDAY_NAMES = (
+    "Monday", "Tuesday", "Wednesday", "Thursday",
+    "Friday", "Saturday", "Sunday",
+)
+_WEEKDAY_INDEX = {day.lower(): index for index, day in enumerate(_WEEKDAY_NAMES)}
+
+def _hk_now() -> datetime:
+    return datetime.now(timezone(timedelta(hours=8)))
+
+def _merge_blocked_slots(manual_slots: list, calendar_slots: list) -> list:
+    """Merge manual timetable rows with calendar imports; manual rows win on duplicates."""
+    seen = {
+        (slot.get("day", "").lower(), slot.get("start"), slot.get("end"))
+        for slot in manual_slots or []
+    }
+    merged = list(manual_slots or [])
+    for slot in calendar_slots or []:
+        key = (slot.get("day", "").lower(), slot.get("start"), slot.get("end"))
+        if key in seen:
+            continue
+        merged.append(slot)
+        seen.add(key)
+    return merged
+
+def _prefill_timetable_from_calendar(profile: dict, manual_slots: list, consent_calendar: bool) -> tuple[list, int]:
+    """Import blocked_slots from Outlook when calendar consent is granted."""
+    if not consent_calendar:
+        return manual_slots, 0
+
+    user_email = resolve_user_email(profile.get("email"))
+    now = _hk_now()
+    start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    end_dt = (now + timedelta(days=120)).replace(hour=23, minute=59, second=59).isoformat()
+    result = get_calendar_events(user_email, start_dt, end_dt)
+    if not result.get("success"):
+        logger.warning(f"Calendar prefill failed: {result.get('error')}")
+        return manual_slots, 0
+
+    calendar_slots = calendar_events_to_blocked_slots(result.get("events", []))
+    merged = _merge_blocked_slots(manual_slots, calendar_slots)
+    imported_count = max(0, len(merged) - len(manual_slots or []))
+    return merged, imported_count
+
+def _event_to_calendar_times(event: dict) -> dict | None:
+    """Derive concrete calendar start/end datetimes for an extracted event."""
+    sessions = event.get("event_sessions") or []
+    deadline = event.get("deadline")
+    now = _hk_now()
+
+    if sessions:
+        session = sessions[0]
+        day_name = (session.get("day") or "").strip()
+        start_time = _format_time_value(session.get("start", "09:00"))
+        end_time = _format_time_value(session.get("end", "10:00"))
+        target_weekday = _WEEKDAY_INDEX.get(day_name.lower())
+        if target_weekday is None:
+            return None
+        days_ahead = (target_weekday - now.weekday()) % 7
+        if days_ahead == 0 and now.strftime("%H:%M") >= start_time:
+            days_ahead = 7
+        event_date = (now + timedelta(days=days_ahead)).date()
+        return {
+            "start_iso": f"{event_date.isoformat()}T{start_time}:00",
+            "end_iso": f"{event_date.isoformat()}T{end_time}:00",
+            "display_date": event_date.strftime("%A, %d %B %Y"),
+            "display_time": f"{start_time}–{end_time}",
+        }
+
+    if deadline:
+        try:
+            event_date = datetime.strptime(str(deadline)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+        return {
+            "start_iso": f"{event_date.isoformat()}T09:00:00",
+            "end_iso": f"{event_date.isoformat()}T10:00:00",
+            "display_date": event_date.strftime("%A, %d %B %Y"),
+            "display_time": "09:00–10:00",
+        }
+    return None
+
+def _format_event_datetime_display(start_iso: str, end_iso: str) -> str:
+    try:
+        start_dt = datetime.fromisoformat(start_iso.split(".")[0])
+        end_dt = datetime.fromisoformat(end_iso.split(".")[0])
+        return (
+            f"{start_dt.strftime('%A, %d %B %Y')} "
+            f"({start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')})"
+        )
+    except ValueError:
+        return start_iso
+
+def _parse_calendar_date(date_text: str) -> str | None:
+    """Parse a natural-language or ISO date into YYYY-MM-DD."""
+    raw = (date_text or "").strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return raw
+
+    now = _hk_now()
+    lowered = raw.lower()
+    for day_name in _WEEKDAY_NAMES:
+        if day_name.lower() in lowered or day_name[:3].lower() in lowered.split():
+            target = _WEEKDAY_INDEX[day_name.lower()]
+            days_ahead = (target - now.weekday()) % 7
+            if days_ahead == 0 and "next" in lowered:
+                days_ahead = 7
+            return (now + timedelta(days=days_ahead)).date().isoformat()
+
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%B %d %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+def _calendar_data_to_iso(data: dict) -> tuple[str, str] | None:
+    date_value = _parse_calendar_date(data.get("date", ""))
+    start_time = _format_time_value(data.get("start_time", ""))
+    end_time = _format_time_value(data.get("end_time", ""))
+    if not date_value or not start_time or not end_time:
+        return None
+    return (
+        f"{date_value}T{start_time}:00",
+        f"{date_value}T{end_time}:00",
+    )
+
+def _missing_calendar_fields(data: dict) -> list[str]:
+    missing = []
+    if not str(data.get("title", "") or "").strip():
+        missing.append("title")
+    if not _parse_calendar_date(str(data.get("date", "") or "")):
+        missing.append("date")
+    if not _format_time_value(data.get("start_time", "")):
+        missing.append("start_time")
+    if not _format_time_value(data.get("end_time", "")):
+        missing.append("end_time")
+    return missing
+
+def _calendar_missing_prompt(data: dict, missing_fields: list[str]) -> str:
+    labels = {
+        "title": "event title",
+        "date": "date",
+        "start_time": "start time",
+        "end_time": "end time",
+    }
+    known = []
+    if data.get("title"):
+        known.append(f"title: {data['title']}")
+    if data.get("date"):
+        known.append(f"date: {data['date']}")
+    if data.get("start_time"):
+        known.append(f"start: {data['start_time']}")
+    if data.get("end_time"):
+        known.append(f"end: {data['end_time']}")
+    missing_text = ", ".join(labels.get(field, field) for field in missing_fields)
+    prefix = f"I have {', '.join(known)}. " if known else ""
+    return f"{prefix}Please tell me the {missing_text} for this calendar event."
+
+def _save_pending_calendar_add(profile: dict, data: dict, response_text: str | None = None) -> list:
+    missing_fields = _missing_calendar_fields(data)
+    profile["pending_action"] = "complete_calendar_add"
+    profile["pending_data"] = data
+    save_profile(profile)
+    return [_text_response(response_text or _calendar_missing_prompt(data, missing_fields))]
+
+def _handle_pending_calendar_add(profile: dict, text: str) -> list:
+    try:
+        parsed = {}
+        try:
+            parsed = _parse_profile_update(text)
+        except Exception as exc:
+            logger.warning(f"Pending calendar parser fallback: {exc}")
+        new_data = _merge_timetable_data(
+            parsed.get("extracted_data", {}) or {},
+            _extract_calendar_fields_locally(text),
+        )
+        data = _merge_timetable_data(profile.get("pending_data", {}), new_data)
+        missing_fields = _missing_calendar_fields(data)
+        if missing_fields:
+            return _save_pending_calendar_add(
+                profile,
+                data,
+                parsed.get("agent_response") or _calendar_missing_prompt(data, missing_fields),
+            )
+
+        _clear_pending_state(profile)
+        save_profile(profile)
+        card = _calendar_add_confirmation_card(data)
+        return [_card_response("Please confirm this calendar event.", card)]
+    except Exception as exc:
+        logger.error(f"Pending calendar add error: {exc}")
+        return [_text_response("I had trouble completing that calendar event. Please send the details again.")]
+
+def _extract_calendar_fields_locally(text: str) -> dict:
+    data = {}
+    raw_text = text or ""
+    lowered = raw_text.lower()
+
+    time_match = re.search(
+        r"(?:from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|-)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+        lowered,
+    )
+    if time_match:
+        data["start_time"] = _format_time_value(time_match.group(1))
+        data["end_time"] = _format_time_value(time_match.group(2))
+    else:
+        at_match = re.search(r"at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", lowered)
+        if at_match:
+            data["start_time"] = _format_time_value(at_match.group(1))
+
+    for day_name in _WEEKDAY_NAMES:
+        if day_name.lower() in lowered or day_name[:3].lower() in lowered.split():
+            data["date"] = day_name
+            break
+
+    iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", raw_text)
+    if iso_match:
+        data["date"] = iso_match.group(1)
+
+    title_match = re.search(r"(?:called|named|titled)\s+(.+?)(?:\s+on|\s+at|$)", raw_text, re.IGNORECASE)
+    if title_match:
+        data["title"] = title_match.group(1).strip(" .")
+    return data
+
+def _calendar_add_confirmation_card(data: dict) -> dict:
+    title = data.get("title", "Event")
+    date_value = data.get("date", "")
+    start_time = _format_time_value(data.get("start_time", ""))
+    end_time = _format_time_value(data.get("end_time", ""))
+    location = str(data.get("location", "") or "").strip()
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": (
+                    f"I will add **{title}** to your calendar on **{date_value}** "
+                    f"at **{start_time}–{end_time}**. Confirm?"
+                ),
+                "wrap": True,
+            }
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "✅ Yes",
+                "style": "positive",
+                "data": {
+                    "action": "confirm_calendar_add",
+                    "title": title,
+                    "date": date_value,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "location": location,
+                },
+            },
+            {
+                "type": "Action.Submit",
+                "title": "❌ No",
+                "data": {"action": "cancel_calendar_add"},
+            },
+        ],
+    }
+
+def _event_registration_confirmation_card(event_data: dict) -> dict:
+    title = event_data.get("title", "Event")
+    display_date = event_data.get("display_date", "")
+    display_time = event_data.get("display_time", "")
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": f"Confirm registration for **{title}** on **{display_date}** at **{display_time}**?",
+                "wrap": True,
+            }
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "✅ Yes",
+                "style": "positive",
+                "data": {
+                    "action": "confirm_event_registration",
+                    "event_id": event_data.get("event_id", ""),
+                    "title": title,
+                    "location": event_data.get("location", ""),
+                    "start_iso": event_data.get("start_iso", ""),
+                    "end_iso": event_data.get("end_iso", ""),
+                    "display_date": display_date,
+                    "display_time": display_time,
+                },
+            },
+            {
+                "type": "Action.Submit",
+                "title": "❌ No",
+                "data": {"action": "cancel_event_registration"},
+            },
+        ],
+    }
+
+def _store_shown_events(profile: dict, events: list) -> None:
+    stored = []
+    for event in events or []:
+        cal_times = _event_to_calendar_times(event)
+        if not cal_times:
+            continue
+        stored.append({
+            "event_id": event.get("source_id") or event.get("id", ""),
+            "title": event.get("title", ""),
+            "location": event.get("location", ""),
+            **cal_times,
+        })
+    profile["last_shown_events"] = stored[:20]
+
+def _find_event_for_registration(profile: dict, text: str) -> dict | None:
+    query = (text or "").lower()
+    for prefix in ("register for", "sign up for", "sign me up for", "join"):
+        if prefix in query:
+            query = query.split(prefix, 1)[1].strip(" :")
+            break
+    if not query:
+        return None
+
+    candidates = profile.get("last_shown_events") or []
+    best = None
+    for candidate in candidates:
+        title = str(candidate.get("title", "")).lower()
+        if title and (title in query or query in title):
+            best = candidate
+            break
+    if best:
+        return best
+
+    try:
+        events = extract_events_for_student(profile.get("id", ""))
+    except Exception as exc:
+        logger.error(f"Event lookup for registration failed: {exc}")
+        return None
+
+    for event in events:
+        title = str(event.get("title", "")).lower()
+        if title and (title in query or query in title):
+            cal_times = _event_to_calendar_times(event)
+            if not cal_times:
+                continue
+            return {
+                "event_id": event.get("source_id") or event.get("id", ""),
+                "title": event.get("title", ""),
+                "location": event.get("location", ""),
+                **cal_times,
+            }
+    return None
+
+def handle_start_event_registration(event_data: dict) -> list:
+    if not event_data.get("start_iso") or not event_data.get("end_iso"):
+        return [_text_response("I couldn't determine the event schedule for registration.")]
+    card = _event_registration_confirmation_card(event_data)
+    return [_card_response("Please confirm your registration.", card)]
+
+def handle_confirm_event_registration(student_id: str, value: dict) -> list:
+    profile = get_profile(student_id)
+    if not profile:
+        return [_text_response("Please complete onboarding first.")]
+
+    event_id = value.get("event_id", "")
+    title = value.get("title", "Event")
+    start_iso = value.get("start_iso", "")
+    end_iso = value.get("end_iso", "")
+    location = value.get("location", "")
+
+    registered = list(profile.get("registered_events") or [])
+    if event_id and event_id not in registered:
+        registered.append(event_id)
+        profile["registered_events"] = registered
+
+    if not _has_calendar_consent(profile):
+        save_profile(profile)
+        return [_text_response(
+            "Registration noted. Enable calendar access in your profile settings to auto-add events."
+        )]
+
+    user_email = resolve_user_email(profile.get("email"))
+    result = create_calendar_event(user_email, title, start_iso, end_iso, location)
+    save_profile(profile)
+    if result.get("success"):
+        display = _format_event_datetime_display(start_iso, end_iso)
+        return [_text_response(f"✅ Added {title} to your calendar for {display}.")]
+    logger.error(f"Event registration calendar create failed: {result.get('error')}")
+    return [_text_response("I couldn't reach your calendar right now. Please try again later.")]
+
+def handle_confirm_calendar_add(student_id: str, value: dict) -> list:
+    profile = get_profile(student_id)
+    if not profile:
+        return [_text_response("Please complete onboarding first.")]
+
+    if not _has_calendar_consent(profile):
+        return [_text_response(
+            "Calendar access is not enabled. Turn on calendar permission in your profile settings first."
+        )]
+
+    iso_times = _calendar_data_to_iso(value)
+    if not iso_times:
+        return [_text_response("I couldn't parse that calendar event. Please try again.")]
+
+    start_iso, end_iso = iso_times
+    title = value.get("title", "Event")
+    location = value.get("location", "")
+    user_email = resolve_user_email(profile.get("email"))
+    result = create_calendar_event(user_email, title, start_iso, end_iso, location)
+    if result.get("success"):
+        display = _format_event_datetime_display(start_iso, end_iso)
+        return [_text_response(f"✅ Added {title} to your calendar for {display}.")]
+    logger.error(f"Manual calendar create failed: {result.get('error')}")
+    return [_text_response("I couldn't reach your calendar right now. Please try again later.")]
+
+def handle_event_registration(student_id: str, text: str) -> list:
+    profile = get_profile(student_id)
+    if not profile:
+        return [_text_response("Please complete onboarding first.")]
+
+    event_data = _find_event_for_registration(profile, text)
+    if not event_data:
+        return [_text_response(
+            "I couldn't find that event. Try 'events' or your digest first, then say "
+            "'register for [event name]'."
+        )]
+    return handle_start_event_registration(event_data)
+
 PROFILE_UPDATE_SYSTEM_PROMPT = """You are an intelligent university campus agent. Analyze the user's message to determine their intent and extract relevant information.
 
 You can handle these main intents:
@@ -656,10 +1122,11 @@ You can handle these main intents:
 2. "update_interests": Adding or removing items from the user's 'interests' list.
 3. "update_activities": Adding or removing items from the user's 'activities' list.
 4. "add_timetable": Adding a class to their schedule (requires: course_code, day, start_time, end_time).
+5. "add_calendar_event": Adding an arbitrary event to Outlook calendar (requires: title, date, start_time, end_time; location optional).
 
 Return ONLY a raw JSON object with this exact structure:
 {
-  "intent": "update_profile" | "update_interests" | "update_activities" | "add_timetable" | "unknown",
+  "intent": "update_profile" | "update_interests" | "update_activities" | "add_timetable" | "add_calendar_event" | "unknown",
   "extracted_data": { ...key-value pairs of what the user provided... },
   "missing_fields": [ "list of fields still needed to complete the action" ],
   "agent_response": "A natural, friendly response to the user. If there are missing_fields, ask them for the missing info. If the action is complete, confirm it."
@@ -672,6 +1139,8 @@ Examples of expected behavior:
 - If the user says "add AI and robotics to my interests", intent is "update_interests", extracted_data has action="add", items=["AI", "robotics"].
 - If the user says "remove robotics from interests", intent is "update_interests", extracted_data has action="remove", items=["robotics"].
 - If the user says "turn off events but keep scholarships", intent is "update_profile", extracted_data has module_events=false, module_scholarships=true.
+- If the user says "add team meeting to my calendar on Friday at 2pm until 4pm", intent is "add_calendar_event", extracted_data has title="team meeting", date="Friday", start_time="14:00", end_time="16:00".
+- If the user says "add study group to my calendar on Monday", intent is "add_calendar_event", extracted_data has title="study group", date="Monday", missing_fields are ["start_time", "end_time"].
 - If the user says "change my name to Alex", intent is "update_profile", extracted_data has name="Alex".
 - If the user says "make my digest weekly", intent is "update_profile", extracted_data has notification_preference="weekly".
 - If you cannot understand the intent, return intent="unknown".
@@ -1104,6 +1573,23 @@ def _event_card(event: dict) -> dict:
             "url": event["source_url"]
         })
 
+    cal_times = _event_to_calendar_times(event)
+    if cal_times:
+        actions.append({
+            "type": "Action.Submit",
+            "title": "Register",
+            "data": {
+                "action": "start_event_registration",
+                "event_id": event.get("source_id") or event.get("id", ""),
+                "title": event.get("title", "Event"),
+                "location": event.get("location", ""),
+                "start_iso": cal_times["start_iso"],
+                "end_iso": cal_times["end_iso"],
+                "display_date": cal_times["display_date"],
+                "display_time": cal_times["display_time"],
+            }
+        })
+
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
@@ -1221,6 +1707,11 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         else False
     )
 
+    consent_inbox = str(form_data.get("consent_inbox", "false")).lower() == "true"
+    consent_calendar = str(form_data.get("consent_calendar", "false")).lower() == "true"
+    # In production, consent_inbox/consent_calendar would trigger the OAuth2 delegated-consent flow.
+    # This prototype stores consent intent only.
+
     # Build and save profile
     profile = build_profile_from_form({
         "name":                  form_data.get("name") or "Student",
@@ -1262,17 +1753,31 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
                 "label": code
             })
 
+    blocked_slots, imported_count = _prefill_timetable_from_calendar(
+        {"email": form_data.get("email", f"{student_id}@connect.hku.hk")},
+        blocked_slots,
+        consent_calendar,
+    )
+
     # Inject timetable into profile before saving
     profile["timetable"] = {
         "blocked_slots": blocked_slots,
         "upcoming_deadlines": []
     }
+    profile["consent"] = {
+        "inbox": consent_inbox,
+        "calendar": consent_calendar,
+    }
 
     profile["id"] = student_id
     save_profile(profile)
 
+    calendar_note = ""
+    if imported_count:
+        calendar_note = f"\n\nImported {imported_count} class(es) from your Outlook calendar."
+
     responses = [_text_response(
-        f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences. "
+        f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences.{calendar_note} "
         "What would you like to do now?\n\n"
         "• Type 'digest' for your daily update\n"
         "• Type 'scholarships' to browse matches\n"
@@ -1335,6 +1840,8 @@ def handle_get_digest(student_id: str) -> list:
         try:
             raw_events = extract_events_for_student(student_id)
             checked_events = run_conflict_checks_batch(raw_events, profile)
+            _store_shown_events(profile, checked_events)
+            save_profile(profile)
         except Exception as e:
             logger.error(f"Event pipeline error: {e}")
             checked_events = []
@@ -1571,6 +2078,12 @@ def _list_gaps(gaps: list) -> list:
     return [gap for gap in gaps or [] if gap.get("type") == "repeating_list"]
 
 
+def _collection_gaps(gaps: list) -> list:
+    order = {"repeating_list": 0, "free_field": 1, "long_text": 2}
+    items = [gap for gap in gaps or [] if gap.get("type") in order]
+    return sorted(items, key=lambda gap: order[gap["type"]])
+
+
 def _long_text_gaps(gaps: list) -> list:
     return [gap for gap in gaps or [] if gap.get("type") == "long_text"]
 
@@ -1602,6 +2115,7 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
     filled_data = state.get("filled_data") or {}
     pending_lists = state.get("pending_list_data") or {}
     long_text_drafts = state.get("long_text_drafts") or {}
+    pending_free_fields = state.get("pending_free_fields") or {}
 
     simple_fields = filled_data.get("simple_fields") or {}
     if simple_fields:
@@ -1643,6 +2157,23 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
             })
 
     for key, text in long_text_drafts.items():
+        if not text:
+            continue
+        body.append({
+            "type": "TextBlock",
+            "text": key.replace("_", " ").title(),
+            "weight": "Bolder",
+            "wrap": True,
+            "spacing": "Medium",
+        })
+        preview = text if len(text) <= 1200 else f"{text[:1200]}..."
+        body.append({
+            "type": "TextBlock",
+            "text": preview,
+            "wrap": True,
+        })
+
+    for key, text in pending_free_fields.items():
         if not text:
             continue
         body.append({
@@ -1718,17 +2249,17 @@ def _begin_application_review(profile: dict, state: dict) -> list:
 
 
 def _advance_application_gap(profile: dict, state: dict) -> list:
-    list_gap_items = _list_gaps(state.get("gap_queue", []))
+    collection_gaps = _collection_gaps(state.get("gap_queue", []))
     current = state.get("current_gap") or {}
     current_index = 0
     if current:
-        for index, gap in enumerate(list_gap_items):
-            if gap.get("key") == current.get("key"):
+        for index, gap in enumerate(collection_gaps):
+            if gap.get("key") == current.get("key") and gap.get("type") == current.get("type"):
                 current_index = index + 1
                 break
 
-    if current_index < len(list_gap_items):
-        next_gap = list_gap_items[current_index]
+    if current_index < len(collection_gaps):
+        next_gap = collection_gaps[current_index]
         update_application_state(
             profile,
             current_gap=next_gap,
@@ -1753,7 +2284,28 @@ def handle_application_collection_message(student_id: str, text: str) -> list | 
         return _advance_application_gap(profile, state)
 
     current_gap = state.get("current_gap") or {}
-    if current_gap.get("type") != "repeating_list":
+    gap_type = current_gap.get("type")
+
+    if gap_type == "free_field":
+        key = current_gap.get("key")
+        if not (text or "").strip():
+            return [_text_response("Please provide your answer, or say **next** to skip for now.")]
+        pending_free_fields = dict(state.get("pending_free_fields") or {})
+        pending_free_fields[key] = text.strip()
+        update_application_state(profile, pending_free_fields=pending_free_fields)
+        save_profile(profile)
+        return _advance_application_gap(profile, get_application_state(profile))
+
+    if gap_type == "long_text":
+        key = current_gap.get("key")
+        if (text or "").strip():
+            long_text_drafts = dict(state.get("long_text_drafts") or {})
+            long_text_drafts[key] = text.strip()
+            update_application_state(profile, long_text_drafts=long_text_drafts)
+            save_profile(profile)
+        return _advance_application_gap(profile, get_application_state(profile))
+
+    if gap_type != "repeating_list":
         return [_text_response("Say **next** when you're ready to continue.")]
 
     list_schema = current_gap.get("schema") or {}
@@ -1825,25 +2377,34 @@ def handle_application_form_upload(
         handle.write(file_bytes)
 
     try:
-        if stored_content_type == "application/pdf":
-            form_json = extract_pdf_schema(input_path)
-        else:
-            form_json = extract_docx_schema(input_path)
-
-        schema = analyze_form_schema(form_json)
-        filled_data = build_filled_data(schema, profile)
-        gaps = detect_gaps(schema, filled_data, profile)
+        plan = build_form_plan(input_path, stored_content_type, profile)
     except Exception as exc:
         logger.error(f"Application form analysis failed: {exc}")
         return [_text_response(
-            "I couldn't analyze that form structure. Please upload a table-based DOCX or PDF application form."
+            "I couldn't analyze that form. Please upload a table-based DOCX or PDF application form."
         )]
+
+    if not plan_has_fill_targets(plan):
+        metadata = plan.get("metadata") or {}
+        table_count = metadata.get("table_count", 0)
+        errors = metadata.get("analysis_errors") or []
+        detail = errors[0] if errors else "no fillable fields were detected"
+        return [_text_response(
+            f"I parsed {table_count} table section(s) but couldn't identify fillable fields ({detail}). "
+            "Try a clearer scan/PDF export, or paste missing answers after review."
+        )]
+
+    schema = plan.get("table_schema") or {}
+    free_fields = plan.get("free_fields") or []
+    filled_data = plan.get("filled_data") or build_filled_data(schema, profile, free_fields)
+    gaps = plan.get("gaps") or detect_gaps(schema, filled_data, profile, free_fields)
+    form_json = plan.get("form_json", "")
 
     profile.pop("pending_application", None)
     _clear_application_review_state(profile)
 
-    list_gap_items = _list_gaps(gaps)
-    first_gap = list_gap_items[0] if list_gap_items else None
+    collection_gaps = _collection_gaps(gaps)
+    first_gap = collection_gaps[0] if collection_gaps else None
     state = init_application_state(
         profile,
         scholarship_id="ss_472",
@@ -1856,10 +2417,12 @@ def handle_application_form_upload(
     )
     update_application_state(
         profile,
+        form_plan=plan,
         form_json=form_json,
         gap_queue=gaps,
         current_gap=first_gap,
         pending_list_data={},
+        pending_free_fields={},
         long_text_drafts={},
     )
     profile["last_scholarship_id"] = "ss_472"
@@ -1867,10 +2430,15 @@ def handle_application_form_upload(
     save_profile(profile)
 
     if first_gap:
+        metadata = plan.get("metadata") or {}
+        imported_note = ""
+        if metadata.get("analysis_errors"):
+            imported_note = " Some sections needed partial analysis."
         return [
             _text_response(
-                f"I analyzed your form and found {len(schema.get('simple_fields', []))} profile fields "
-                f"and {len(schema.get('repeating_lists', []))} repeating sections."
+                f"I analyzed your form and found {len(schema.get('simple_fields', []))} profile fields, "
+                f"{len(schema.get('repeating_lists', []))} repeating sections, and "
+                f"{len(free_fields)} open-ended questions.{imported_note}"
             ),
             _text_response(first_gap.get("prompt") or "Please share the first entry for this section."),
         ]
@@ -1897,7 +2465,9 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
             "schema": {},
             "filled_data": {},
             "pending_list_data": {},
+            "pending_free_fields": {},
             "long_text_drafts": {},
+            "form_plan": {},
         }
 
     input_path = state.get("input_path") or profile.get("application_input_path")
@@ -1911,17 +2481,18 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
         state.get("filled_data") or {},
         state.get("pending_list_data") or {},
         state.get("long_text_drafts") or {},
+        state.get("pending_free_fields") or {},
     )
     if additional_notes:
         merged_data.setdefault("long_text", {})
         merged_data["long_text"]["additional_notes"] = additional_notes
 
-    schema = state.get("schema") or {}
+    form_plan = state.get("form_plan") or {
+        "table_schema": state.get("schema") or {},
+        "free_fields": [],
+    }
     try:
-        if content_type == "application/pdf":
-            fill_pdf_form(input_path, merged_data, schema, output_path)
-        else:
-            fill_docx_form(input_path, merged_data, schema, output_path)
+        fill_application(form_plan, input_path, output_path, merged_data, content_type)
     except Exception as exc:
         logger.error(f"Application form fill failed: {exc}")
         return [_text_response(
@@ -2087,6 +2658,15 @@ def handle_profile_update(student_id: str, text: str) -> list:
         if missing_fields:
             if intent == "add_timetable":
                 return _save_pending_timetable(profile, extracted_data, agent_response)
+            if intent == "add_calendar_event":
+                merged = _merge_timetable_data(
+                    extracted_data,
+                    _extract_calendar_fields_locally(text),
+                )
+                if _missing_calendar_fields(merged):
+                    return _save_pending_calendar_add(profile, merged, agent_response)
+                card = _calendar_add_confirmation_card(merged)
+                return [_card_response("Please confirm this calendar event.", card)]
             return [_text_response(agent_response)]
 
         if intent == "update_profile":
@@ -2171,6 +2751,17 @@ def handle_profile_update(student_id: str, text: str) -> list:
             save_profile(profile)
             return [_text_response(message)]
 
+        if intent == "add_calendar_event":
+            merged = _merge_timetable_data(
+                extracted_data,
+                _extract_calendar_fields_locally(text),
+            )
+            missing_calendar_fields = _missing_calendar_fields(merged)
+            if missing_calendar_fields:
+                return _save_pending_calendar_add(profile, merged, agent_response)
+            card = _calendar_add_confirmation_card(merged)
+            return [_card_response("Please confirm this calendar event.", card)]
+
         return [_text_response(agent_response)]
 
     except Exception as e:
@@ -2227,6 +2818,9 @@ def handle_message(student_id: str, message: dict) -> list:
     if profile and profile.get("pending_action") == "complete_timetable" and not action.strip():
         return _handle_pending_timetable(profile, message.get("text") or "")
 
+    if profile and profile.get("pending_action") == "complete_calendar_add" and not action.strip():
+        return _handle_pending_calendar_add(profile, message.get("text") or "")
+
     if profile and get_application_state(profile).get("step") == "collecting_list" and not action.strip():
         collection_response = handle_application_collection_message(
             student_id,
@@ -2262,6 +2856,21 @@ def handle_message(student_id: str, message: dict) -> list:
 
     if action == "cancel_profile_update":
         return [_text_response("No problem — I cancelled that profile change.")]
+
+    if action == "start_event_registration":
+        return handle_start_event_registration(value)
+
+    if action == "confirm_event_registration":
+        return handle_confirm_event_registration(student_id, value)
+
+    if action == "cancel_event_registration":
+        return [_text_response("Registration cancelled. No calendar changes were made.")]
+
+    if action == "confirm_calendar_add":
+        return handle_confirm_calendar_add(student_id, value)
+
+    if action == "cancel_calendar_add":
+        return [_text_response("No problem — I did not add anything to your calendar.")]
 
     if action == "edit_profile":
         if profile:
@@ -2367,8 +2976,14 @@ def handle_message(student_id: str, message: dict) -> list:
         "change ", "update ", "set ", "modify", "make me", "i want to be",
         "add ", "remove ", "add class", "add course", "add timetable", "add schedule"
     ]
+    if _looks_like_calendar_add_message(text):
+        return handle_profile_update(student_id, message.get("text") or text)
+
+    if _looks_like_event_registration_message(text):
+        return handle_event_registration(student_id, message.get("text") or text)
+
     if any(kw in text for kw in update_terms) or _looks_like_timetable_message(text):
-        return handle_profile_update(student_id, text)
+        return handle_profile_update(student_id, message.get("text") or text)
 
     if "upload cv" in text or text == "cv":
         return [_text_response("Please attach your PDF CV to the chat first, then type CV again.")]
@@ -2427,7 +3042,7 @@ def handle_message(student_id: str, message: dict) -> list:
 
     return [_text_response(
         "I didn't quite understand that.\n\n"
-        "Did you mean to update your profile, add a class to your timetable, or see your daily digest?"
+        "Did you mean to update your profile, add a class to your timetable, add an event to your calendar, or see your daily digest?"
     )]
 
 # ---------------------------------------------------------------------------

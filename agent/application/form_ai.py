@@ -1,5 +1,7 @@
 """AI analysis and conversational data helpers for application forms."""
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -8,12 +10,14 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 
-from agent.application.cell_utils import parse_llm_json
+from agent.application.cell_utils import normalize_text, parse_llm_json
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 PROMPT_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
+TABLE_BATCH_SIZE = 4
+SCHEMA_MAX_TOKENS = 8000
 
 
 def _load_prompt(name: str) -> str:
@@ -51,16 +55,30 @@ def _profile_value(profile: dict, profile_key: str) -> str:
     return str(mapping.get(profile_key, "") or "")
 
 
+def _valid_paragraph_index(value, paragraph_count: int) -> bool:
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= index < paragraph_count
+
+
+def _field_has_location(field: dict, table_count: int, paragraph_count: int) -> bool:
+    source = (field.get("source") or "table").lower()
+    if source == "paragraph":
+        return _valid_paragraph_index(field.get("paragraph_index"), paragraph_count)
+    try:
+        index = int(field.get("table_index", -1))
+    except (TypeError, ValueError):
+        return False
+    return 0 <= index < table_count
+
+
 def _validate_schema(schema: dict, form_payload: dict) -> dict:
     tables = form_payload.get("tables") or []
+    paragraphs = form_payload.get("paragraphs") or []
     table_count = len(tables)
-
-    def valid_table_index(value) -> bool:
-        try:
-            index = int(value)
-        except (TypeError, ValueError):
-            return False
-        return 0 <= index < table_count
+    paragraph_count = len(paragraphs)
 
     cleaned = {
         "simple_fields": [],
@@ -70,34 +88,39 @@ def _validate_schema(schema: dict, form_payload: dict) -> dict:
     }
 
     for field in schema.get("simple_fields", []) or []:
-        if field.get("anchor_label") and valid_table_index(field.get("table_index", 0)):
+        if field.get("anchor_label") and field.get("key") and _field_has_location(field, table_count, paragraph_count):
             cleaned["simple_fields"].append(field)
 
     for field in schema.get("repeating_lists", []) or []:
         headers = field.get("column_headers") or []
-        if field.get("key") and headers and valid_table_index(field.get("table_index", 0)):
+        if field.get("key") and headers and _field_has_location(field, table_count, paragraph_count):
             cleaned["repeating_lists"].append(field)
 
     for field in schema.get("long_text", []) or []:
-        if field.get("anchor_label") and field.get("key"):
+        if field.get("anchor_label") and field.get("key") and _field_has_location(field, table_count, paragraph_count):
             cleaned["long_text"].append(field)
 
     for field in schema.get("booleans", []) or []:
-        if field.get("anchor_label") and valid_table_index(field.get("table_index", 0)):
+        if field.get("anchor_label") and field.get("key") and _field_has_location(field, table_count, paragraph_count):
             cleaned["booleans"].append(field)
 
     return cleaned
 
 
-def analyze_form_schema(table_json: str) -> dict:
-    form_payload = json.loads(table_json)
-    prompt = _load_prompt("form_schema_analysis.txt").format(form_json=table_json)
+def _analyze_schema_batch(form_payload: dict, table_batch: list) -> dict:
+    batch_payload = {
+        **form_payload,
+        "tables": table_batch,
+        "analysis_note": f"Analyzing tables {table_batch[0]['table_index']} to {table_batch[-1]['table_index']} only.",
+    }
+    batch_json = json.dumps(batch_payload, ensure_ascii=False, indent=2)
+    prompt = _load_prompt("form_schema_analysis.txt").format(form_json=batch_json)
     client = _get_openai_client()
     response = client.chat.completions.create(
         model=_deployment(),
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
-        max_tokens=4000,
+        max_tokens=SCHEMA_MAX_TOKENS,
         temperature=0.1,
     )
     parsed = parse_llm_json(response.choices[0].message.content or "{}")
@@ -106,7 +129,169 @@ def analyze_form_schema(table_json: str) -> dict:
     return _validate_schema(parsed, form_payload)
 
 
-def build_filled_data(schema: dict, profile: dict) -> dict:
+def merge_table_schemas(partial_schemas: list[dict]) -> dict:
+    merged = {
+        "simple_fields": [],
+        "repeating_lists": [],
+        "long_text": [],
+        "booleans": [],
+    }
+    seen = {category: set() for category in merged}
+
+    for schema in partial_schemas or []:
+        for category in merged:
+            for field in schema.get(category, []) or []:
+                key = field.get("key") or field.get("anchor_label")
+                table_index = field.get("table_index", "")
+                dedupe_key = (category, key, table_index, field.get("paragraph_index", ""))
+                if dedupe_key in seen[category]:
+                    continue
+                seen[category].add(dedupe_key)
+                merged[category].append(field)
+    return merged
+
+
+def count_fill_targets(schema: dict, free_fields: list | None = None) -> int:
+    total = sum(len(schema.get(category, []) or []) for category in (
+        "simple_fields", "repeating_lists", "long_text", "booleans"
+    ))
+    total += len(free_fields or [])
+    return total
+
+
+def analyze_form_schema_chunked(form_payload: dict) -> tuple[dict, list[str]]:
+    """Analyze large forms in table batches; return merged schema and warnings."""
+    tables = form_payload.get("tables") or []
+    if not tables:
+        return {"simple_fields": [], "repeating_lists": [], "long_text": [], "booleans": []}, []
+
+    partial_schemas = []
+    errors = []
+    for start in range(0, len(tables), TABLE_BATCH_SIZE):
+        batch = tables[start:start + TABLE_BATCH_SIZE]
+        try:
+            partial_schemas.append(_analyze_schema_batch(form_payload, batch))
+        except Exception as exc:
+            first = batch[0].get("table_index", start)
+            last = batch[-1].get("table_index", start + len(batch) - 1)
+            message = f"Tables {first}-{last}: {exc}"
+            logger.warning("Schema batch failed: %s", message)
+            errors.append(message)
+
+    merged = merge_table_schemas(partial_schemas)
+    if count_fill_targets(merged) == 0 and errors:
+        raise ValueError("; ".join(errors))
+    return merged, errors
+
+
+def analyze_form_schema(table_json: str) -> dict:
+    """Backward-compatible single-call wrapper."""
+    form_payload = json.loads(table_json)
+    schema, _errors = analyze_form_schema_chunked(form_payload)
+    return schema
+
+
+def _match_widget_name(question_text: str, widgets: list[dict]) -> str | None:
+    question_norm = normalize_text(question_text)
+    if not question_norm:
+        return None
+    for widget in widgets or []:
+        name = str(widget.get("field_name") or "")
+        name_norm = normalize_text(name.replace("_", " "))
+        if not name_norm:
+            continue
+        if name_norm in question_norm or question_norm[:40] in name_norm:
+            return name
+        essay_keys = ("essay", "statement", "reason", "experience", "answer", "description")
+        if any(key in name_norm for key in essay_keys) and any(key in question_norm for key in essay_keys):
+            return name
+    return None
+
+
+def extract_free_form_fields(form_payload: dict) -> list[dict]:
+    """Extract non-table essay/open fields from paragraphs and AcroForm widgets."""
+    paragraphs = form_payload.get("paragraphs") or []
+    widgets = form_payload.get("acroform_widgets") or []
+    content_controls = form_payload.get("content_controls") or []
+
+    paragraph_inventory = "\n".join(
+        f"{item.get('paragraph_index', item.get('line_index', idx))}: {item.get('text', '')[:200]}"
+        for idx, item in enumerate(paragraphs[:80])
+    )
+    widget_inventory = "\n".join(
+        f"{widget.get('field_name', '')}: {widget.get('field_type', '')}"
+        for widget in widgets[:40]
+    ) or "(none)"
+
+    raw_parts = [item.get("text", "") for item in paragraphs[:80]]
+    raw_text = "\n".join(raw_parts)[:12000]
+
+    if not raw_text.strip() and not widgets and not content_controls:
+        return []
+
+    try:
+        prompt = _load_prompt("form_free_field_extract.txt").format(
+            paragraph_inventory=paragraph_inventory or "(none)",
+            widget_inventory=widget_inventory,
+            raw_text=raw_text or "(none)",
+        )
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=_deployment(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2000,
+            temperature=0.1,
+        )
+        parsed = parse_llm_json(response.choices[0].message.content or "{}")
+        candidates = parsed.get("free_fields", []) if isinstance(parsed, dict) else []
+    except Exception as exc:
+        logger.warning("Free-field extraction failed: %s", exc)
+        candidates = []
+
+    free_fields = []
+    seen_keys = set()
+    for item in candidates or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        question_text = str(item.get("question_text") or item.get("anchor_label") or "").strip()
+        if not key or not question_text or key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        field = {
+            "key": key,
+            "question_text": question_text,
+            "anchor_label": str(item.get("anchor_label") or question_text[:80]).strip(),
+            "source": "paragraph",
+            "fill_strategy": item.get("fill_strategy") or "paragraph_append",
+            "paragraph_index": item.get("paragraph_index"),
+            "field_name": item.get("field_name"),
+        }
+
+        if widgets:
+            matched = field.get("field_name") or _match_widget_name(question_text, widgets)
+            if matched:
+                field["field_name"] = matched
+                field["source"] = "acroform"
+                field["fill_strategy"] = "acroform_widget"
+
+        if field.get("paragraph_index") is None and content_controls:
+            anchor_norm = normalize_text(field["anchor_label"])
+            for control in content_controls:
+                label_norm = normalize_text(control.get("label", ""))
+                if anchor_norm and label_norm and (anchor_norm in label_norm or label_norm in anchor_norm):
+                    field["content_control_index"] = control.get("index")
+                    field["source"] = "content_control"
+                    break
+
+        free_fields.append(field)
+
+    return free_fields[:15]
+
+
+def build_filled_data(schema: dict, profile: dict, free_fields: list | None = None) -> dict:
     simple_values = {}
     for field in schema.get("simple_fields", []):
         key = field.get("key")
@@ -140,15 +325,22 @@ def build_filled_data(schema: dict, profile: dict) -> dict:
         else:
             boolean_values[key] = None
 
+    free_values = {}
+    for field in free_fields or []:
+        key = field.get("key")
+        if key:
+            free_values[key] = ""
+
     return {
         "simple_fields": simple_values,
         "repeating_lists": repeating_values,
         "long_text": long_text_values,
         "booleans": boolean_values,
+        "free_fields": free_values,
     }
 
 
-def detect_gaps(schema: dict, filled_data: dict, profile: dict) -> list[dict]:
+def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs: list | None = None) -> list[dict]:
     gaps = []
 
     for field in schema.get("repeating_lists", []):
@@ -179,6 +371,25 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict) -> list[dict]:
             "key": key,
             "label": field.get("anchor_label") or key.replace("_", " ").title(),
             "schema": field,
+            "prompt": (
+                f"Please provide your response for **{field.get('anchor_label', key)}**, "
+                "or say **next** to let me draft it from your profile."
+            ),
+        })
+
+    for field in free_field_defs or []:
+        key = field.get("key")
+        current = (filled_data.get("free_fields") or {}).get(key) or ""
+        if current.strip():
+            continue
+        gaps.append({
+            "type": "free_field",
+            "key": key,
+            "label": field.get("question_text") or key.replace("_", " ").title(),
+            "schema": field,
+            "prompt": (
+                f"Please answer this form question:\n\n**{field.get('question_text', key)}**"
+            ),
         })
 
     if not gaps and not profile.get("activities"):
@@ -234,15 +445,23 @@ def draft_long_text(field_schema: dict, profile: dict, collected_lists: dict) ->
     return ""
 
 
-def merge_filled_data(base: dict, pending_lists: dict, long_text_drafts: dict) -> dict:
+def merge_filled_data(
+    base: dict,
+    pending_lists: dict,
+    long_text_drafts: dict,
+    pending_free_fields: dict | None = None,
+) -> dict:
     merged = {
         "simple_fields": dict(base.get("simple_fields") or {}),
         "repeating_lists": dict(base.get("repeating_lists") or {}),
         "long_text": dict(base.get("long_text") or {}),
         "booleans": dict(base.get("booleans") or {}),
+        "free_fields": dict(base.get("free_fields") or {}),
     }
     for key, items in (pending_lists or {}).items():
         merged["repeating_lists"][key] = list(items)
     for key, text in (long_text_drafts or {}).items():
         merged["long_text"][key] = text
+    for key, text in (pending_free_fields or {}).items():
+        merged["free_fields"][key] = text
     return merged

@@ -13,19 +13,21 @@ Categorize fields into:
 
 Rules:
 - Use only labels that actually appear in the provided form JSON.
-- Use table_index from the parsed tables.
+- For table-backed fields, set source to "table" and include table_index from the parsed tables.
+- For paragraph-backed fields outside tables, set source to "paragraph", omit table_index, and include paragraph_index from the paragraphs list.
 - Do not invent fields that are not present.
 - For repeating lists, set description_row to true when a description row appears below each data row.
 - Return ONLY valid JSON in this shape:
 {{
   "simple_fields": [
-    {{"key": "name_en", "anchor_label": "Name in English on HKID", "fill_location": "right", "table_index": 0, "profile_key": "name"}}
+    {{"key": "name_en", "anchor_label": "Name in English on HKID", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "name"}}
   ],
   "repeating_lists": [
     {{
       "key": "volunteer_exp",
       "label": "Volunteer Experience",
       "table_index": 3,
+      "source": "table",
       "max_rows": 5,
       "column_headers": ["Period", "Name of the Unit", "Role"],
       "description_row": true,
@@ -33,10 +35,10 @@ Rules:
     }}
   ],
   "long_text": [
-    {{"key": "personal_statement", "anchor_label": "Personal Statement", "fill_location": "below", "table_index": 0, "target_words": 800}}
+    {{"key": "personal_statement", "anchor_label": "Personal Statement", "fill_location": "below", "table_index": 0, "source": "table", "target_words": 800}}
   ],
   "booleans": [
-    {{"key": "local_student", "anchor_label": "Local Student", "fill_location": "right", "table_index": 0}}
+    {{"key": "local_student", "anchor_label": "Local Student", "fill_location": "right", "table_index": 0, "source": "table"}}
   ]
 }}
 

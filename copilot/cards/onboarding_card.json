@@ -282,6 +282,39 @@
     },
     {
       "type": "TextBlock",
+      "text": "Grant calendar access below to import your schedule automatically.",
+      "wrap": true,
+      "size": "Small",
+      "isSubtle": true,
+      "spacing": "Small"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Permissions",
+      "weight": "Bolder",
+      "size": "Medium",
+      "color": "Accent",
+      "spacing": "Large",
+      "separator": true
+    },
+    {
+      "type": "Input.Toggle",
+      "id": "consent_inbox",
+      "title": "I allow the agent to read my inbox to organize emails and find opportunities.",
+      "value": "false",
+      "valueOn": "true",
+      "valueOff": "false"
+    },
+    {
+      "type": "Input.Toggle",
+      "id": "consent_calendar",
+      "title": "I allow the agent to manage my calendar to add events and check conflicts.",
+      "value": "false",
+      "valueOn": "true",
+      "valueOff": "false"
+    },
+    {
+      "type": "TextBlock",
       "text": "📄 CV Upload",
       "weight": "Bolder",
       "size": "Medium",

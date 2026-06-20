@@ -204,6 +204,10 @@ def build_profile_from_form(form_data: dict, cv_bytes: bytes = None, cv_filename
             "blocked_slots":       blocked_slots,
             "upcoming_deadlines":  []
         },
+        "consent": {
+            "inbox": str(form_data.get("consent_inbox", "false")).lower() == "true",
+            "calendar": str(form_data.get("consent_calendar", "false")).lower() == "true",
+        },
         "onboarding_complete": True,
         "last_updated":        datetime.now(timezone.utc).isoformat(),
     }

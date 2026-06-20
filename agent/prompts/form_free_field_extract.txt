@@ -1,0 +1,33 @@
+You are parsing a scholarship or university application form.
+Extract open-ended fields the student must fill in that are NOT simple profile key-value pairs.
+
+Include:
+- Essay prompts and personal statements
+- Short-answer questions requiring a written response
+- Open text boxes described in paragraphs
+
+Ignore:
+- Name, email, phone, student ID, faculty, programme, GPA, nationality
+- Signature lines, dates, checkbox labels, upload instructions, section headings
+- Table column headers that belong to repeating list sections (Period, Role, Organization, etc.)
+
+For each field return:
+- key: snake_case identifier
+- question_text: the prompt as it appears in the form
+- anchor_label: a short label to locate the field (first 80 chars of prompt or nearby heading)
+- paragraph_index: integer index if matched to a paragraph from the inventory (or null)
+- fill_strategy: "paragraph_append" for DOCX paragraph targets, "acroform_widget" for PDF widgets
+
+Return ONLY valid JSON:
+{{"free_fields": [
+  {{"key": "leadership_essay", "question_text": "...", "anchor_label": "...", "paragraph_index": 12, "fill_strategy": "paragraph_append", "field_name": null}}
+]}}
+
+Paragraph inventory (index: text):
+{paragraph_inventory}
+
+AcroForm widgets (field_name: type):
+{widget_inventory}
+
+Additional form text:
+{raw_text}
