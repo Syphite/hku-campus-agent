@@ -42,6 +42,8 @@ def init_application_state(
         "long_text_drafts": {},
         "skipped_sections": [],
         "ai_drafted_keys": [],
+        "profile_suggestions": {},
+        "suggestions_reviewed": [],
         "gap_queue": [],
         "current_gap": None,
         "form_json": None,

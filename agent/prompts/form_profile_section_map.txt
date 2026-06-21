@@ -1,0 +1,26 @@
+Map the student's profile activities to structured entries for one scholarship form section.
+
+Return ONLY valid JSON:
+{{
+  "suggestions": [
+    {{
+      "source_text": "Original activity text from profile",
+      "mapped_fields": {{}},
+      "confidence": "high",
+      "category": "volunteer"
+    }}
+  ]
+}}
+
+Rules:
+- Only suggest entries that clearly fit this section's list_kind and column headers.
+- Use mapped_fields keys from this list only: {field_keys}
+- Do not invent achievements not present in the student profile.
+- Return an empty suggestions array if nothing fits.
+- Prefer high-confidence matches only.
+
+Student profile:
+{student_profile}
+
+Form section:
+{section_schema}

@@ -6,7 +6,7 @@ The student is currently on this section:
 Allowed intents:
 - "fill_section": The user provided an answer or entries for the current section.
 - "draft_section": The user wants an AI draft (essays/open questions only, not repeating lists).
-- "skip_section": The user wants to skip this section (e.g. "skip", "next", "move on", "skip volunteer").
+- "skip_section": The user wants to skip this section (e.g. "skip", "next", "move on", "skip volunteer", "I don't have any", "nothing to add").
 - "clarify": The answer is incomplete or you need one follow-up question on the same section.
 - "unknown": Off-topic or unclear; remind them what the current section needs.
 
@@ -17,10 +17,15 @@ Return ONLY valid JSON:
   "agent_response": "Friendly reply to the user"
 }}
 
+Rules:
+- Treat any message containing "skip", "next", "move on", "pass", "no more", "don't have", or "nothing to add" as skip_section unless the user is clearly providing form content.
+- For clarify/unknown, repeat the section prompt wording — do NOT invent new requirements like "requires up to None entries" or "your profile doesn't have this yet".
+- Do not mention profile gaps unless the student explicitly asks.
+
 Examples:
 - User: "Code4HK tutor Sep-May 40hrs; Robotics mentor Jan-Jun" on a volunteer list section -> fill_section
 - User: "draft it for me" on an essay section -> draft_section
-- User: "skip this" -> skip_section
+- User: "skip this" or "skip volunteer" -> skip_section
 - User: "what scholarships do I have?" -> unknown
 
 User message:

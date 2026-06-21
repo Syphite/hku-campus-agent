@@ -29,12 +29,15 @@ from agent.form_filler import fill_application_form
 from agent.application.form_ai import (
     build_filled_data,
     build_gap_overview,
+    build_profile_suggestions_for_gaps,
+    build_profile_suggestions_overview,
     build_section_prompt,
     detect_gaps,
     draft_long_text,
     merge_filled_data,
     parse_application_collection,
     parse_list_entries_batch,
+    safe_max_rows,
     sort_collection_gaps,
 )
 from agent.application.fill_orchestrator import fill_application
@@ -2120,9 +2123,138 @@ def _long_text_gaps(gaps: list) -> list:
 
 def _looks_like_section_advance(text: str) -> bool:
     normalized = (text or "").strip().lower()
-    return normalized in {
+    if not normalized:
+        return False
+    if normalized in {
         "next", "done", "move on", "skip", "no more", "continue",
-        "that's all", "thats all", "no more", "move to next section",
+        "that's all", "thats all", "move to next section", "pass",
+        "nothing to add", "none", "n/a",
+    }:
+        return True
+    phrases = (
+        "skip", "next", "move on", "pass", "no more",
+        "don't have", "dont have", "nothing to add", "don't have any",
+    )
+    return any(phrase in normalized for phrase in phrases)
+
+
+def _looks_like_collection_review(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return normalized in {"review", "finish", "done collecting", "go to review"} or "review now" in normalized
+
+
+def _looks_like_collection_cancel(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return normalized in {
+        "cancel application", "stop application", "cancel form", "stop form",
+    }
+
+
+def _gap_is_complete(state: dict, gap: dict) -> bool:
+    key = gap.get("key")
+    if not key:
+        return False
+    if key in set(state.get("skipped_sections") or []):
+        return True
+    gap_type = gap.get("type")
+    if gap_type == "repeating_list":
+        return bool((state.get("pending_list_data") or {}).get(key))
+    if gap_type == "long_text":
+        return bool((state.get("long_text_drafts") or {}).get(key))
+    if gap_type == "free_field":
+        return bool((state.get("pending_free_fields") or {}).get(key))
+    return False
+
+
+def _next_unfilled_gap(state: dict, after_gap: dict | None = None) -> dict | None:
+    collection_gaps = _collection_gaps(state.get("gap_queue", []))
+    start_index = 0
+    if after_gap:
+        found = False
+        for index, gap in enumerate(collection_gaps):
+            if gap.get("key") == after_gap.get("key") and gap.get("type") == after_gap.get("type"):
+                start_index = index + 1
+                found = True
+                break
+        if not found:
+            start_index = 0
+
+    for gap in collection_gaps[start_index:]:
+        if not _gap_is_complete(state, gap):
+            return gap
+    return None
+
+
+def _mark_suggestion_reviewed(profile: dict, section_key: str) -> None:
+    reviewed = list(get_application_state(profile).get("suggestions_reviewed") or [])
+    if section_key and section_key not in reviewed:
+        reviewed.append(section_key)
+    update_application_state(profile, suggestions_reviewed=reviewed)
+
+
+def _profile_suggestions_card(gap: dict, suggestions: list) -> dict:
+    label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
+    section_key = gap.get("key", "")
+    body = [
+        {
+            "type": "TextBlock",
+            "text": f"Include these from your profile for **{label}**?",
+            "weight": "Bolder",
+            "wrap": True,
+        },
+        {
+            "type": "TextBlock",
+            "text": "I matched activities from your profile to this section. You can accept, enter your own entries, or skip.",
+            "wrap": True,
+            "size": "Small",
+        },
+    ]
+    for index, entry in enumerate(suggestions[:5], start=1):
+        source = entry.get("_source_text") or ""
+        summary = ", ".join(
+            str(value)
+            for key, value in entry.items()
+            if value and not str(key).startswith("_")
+        )
+        line = source or summary
+        if line:
+            body.append({
+                "type": "TextBlock",
+                "text": f"{index}. {line}",
+                "wrap": True,
+            })
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": body,
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "Yes, include these",
+                "style": "positive",
+                "data": {
+                    "action": "accept_profile_suggestions",
+                    "section_key": section_key,
+                },
+            },
+            {
+                "type": "Action.Submit",
+                "title": "No, I'll enter my own",
+                "data": {
+                    "action": "reject_profile_suggestions",
+                    "section_key": section_key,
+                },
+            },
+            {
+                "type": "Action.Submit",
+                "title": "Skip this section",
+                "data": {
+                    "action": "skip_application_section",
+                    "section_key": section_key,
+                },
+            },
+        ],
     }
 
 
@@ -2180,7 +2312,7 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
             summary = ", ".join(
                 f"{field}: {value}"
                 for field, value in item.items()
-                if value
+                if value and not str(field).startswith("_")
             )
             body.append({
                 "type": "TextBlock",
@@ -2293,7 +2425,14 @@ def _application_section_card(gap: dict) -> dict:
     }
 
 
-def _section_prompt_response(gap: dict) -> list:
+def _section_prompt_response(profile: dict, gap: dict, state: dict | None = None) -> list:
+    state = state or {}
+    gap_key = gap.get("key", "")
+    reviewed = set(state.get("suggestions_reviewed") or [])
+    suggestions = (state.get("profile_suggestions") or {}).get(gap_key) or []
+    if gap.get("type") == "repeating_list" and suggestions and gap_key not in reviewed:
+        return [_card_response("Include from profile?", _profile_suggestions_card(gap, suggestions))]
+
     prompt = build_section_prompt(gap)
     return [
         _text_response(prompt),
@@ -2305,8 +2444,51 @@ def _mark_section_skipped(profile: dict, state: dict, section_key: str) -> dict:
     skipped = list(state.get("skipped_sections") or [])
     if section_key and section_key not in skipped:
         skipped.append(section_key)
-    update_application_state(profile, skipped_sections=skipped)
+    reviewed = list(state.get("suggestions_reviewed") or [])
+    if section_key and section_key not in reviewed:
+        reviewed.append(section_key)
+    update_application_state(profile, skipped_sections=skipped, suggestions_reviewed=reviewed)
     return get_application_state(profile)
+
+
+def _accept_profile_suggestions(profile: dict, state: dict, section_key: str) -> list:
+    suggestions = list((state.get("profile_suggestions") or {}).get(section_key) or [])
+    if not suggestions:
+        _mark_suggestion_reviewed(profile, section_key)
+        current_gap = state.get("current_gap") or {}
+        return _section_prompt_response(profile, current_gap, get_application_state(profile))
+
+    cleaned = []
+    for entry in suggestions:
+        cleaned.append({k: v for k, v in entry.items() if not str(k).startswith("_")})
+
+    pending_list_data = dict(state.get("pending_list_data") or {})
+    pending_list_data[section_key] = cleaned
+    _mark_suggestion_reviewed(profile, section_key)
+    update_application_state(profile, pending_list_data=pending_list_data)
+    save_profile(profile)
+
+    label = section_key.replace("_", " ")
+    current_gap = get_application_state(profile).get("current_gap") or {}
+    if current_gap.get("key") == section_key:
+        label = current_gap.get("label") or label
+    responses = [_text_response(f"Added {len(cleaned)} entr{'y' if len(cleaned) == 1 else 'ies'} from your profile for **{label}**.")]
+    responses.extend(_advance_application_gap(profile, get_application_state(profile)))
+    return responses
+
+
+def _reject_profile_suggestions(profile: dict, state: dict, section_key: str) -> list:
+    _mark_suggestion_reviewed(profile, section_key)
+    state = get_application_state(profile)
+    current_gap = state.get("current_gap") or {}
+    if current_gap.get("key") != section_key:
+        for gap in _collection_gaps(state.get("gap_queue", [])):
+            if gap.get("key") == section_key:
+                current_gap = gap
+                break
+    responses = [_text_response("No problem — paste your entries when you're ready.")]
+    responses.extend(_section_prompt_response(profile, current_gap, state))
+    return responses
 
 
 def _skip_current_section(profile: dict, state: dict, response_text: str | None = None) -> list:
@@ -2362,13 +2544,12 @@ def _fill_current_section(profile: dict, state: dict, current_gap: dict, user_te
 
     if gap_type == "repeating_list":
         list_schema = current_gap.get("schema") or {}
-        max_rows = int(list_schema.get("max_rows") or 5)
+        max_rows = safe_max_rows(list_schema)
         entries = parse_list_entries_batch(text_value, list_schema, max_rows)
         if not entries:
-            return [_text_response(
-                "I couldn't parse any entries. Please paste all experiences in one message "
-                "(organization, role, dates, hours)."
-            )]
+            if _looks_like_section_advance(text_value):
+                return _skip_current_section(profile, state, "Okay, skipping this section.")
+            return [_text_response(build_section_prompt(current_gap))]
         pending_list_data = dict(state.get("pending_list_data") or {})
         pending_list_data[list_key] = entries
         update_application_state(profile, pending_list_data=pending_list_data)
@@ -2442,24 +2623,16 @@ def _begin_application_review(profile: dict, state: dict) -> list:
 
 
 def _advance_application_gap(profile: dict, state: dict) -> list:
-    collection_gaps = _collection_gaps(state.get("gap_queue", []))
     current = state.get("current_gap") or {}
-    current_index = 0
-    if current:
-        for index, gap in enumerate(collection_gaps):
-            if gap.get("key") == current.get("key") and gap.get("type") == current.get("type"):
-                current_index = index + 1
-                break
-
-    if current_index < len(collection_gaps):
-        next_gap = collection_gaps[current_index]
+    next_gap = _next_unfilled_gap(state, after_gap=current if current else None)
+    if next_gap:
         update_application_state(
             profile,
             current_gap=next_gap,
             step="collecting_list",
         )
         save_profile(profile)
-        return _section_prompt_response(next_gap)
+        return _section_prompt_response(profile, next_gap, get_application_state(profile))
 
     return _begin_application_review(profile, get_application_state(profile))
 
@@ -2472,6 +2645,12 @@ def handle_application_collection_message(student_id: str, text: str) -> list | 
     state = get_application_state(profile)
     if state.get("step") != "collecting_list":
         return None
+
+    if _looks_like_collection_cancel(text):
+        return handle_cancel_application_collection(student_id)
+
+    if _looks_like_collection_review(text):
+        return _begin_application_review(profile, state)
 
     current_gap = state.get("current_gap") or {}
     if not current_gap:
@@ -2575,7 +2754,8 @@ def handle_application_form_upload(
     _clear_application_review_state(profile)
 
     collection_gaps = _collection_gaps(gaps)
-    first_gap = collection_gaps[0] if collection_gaps else None
+    first_gap = _next_unfilled_gap({"gap_queue": gaps, "skipped_sections": [], "pending_list_data": {}, "long_text_drafts": {}, "pending_free_fields": {}}) if collection_gaps else None
+    profile_suggestions = build_profile_suggestions_for_gaps(gaps, profile) if collection_gaps else {}
     state = init_application_state(
         profile,
         scholarship_id="ss_472",
@@ -2597,6 +2777,8 @@ def handle_application_form_upload(
         long_text_drafts={},
         skipped_sections=[],
         ai_drafted_keys=[],
+        profile_suggestions=profile_suggestions,
+        suggestions_reviewed=[],
     )
     profile["last_scholarship_id"] = "ss_472"
     profile["last_scholarship_name"] = DEMO_SCHOLARSHIP_472["name"]
@@ -2604,6 +2786,9 @@ def handle_application_form_upload(
 
     if first_gap:
         overview = build_gap_overview(schema, filled_data, gaps)
+        suggestion_overview = build_profile_suggestions_overview(gaps, profile, profile_suggestions)
+        if suggestion_overview:
+            overview += f"\n\n{suggestion_overview}"
         metadata = plan.get("metadata") or {}
         if metadata.get("analysis_errors"):
             overview += "\n\n_Note: some sections needed partial analysis._"
@@ -2612,7 +2797,7 @@ def handle_application_form_upload(
             _text_response(overview),
             _text_response(f"Starting with **{first_label}**."),
         ]
-        responses.extend(_section_prompt_response(first_gap))
+        responses.extend(_section_prompt_response(profile, first_gap, get_application_state(profile)))
         return responses
 
     return _begin_application_review(profile, get_application_state(profile))
@@ -2679,6 +2864,14 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
     save_profile(profile)
 
     return _public_download_response(public_url)
+
+
+def handle_cancel_application_collection(student_id: str) -> list:
+    profile = get_profile(student_id)
+    if profile:
+        _clear_application_review_state(profile)
+        save_profile(profile)
+    return [_text_response("Application collection cancelled. Tap **Start Application** whenever you're ready to try again.")]
 
 
 def handle_cancel_application_review(student_id: str) -> list:
@@ -3065,8 +3258,27 @@ def handle_message(student_id: str, message: dict) -> list:
         profile = get_profile(student_id)
         if profile and get_application_state(profile).get("step") == "collecting_list":
             state = get_application_state(profile)
+            section_key = value.get("section_key") or (state.get("current_gap") or {}).get("key", "")
+            if section_key:
+                _mark_suggestion_reviewed(profile, section_key)
             return _skip_current_section(profile, state, "Skipped this section.")
         return [_text_response("No section is active to skip right now.")]
+
+    if action == "accept_profile_suggestions":
+        profile = get_profile(student_id)
+        if profile and get_application_state(profile).get("step") == "collecting_list":
+            state = get_application_state(profile)
+            section_key = value.get("section_key") or (state.get("current_gap") or {}).get("key", "")
+            return _accept_profile_suggestions(profile, state, section_key)
+        return [_text_response("No section is waiting for profile suggestions right now.")]
+
+    if action == "reject_profile_suggestions":
+        profile = get_profile(student_id)
+        if profile and get_application_state(profile).get("step") == "collecting_list":
+            state = get_application_state(profile)
+            section_key = value.get("section_key") or (state.get("current_gap") or {}).get("key", "")
+            return _reject_profile_suggestions(profile, state, section_key)
+        return [_text_response("No section is waiting for profile suggestions right now.")]
 
     if action == "cancel_application_review":
         return handle_cancel_application_review(student_id)

@@ -94,6 +94,13 @@ def _validate_schema(schema: dict, form_payload: dict) -> dict:
     for field in schema.get("repeating_lists", []) or []:
         headers = field.get("column_headers") or []
         if field.get("key") and headers and _field_has_location(field, table_count, paragraph_count):
+            if field.get("max_rows") is not None:
+                try:
+                    field["max_rows"] = int(field["max_rows"])
+                except (TypeError, ValueError):
+                    field.pop("max_rows", None)
+            if not field.get("list_kind"):
+                field["list_kind"] = infer_list_kind(field)
             cleaned["repeating_lists"].append(field)
 
     for field in schema.get("long_text", []) or []:
@@ -291,6 +298,223 @@ def extract_free_form_fields(form_payload: dict) -> list[dict]:
     return free_fields[:15]
 
 
+LIST_KIND_KEYWORDS = {
+    "education": ("school", "degree", "qualification", "tertiary", "secondary", "institution", "education", "university", "college"),
+    "volunteer": ("volunteer", "service", "unit", "hours", "community service"),
+    "award": ("award", "prize", "achievement", "competition", "honour", "honor", "dean's list"),
+    "work": ("employment", "employer", "position", "work experience", "internship", "job"),
+    "social_good": ("social good", "community", "engagement", "social service"),
+}
+
+
+def safe_max_rows(schema: dict | None) -> int:
+    try:
+        value = int((schema or {}).get("max_rows") or 5)
+        return value if value > 0 else 5
+    except (TypeError, ValueError):
+        return 5
+
+
+def infer_list_kind(list_schema: dict) -> str:
+    label = normalize_text(str(list_schema.get("label") or list_schema.get("key") or ""))
+    instructions = normalize_text(str(list_schema.get("instructions") or ""))
+    headers = " ".join(normalize_text(str(header)) for header in (list_schema.get("column_headers") or []))
+    blob = f"{label} {instructions} {headers}"
+    scores = {}
+    for kind, keywords in LIST_KIND_KEYWORDS.items():
+        scores[kind] = sum(1 for keyword in keywords if keyword in blob)
+    best_kind, best_score = max(scores.items(), key=lambda item: item[1])
+    return best_kind if best_score > 0 else "generic"
+
+
+def list_entry_field_keys(list_schema: dict) -> list[str]:
+    item_fields = list_schema.get("item_fields") or {}
+    if isinstance(item_fields, dict) and item_fields:
+        return list(item_fields.keys())
+    kind = list_schema.get("list_kind") or infer_list_kind(list_schema)
+    if kind == "education":
+        return ["institution", "qualification", "dates", "description"]
+    if kind == "award":
+        return ["organization", "role", "dates", "description"]
+    if kind == "work":
+        return ["organization", "role", "dates", "description"]
+    return ["organization", "role", "dates", "hours", "description"]
+
+
+def build_list_section_prompt(gap: dict) -> str:
+    schema = gap.get("schema") or {}
+    label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
+    max_rows = safe_max_rows(schema)
+    kind = schema.get("list_kind") or infer_list_kind(schema)
+    headers = schema.get("column_headers") or []
+    header_hint = ", ".join(str(header) for header in headers[:6] if header)
+
+    if kind == "education":
+        instructions = (schema.get("instructions") or "").strip()
+        if not instructions:
+            instructions = (
+                "Please provide details of your PREVIOUS tertiary and secondary education, "
+                "starting with the most recent one."
+            )
+        fields_hint = header_hint or "institution, qualification, dates"
+        return (
+            f"**{label}**\n\n{instructions}\n\n"
+            f"Paste all entries in one message (up to {max_rows}). "
+            f"Include {fields_hint} for each."
+        )
+
+    field_hints = {
+        "volunteer": "organization, role, dates, and hours",
+        "award": "award name, organization, dates, and brief description",
+        "work": "employer, role, dates, and description",
+        "social_good": "organization, activity, dates, and impact",
+        "generic": header_hint or "the fields shown in the form for each entry",
+    }
+    hint = field_hints.get(kind, field_hints["generic"])
+    return (
+        f"**{label}** — paste all entries in one message (up to {max_rows}). "
+        f"Include {hint} for each."
+    )
+
+
+def extract_profile_activity_blobs(profile: dict) -> list[str]:
+    blobs: list[str] = []
+    for item in profile.get("activities") or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if any(sep in text for sep in ("\n", ";")):
+            for part in text.replace(";", "\n").split("\n"):
+                cleaned = part.strip(" •-\t")
+                if cleaned:
+                    blobs.append(cleaned)
+        elif "," in text and len(text) > 40:
+            for part in text.split(","):
+                cleaned = part.strip()
+                if cleaned:
+                    blobs.append(cleaned)
+        else:
+            blobs.append(text)
+
+    cv_text = str(profile.get("cv_text") or "").strip()
+    if cv_text:
+        for line in cv_text.split("\n"):
+            cleaned = line.strip(" •-\t")
+            if len(cleaned) >= 8:
+                blobs.append(cleaned)
+
+    seen = set()
+    unique = []
+    for blob in blobs:
+        key = blob.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(blob)
+    return unique[:20]
+
+
+def _compact_profile_for_mapping(profile: dict) -> dict:
+    academic = profile.get("academic") or {}
+    return {
+        "faculty": academic.get("faculty") or profile.get("faculty", ""),
+        "programme": academic.get("programme") or profile.get("programme", ""),
+        "year_of_study": academic.get("year_of_study") or profile.get("year", ""),
+        "interests": profile.get("interests") or [],
+        "activities": extract_profile_activity_blobs(profile),
+    }
+
+
+def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
+    activity_blobs = extract_profile_activity_blobs(profile)
+    if not activity_blobs or gap.get("type") != "repeating_list":
+        return []
+
+    schema = gap.get("schema") or {}
+    section_payload = {
+        "key": gap.get("key"),
+        "label": gap.get("label"),
+        "list_kind": schema.get("list_kind") or infer_list_kind(schema),
+        "column_headers": schema.get("column_headers") or [],
+        "item_fields": schema.get("item_fields") or {},
+        "instructions": schema.get("instructions") or "",
+    }
+    field_keys = list_entry_field_keys(schema)
+
+    prompt = _load_prompt("form_profile_section_map.txt").format(
+        student_profile=json.dumps(_compact_profile_for_mapping(profile), ensure_ascii=False, indent=2),
+        section_schema=json.dumps(section_payload, ensure_ascii=False, indent=2),
+        field_keys=", ".join(field_keys),
+    )
+    try:
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=_deployment(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=1500,
+            temperature=0.1,
+        )
+        parsed = parse_llm_json(response.choices[0].message.content or "{}")
+        if not isinstance(parsed, dict):
+            return []
+        suggestions = []
+        for item in parsed.get("suggestions", []) or []:
+            if not isinstance(item, dict):
+                continue
+            mapped = item.get("mapped_fields") or {}
+            if not isinstance(mapped, dict):
+                continue
+            entry = {key: str(mapped.get(key) or "").strip() for key in field_keys}
+            if not any(entry.values()):
+                continue
+            entry["_source_text"] = str(item.get("source_text") or "").strip()
+            entry["_confidence"] = str(item.get("confidence") or "").strip()
+            suggestions.append(entry)
+            if len(suggestions) >= safe_max_rows(schema):
+                break
+        return suggestions
+    except Exception as exc:
+        logger.warning("Profile section mapping failed for %s: %s", gap.get("key"), exc)
+        return []
+
+
+def build_profile_suggestions_for_gaps(gaps: list, profile: dict) -> dict:
+    suggestions = {}
+    for gap in sort_collection_gaps(gaps):
+        if gap.get("type") != "repeating_list":
+            continue
+        key = gap.get("key")
+        if not key:
+            continue
+        entries = suggest_profile_entries_for_gap(gap, profile)
+        if entries:
+            suggestions[key] = entries
+    return suggestions
+
+
+def build_profile_suggestions_overview(gaps: list, profile: dict, profile_suggestions: dict | None = None) -> str:
+    profile_suggestions = profile_suggestions or build_profile_suggestions_for_gaps(gaps, profile)
+    if not profile_suggestions:
+        return ""
+
+    lines = ["**From your profile, I may be able to pre-fill:**"]
+    for gap in sort_collection_gaps(gaps):
+        key = gap.get("key")
+        entries = profile_suggestions.get(key) or []
+        if not entries:
+            continue
+        label = gap.get("label") or key.replace("_", " ").title()
+        preview = "; ".join(
+            entry.get("_source_text") or ", ".join(v for v in entry.values() if v and not str(v).startswith("_"))
+            for entry in entries[:2]
+        )
+        lines.append(f"- **{label}**: {preview}")
+    lines.append("")
+    lines.append("I'll ask you to confirm before using these in each matching section.")
+    return "\n".join(lines)
+
+
 def build_filled_data(schema: dict, profile: dict, free_fields: list | None = None) -> dict:
     simple_values = {}
     for field in schema.get("simple_fields", []):
@@ -348,16 +572,17 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
         items = (filled_data.get("repeating_lists") or {}).get(key) or []
         if items:
             continue
-        gaps.append({
+        list_schema = dict(field)
+        if not list_schema.get("list_kind"):
+            list_schema["list_kind"] = infer_list_kind(list_schema)
+        gap = {
             "type": "repeating_list",
             "key": key,
             "label": field.get("label") or key.replace("_", " ").title(),
-            "schema": field,
-            "prompt": (
-                f"**{field.get('label') or key.replace('_', ' ').title()}** — paste all entries in one message "
-                f"(up to {field.get('max_rows', 5)}). Include organization, role, dates, and hours for each."
-            ),
-        })
+            "schema": list_schema,
+        }
+        gap["prompt"] = build_list_section_prompt(gap)
+        gaps.append(gap)
 
     for field in schema.get("long_text", []):
         key = field.get("key")
@@ -412,15 +637,10 @@ def build_section_prompt(gap: dict) -> str:
         return "Please share the information for the next section."
     if gap.get("prompt"):
         return gap["prompt"]
-    label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
     gap_type = gap.get("type")
     if gap_type == "repeating_list":
-        schema = gap.get("schema") or {}
-        max_rows = schema.get("max_rows", 5)
-        return (
-            f"**{label}** — paste all entries in one message (up to {max_rows}). "
-            "Include organization, role, dates, and hours for each."
-        )
+        return build_list_section_prompt(gap)
+    label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
     return (
         f"**{label}** — paste your answer, say **draft** for an AI draft from your profile and activities, "
         "or **skip** to leave blank."
@@ -445,23 +665,49 @@ def build_gap_overview(schema: dict, filled_data: dict, gaps: list) -> str:
             label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
             gap_type = gap.get("type")
             if gap_type == "repeating_list":
-                max_rows = (gap.get("schema") or {}).get("max_rows", 5)
+                max_rows = safe_max_rows(gap.get("schema"))
                 lines.append(f"{index}. {label} — up to {max_rows} entries (send all in one message)")
             else:
                 lines.append(f"{index}. {label} — essay/open answer (**draft** or **skip** ok)")
         lines.append("")
-        lines.append("Say **skip [section]** to skip a section. I'll walk you through each section one at a time.")
+        lines.append(
+            "Say **skip [section]** to skip, **review** to finish early, or **cancel application** to stop."
+        )
     else:
         lines.append("Your profile covers the required fields. Review the summary next.")
 
     return "\n".join(lines)
 
 
-def parse_list_entries_batch(user_text: str, list_schema: dict, max_rows: int = 5) -> list[dict]:
+def _normalize_batch_entry(item: dict, field_keys: list[str]) -> dict:
+    normalized = {key: str(item.get(key) or "").strip() for key in field_keys}
+    if "institution" in field_keys and not normalized.get("institution"):
+        normalized["institution"] = str(item.get("organization") or item.get("school") or "").strip()
+    if "organization" in field_keys and not normalized.get("organization"):
+        normalized["organization"] = str(item.get("institution") or item.get("school") or "").strip()
+    if "qualification" in field_keys and not normalized.get("qualification"):
+        normalized["qualification"] = str(item.get("role") or item.get("degree") or "").strip()
+    if "role" in field_keys and not normalized.get("role"):
+        normalized["role"] = str(item.get("qualification") or item.get("position") or "").strip()
+    if "dates" in field_keys and not normalized.get("dates"):
+        normalized["dates"] = str(item.get("period") or item.get("date") or "").strip()
+    if "description" in field_keys and not normalized.get("description"):
+        normalized["description"] = str(item.get("details") or item.get("summary") or "").strip()
+    if "hours" in field_keys and not normalized.get("hours"):
+        normalized["hours"] = str(item.get("hours") or "").strip()
+    return normalized
+
+
+def parse_list_entries_batch(user_text: str, list_schema: dict, max_rows: int | None = None) -> list[dict]:
+    max_rows = max_rows if max_rows is not None else safe_max_rows(list_schema)
+    field_keys = list_entry_field_keys(list_schema)
+    example_entry = {key: "..." for key in field_keys}
     prompt = _load_prompt("form_list_batch_parse.txt").format(
         list_schema=json.dumps(list_schema, ensure_ascii=False, indent=2),
         user_text=user_text,
         max_rows=max_rows,
+        field_keys=", ".join(field_keys),
+        example_entry=json.dumps(example_entry, ensure_ascii=False),
     )
     client = _get_openai_client()
     response = client.chat.completions.create(
@@ -479,13 +725,7 @@ def parse_list_entries_batch(user_text: str, list_schema: dict, max_rows: int = 
     for item in parsed.get("entries", []) or []:
         if not isinstance(item, dict):
             continue
-        normalized = {
-            "organization": str(item.get("organization") or "").strip(),
-            "role": str(item.get("role") or "").strip(),
-            "dates": str(item.get("dates") or "").strip(),
-            "hours": str(item.get("hours") or "").strip(),
-            "description": str(item.get("description") or "").strip(),
-        }
+        normalized = _normalize_batch_entry(item, field_keys)
         if any(normalized.values()):
             entries.append(normalized)
         if len(entries) >= max_rows:
@@ -523,7 +763,7 @@ def parse_application_collection(user_text: str, current_gap: dict, profile: dic
         logger.warning("Application collection router failed: %s", exc)
 
     lowered = (user_text or "").strip().lower()
-    if any(term in lowered for term in ("skip", "next", "move on", "pass")):
+    if any(term in lowered for term in ("skip", "next", "move on", "pass", "no more", "don't have", "dont have", "nothing to add")):
         return {
             "intent": "skip_section",
             "extracted_data": {},
