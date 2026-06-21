@@ -8,7 +8,7 @@ Allowed intents:
 - "draft_section": The user wants an AI draft (essays/open questions only, not repeating lists).
 - "skip_section": The user wants to skip this section (e.g. "skip", "next", "move on", "skip volunteer", "I don't have any", "nothing to add").
 - "clarify": The answer is incomplete or you need one follow-up question on the same section.
-- "unknown": Off-topic or unclear; remind them what the current section needs.
+- "unknown": Off-topic or unclear; give a one-line reminder to answer or skip — do NOT paste the full section prompt again.
 
 Return ONLY valid JSON:
 {{
@@ -19,7 +19,8 @@ Return ONLY valid JSON:
 
 Rules:
 - Treat any message containing "skip", "next", "move on", "pass", "no more", "don't have", or "nothing to add" as skip_section unless the user is clearly providing form content.
-- For clarify/unknown, repeat the section prompt wording — do NOT invent new requirements like "requires up to None entries" or "your profile doesn't have this yet".
+- For clarify, ask one short follow-up only — do NOT repeat the full section prompt (the UI already shows it).
+- For unknown, one brief sentence only — do NOT repeat the full section prompt.
 - Do not mention profile gaps unless the student explicitly asks.
 
 Examples:

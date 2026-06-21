@@ -677,6 +677,43 @@ def _require_graph_token(profile: dict, *, needs_inbox: bool = False, needs_cale
     )
 
 
+def _graph_signin_gate(profile: dict, pending_command: str) -> dict | None:
+    """Prompt Microsoft sign-in the first time inbox/digest needs Graph access."""
+    if get_graph_access_token(profile):
+        return None
+    return _oauth_login_required(
+        "To connect your Microsoft account, please sign in once. "
+        "I'll continue with your request right after.",
+        pending_command=pending_command,
+    )
+
+
+def _run_inbox_pipeline_for_profile(student_id: str, profile: dict) -> tuple[dict | None, str | None]:
+    """Run inbox classification/archive and return (summary, error_note)."""
+    user_token = get_graph_access_token(profile)
+    if not user_token:
+        return None, None
+    try:
+        return run_inbox_pipeline(student_id, profile, user_token=user_token), None
+    except GraphApiError as exc:
+        logger.error("Email pipeline Graph error: %s", exc.to_log_dict())
+        summary = {
+            "processed": 0,
+            "archived": 0,
+            "kept": 0,
+            "archived_items": [],
+            "relevant_items": [],
+            "urgent_items": [],
+            "ambiguous_items": [],
+            "error": "Inbox unavailable — check Graph diagnostics in logs.",
+            "graph_hint": exc.hint,
+        }
+        return summary, exc.hint or "Inbox unavailable — check Graph diagnostics in logs."
+    except Exception as e:
+        logger.error(f"Email pipeline error: {e}")
+        return None, None
+
+
 def handle_graph_token_response(student_id: str, token_payload) -> list:
     """Save OAuth token and optionally replay the command that triggered sign-in."""
     if not save_graph_token(student_id, token_payload):
@@ -690,8 +727,14 @@ def handle_graph_token_response(student_id: str, token_payload) -> list:
             responses.append(_text_response(digest_result.get("text", "Please try **digest** again.")))
         else:
             responses.extend(digest_result)
+    elif pending == "inbox":
+        inbox_result = handle_get_inbox(student_id)
+        if isinstance(inbox_result, dict):
+            responses.append(_text_response(inbox_result.get("text", "Please try **inbox** again.")))
+        else:
+            responses.extend(inbox_result)
     else:
-        responses.append(_text_response("Type **digest** when you're ready for your update."))
+        responses.append(_text_response("Type **digest** or **inbox** when you're ready."))
     return responses
 
 _WEEKDAY_NAMES = (
@@ -1820,11 +1863,6 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         "• Type 'inbox' to review your archived emails\n"
         "• Type 'help' anytime to see all commands"
     )]
-    if (consent_inbox or consent_calendar) and not get_graph_access_token(profile):
-        responses.append(_oauth_login_required(
-            "To connect your email and calendar, please sign in with your Microsoft account once during registration.",
-            pending_command=None,
-        ))
     return responses
 
 def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
@@ -1841,6 +1879,45 @@ def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
         "I'll use this to improve your matches."
     )]
 
+def handle_get_inbox(student_id: str) -> list:
+    """Run inbox pipeline only — prompts sign-in on first use."""
+    profile = get_profile(student_id)
+    if not profile:
+        return [_card_response("I don't have your profile yet. Let's get you set up:", _build_onboarding_card())]
+
+    auth_required = _graph_signin_gate(profile, pending_command="inbox")
+    if auth_required:
+        profile["pending_graph_command"] = "inbox"
+        save_profile(profile)
+        return auth_required
+
+    inbox_summary, inbox_error_note = _run_inbox_pipeline_for_profile(student_id, profile)
+    if not inbox_summary:
+        return [_text_response("I couldn't read your inbox right now. Please try again in a moment.")]
+
+    processed = inbox_summary.get("processed", 0)
+    archived = inbox_summary.get("archived", 0)
+    kept = inbox_summary.get("kept", 0)
+    lines = [f"📬 **Inbox update:** {processed} email(s) processed, {archived} archived, {kept} kept."]
+    if inbox_error_note:
+        lines.append(f"⚠️ {inbox_error_note}")
+    responses = [_text_response("\n".join(lines))]
+
+    if inbox_summary.get("archived_items"):
+        review_item = inbox_summary["archived_items"][0]
+        responses.append({
+            "type": "message",
+            "text": "Archive review",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": _archive_review_card(review_item),
+                }
+            ],
+        })
+    return responses
+
+
 def handle_get_digest(student_id: str) -> list:
     """Run full matching pipeline and return digest as Adaptive Cards."""
     profile = get_profile(student_id)
@@ -1856,42 +1933,18 @@ def handle_get_digest(student_id: str) -> list:
         ["scholarships", "events", "inbox"]
     )
 
-    auth_required = _require_graph_token(
-        profile,
-        needs_inbox="inbox" in modules and _has_inbox_consent(profile),
-    )
+    responses = []
+    auth_required = _graph_signin_gate(profile, pending_command="digest")
     if auth_required:
-        profile["pending_graph_command"] = auth_required.get("pending_command") or "digest"
+        profile["pending_graph_command"] = "digest"
         save_profile(profile)
-        return auth_required
+        responses.append(auth_required)
 
-    # 1. Run email inbox pipeline only when enabled and consented
+    # 1. Run email inbox pipeline when enabled and signed in
     inbox_summary = None
     inbox_error_note = None
-    if "inbox" in modules and _has_inbox_consent(profile):
-        try:
-            inbox_summary = run_inbox_pipeline(
-                student_id,
-                profile,
-                user_token=get_graph_access_token(profile),
-            )
-        except GraphApiError as exc:
-            logger.error("Email pipeline Graph error: %s", exc.to_log_dict())
-            inbox_summary = {
-                "processed": 0,
-                "archived": 0,
-                "kept": 0,
-                "archived_items": [],
-                "relevant_items": [],
-                "urgent_items": [],
-                "ambiguous_items": [],
-                "error": "Inbox unavailable — check Graph diagnostics in logs.",
-                "graph_hint": exc.hint,
-            }
-            inbox_error_note = exc.hint or "Inbox unavailable — check Graph diagnostics in logs."
-        except Exception as e:
-            logger.error(f"Email pipeline error: {e}")
-            inbox_summary = None
+    if "inbox" in modules and get_graph_access_token(profile):
+        inbox_summary, inbox_error_note = _run_inbox_pipeline_for_profile(student_id, profile)
 
     # 2. Run scholarship matching
     scholarship_result = {"apply_now": [], "prepare": []}
@@ -1922,7 +1975,7 @@ def handle_get_digest(student_id: str) -> list:
         inbox_summary=inbox_summary  # Pass the real inbox summary here
     )
 
-    responses = [_text_response(format_digest_message(digest))]
+    responses.append(_text_response(format_digest_message(digest)))
 
     if inbox_error_note:
         responses.append(_text_response(f"📬 **Inbox:** {inbox_error_note}"))
@@ -2519,27 +2572,29 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
     }
 
 
-def _application_section_card(gap: dict) -> dict:
-    """Optional card for the current collection section with a skip button."""
-    label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
+def _section_collection_message(gap: dict) -> dict:
+    """Single message: section prompt as text + skip button card (no duplicate TextBlock)."""
+    prompt = build_section_prompt(gap)
     return {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "type": "AdaptiveCard",
-        "version": "1.4",
-        "body": [
+        "type": "message",
+        "text": f"**Current section**\n\n{prompt}",
+        "attachments": [
             {
-                "type": "TextBlock",
-                "text": build_section_prompt(gap),
-                "wrap": True,
-            }
-        ],
-        "actions": [
-            {
-                "type": "Action.Submit",
-                "title": "Skip this section",
-                "data": {
-                    "action": "skip_application_section",
-                    "section_key": _section_storage_id(gap),
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "actions": [
+                        {
+                            "type": "Action.Submit",
+                            "title": "Skip this section",
+                            "data": {
+                                "action": "skip_application_section",
+                                "section_key": _section_storage_id(gap),
+                            },
+                        }
+                    ],
                 },
             }
         ],
@@ -2554,9 +2609,7 @@ def _section_prompt_response(profile: dict, gap: dict, state: dict | None = None
     if gap.get("type") == "repeating_list" and suggestions and section_id not in reviewed:
         return [_card_response("Include from profile?", _profile_suggestions_card(gap, suggestions))]
 
-    return [
-        _card_response("Current section", _application_section_card(gap)),
-    ]
+    return [_section_collection_message(gap)]
 
 
 def _mark_section_skipped(profile: dict, state: dict, gap: dict) -> dict:
@@ -2609,12 +2662,11 @@ def _reject_profile_suggestions(profile: dict, state: dict, section_id: str) -> 
     return responses
 
 
-def _skip_current_section(profile: dict, state: dict, response_text: str | None = None) -> list:
+def _skip_current_section(profile: dict, state: dict, response_text: str = "Okay, skipping this section.") -> list:
     current = state.get("current_gap") or {}
     state = _mark_section_skipped(profile, state, current)
-    responses = _advance_application_gap(profile, state)
-    if response_text and responses:
-        responses.insert(0, _text_response(response_text))
+    responses = [_text_response(response_text)]
+    responses.extend(_advance_application_gap(profile, state))
     return responses
 
 
@@ -2668,8 +2720,8 @@ def _fill_current_section(profile: dict, state: dict, current_gap: dict, user_te
         entries = parse_list_entries_batch(text_value, list_schema, max_rows)
         if not entries:
             if _looks_like_section_advance(text_value):
-                return _skip_current_section(profile, state, "Okay, skipping this section.")
-            return [_text_response(build_section_prompt(current_gap))]
+                return _skip_current_section(profile, state)
+            return _section_prompt_response(profile, current_gap, state)
         pending_list_data = dict(state.get("pending_list_data") or {})
         _store_gap_value(pending_list_data, current_gap, entries)
         update_application_state(profile, pending_list_data=pending_list_data)
@@ -2783,16 +2835,21 @@ def handle_application_collection_message(student_id: str, text: str) -> list | 
         return [_text_response("No section is active right now.")]
 
     if _looks_like_section_advance(text):
-        return _skip_current_section(profile, state, "Okay, skipping this section.")
+        return _skip_current_section(profile, state)
 
     parsed = parse_application_collection(text, current_gap, profile, state)
     intent = parsed.get("intent", "unknown")
     agent_response = parsed.get("agent_response") or ""
     extracted = parsed.get("extracted_data") or {}
     answer_text = str(extracted.get("answer_text") or "").strip()
+    section_prompt = build_section_prompt(current_gap)
 
     if intent == "skip_section":
-        return _skip_current_section(profile, state, agent_response or None)
+        return _skip_current_section(
+            profile,
+            state,
+            agent_response or "Okay, skipping this section.",
+        )
 
     if intent == "draft_section":
         return _draft_current_section(profile, state, current_gap)
@@ -2801,12 +2858,17 @@ def handle_application_collection_message(student_id: str, text: str) -> list | 
         return _fill_current_section(profile, state, current_gap, text, answer_text)
 
     if intent == "clarify" and agent_response:
-        return [_text_response(agent_response)]
+        normalized = agent_response.strip()
+        if normalized and normalized not in section_prompt and section_prompt not in normalized:
+            return [_text_response(agent_response)]
 
-    if agent_response:
-        return [_text_response(agent_response)]
+    if intent == "unknown" or not agent_response:
+        return _section_prompt_response(profile, current_gap, state)
 
-    return [_text_response(build_section_prompt(current_gap))]
+    if agent_response.strip() == section_prompt.strip() or section_prompt in agent_response:
+        return _section_prompt_response(profile, current_gap, state)
+
+    return [_text_response(agent_response)]
 
 
 def _looks_like_application_approval(text: str) -> bool:
@@ -3551,13 +3613,17 @@ def handle_message(student_id: str, message: dict) -> list:
     if text in scholarship_commands:
         return handle_get_scholarships(student_id)
 
+    inbox_commands = {"inbox", "show inbox", "check inbox", "my inbox"}
+    if text in inbox_commands:
+        return handle_get_inbox(student_id)
+
     if profile and profile.get("last_scholarship_id") and text:
-        digest_terms = ["digest", "update", "what's new", "show me", "opportunities", "inbox"]
+        digest_terms = ["digest", "update", "what's new", "show me", "opportunities"]
         help_terms = ["hello", "hi", "hey", "start", "help"]
         if not any(kw in text for kw in digest_terms + help_terms):
             return handle_text_pasted(student_id, message.get("text") or "")
 
-    if any(kw in text for kw in ["digest", "update", "what's new", "show me", "opportunities", "inbox"]):
+    if any(kw in text for kw in ["digest", "update", "what's new", "show me", "opportunities"]):
         return handle_get_digest(student_id)
 
     if any(kw in text for kw in ["draft", "apply", "application"]):

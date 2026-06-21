@@ -1,7 +1,17 @@
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
-from botbuilder.schema import Activity, ActivityTypes, Attachment, OAuthCard, ActionTypes, CardAction
+from botbuilder.schema import (
+    Activity,
+    ActivityTypes,
+    Attachment,
+    ActionTypes,
+    CardAction,
+    SigninCard,
+    InvokeResponse,
+)
 from aiohttp import ClientSession, web
+import logging
 import os
+import re
 import secrets
 from agent.handler import (
     handle_application_form_upload,
@@ -29,6 +39,9 @@ SETTINGS = BotFrameworkAdapterSettings(
 
 ADAPTER = BotFrameworkAdapter(SETTINGS)
 DOWNLOAD_STORE = {}
+logger = logging.getLogger(__name__)
+GRAPH_OAUTH_CONNECTION = os.environ.get("GRAPH_OAUTH_CONNECTION", "GraphOAuth")
+MAGIC_CODE_PATTERN = re.compile(r"^\d{6}$")
 
 
 def _register_download(file_bytes: bytes, filename: str, content_type: str) -> str:
@@ -94,26 +107,106 @@ async def messages(req: web.Request) -> web.Response:
                 "text",
                 "Please sign in with your Microsoft account to continue.",
             )
-            card = OAuthCard(
+            connection_name = oauth_payload.get("connection_name", GRAPH_OAUTH_CONNECTION)
+
+            try:
+                sign_in_resource = await ADAPTER.get_sign_in_resource_from_user(
+                    turn_context,
+                    connection_name,
+                    student_id,
+                )
+                sign_in_link = sign_in_resource.sign_in_link
+            except Exception as exc:
+                logger.exception("OAuth sign-in link generation failed")
+                await turn_context.send_activity(
+                    f"{card_text}\n\n"
+                    "I couldn't open Microsoft sign-in from here. Your Azure Bot needs an OAuth connection "
+                    f"named **{connection_name}** (Azure Portal → Bot → Configuration → OAuth Connection Settings) "
+                    "using Microsoft Entra ID with delegated **Mail.Read** and **Calendars.ReadWrite** scopes."
+                    f"\n\n_(Error: {exc})_"
+                )
+                return
+
+            if not sign_in_link:
+                await turn_context.send_activity(
+                    f"{card_text}\n\n"
+                    f"Sign-in link was empty — check the **{connection_name}** OAuth connection on your Azure Bot."
+                )
+                return
+
+            # Copilot/Web Chat often cannot resolve ActionTypes.signin without a pre-fetched URL.
+            sign_in_card = SigninCard(
                 text=card_text,
-                connection_name=oauth_payload.get("connection_name", "GraphOAuth"),
                 buttons=[
                     CardAction(
-                        type=ActionTypes.signin,
+                        type=ActionTypes.open_url,
                         title="Sign In",
-                        value="signin",
+                        value=sign_in_link,
                     )
                 ],
-            )
-            attachment = Attachment(
-                content_type="application/vnd.microsoft.card.oauth",
-                content=card,
             )
             await turn_context.send_activity(Activity(
                 type=ActivityTypes.message,
                 text=card_text,
-                attachments=[attachment],
+                attachments=[
+                    Attachment(
+                        content_type="application/vnd.microsoft.card.signin",
+                        content=sign_in_card,
+                    )
+                ],
             ))
+
+        async def complete_oauth_sign_in(connection_name: str, magic_code: str | None = None) -> bool:
+            try:
+                token_response = await ADAPTER.get_user_token(
+                    turn_context,
+                    connection_name,
+                    magic_code,
+                )
+            except Exception as exc:
+                logger.exception("OAuth token retrieval failed")
+                await turn_context.send_activity(
+                    f"Sign-in did not complete ({exc}). Please try **digest** or **inbox** again."
+                )
+                return True
+
+            if not token_response or not token_response.token:
+                if magic_code:
+                    await turn_context.send_activity(
+                        "That sign-in code didn't work. Please try signing in again."
+                    )
+                return True
+
+            payload = {
+                "token": token_response.token,
+                "connection_name": connection_name,
+            }
+            if getattr(token_response, "expiration", None):
+                payload["expiration"] = token_response.expiration
+            await send_agent_responses(handle_graph_token_response(student_id, payload))
+            return True
+
+        activity_type = turn_context.activity.type
+        activity_name = getattr(turn_context.activity, "name", "") or ""
+
+        if activity_type == ActivityTypes.event and activity_name in ("tokens/response", "token/response"):
+            token_payload = turn_context.activity.value or {}
+            await send_agent_responses(handle_graph_token_response(student_id, token_payload))
+            return
+
+        if activity_type == ActivityTypes.invoke and activity_name in (
+            "signin/verifyState",
+            "signin/tokenExchange",
+        ):
+            connection_name = GRAPH_OAUTH_CONNECTION
+            if isinstance(turn_context.activity.value, dict):
+                connection_name = (
+                    turn_context.activity.value.get("connectionName")
+                    or turn_context.activity.value.get("connection_name")
+                    or connection_name
+                )
+            await complete_oauth_sign_in(connection_name)
+            return InvokeResponse(status=200)
 
         async def send_single_response(response: dict):
             attachments = []
@@ -141,7 +234,7 @@ async def messages(req: web.Request) -> web.Response:
                 ))
 
             await turn_context.send_activity(Activity(
-                type="message",
+                type=ActivityTypes.message,
                 text=message_text,
                 attachments=attachments if attachments else None
             ))
@@ -157,14 +250,6 @@ async def messages(req: web.Request) -> web.Response:
                     await send_oauth_card(response)
                     continue
                 await send_single_response(response)
-
-        activity_type = turn_context.activity.type
-        activity_name = getattr(turn_context.activity, "name", "") or ""
-
-        if activity_type == ActivityTypes.event and activity_name in ("tokens/response", "token/response"):
-            token_payload = turn_context.activity.value or {}
-            await send_agent_responses(handle_graph_token_response(student_id, token_payload))
-            return
 
         if activity_type != ActivityTypes.message:
             return
@@ -249,6 +334,11 @@ async def messages(req: web.Request) -> web.Response:
             "event_type": event_type,
             "activity_name": activity_name_lower
         }
+
+        magic_code = (turn_context.activity.text or "").strip()
+        if MAGIC_CODE_PATTERN.match(magic_code):
+            if await complete_oauth_sign_in(GRAPH_OAUTH_CONNECTION, magic_code):
+                return
 
         responses = handle_message(student_id, message)
         await send_agent_responses(responses)
