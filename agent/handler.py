@@ -63,6 +63,12 @@ from agent.graph import (
     create_calendar_event,
     get_calendar_events,
 )
+from agent.graph_user_diagnostics import (
+    format_calendar_diagnostics_report,
+    format_inbox_diagnostics_report,
+    run_calendar_diagnostics,
+    run_inbox_diagnostics,
+)
 
 APPLICATION_FORM_PDF = "/tmp/application_form.pdf"
 APPLICATION_FORM_DOCX = "/tmp/application_form.docx"
@@ -733,6 +739,13 @@ def handle_graph_token_response(student_id: str, token_payload) -> list:
             responses.append(_text_response(inbox_result.get("text", "Please try **inbox** again.")))
         else:
             responses.extend(inbox_result)
+    elif pending and pending.startswith("debug_"):
+        scope = pending.replace("debug_", "", 1) or "all"
+        debug_result = handle_graph_debug(student_id, scope)
+        if isinstance(debug_result, dict):
+            responses.append(debug_result)
+        else:
+            responses.extend(debug_result)
     else:
         responses.append(_text_response("Type **digest** or **inbox** when you're ready."))
     return responses
@@ -1879,6 +1892,52 @@ def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
         "I'll use this to improve your matches."
     )]
 
+def handle_graph_debug(student_id: str, scope: str) -> list:
+    """Show what delegated Graph actually returns for inbox and/or calendar."""
+    profile = get_profile(student_id)
+    if not profile:
+        return [_card_response("I don't have your profile yet. Let's get you set up:", _build_onboarding_card())]
+
+    auth_required = _graph_signin_gate(profile, pending_command="graph_debug")
+    if auth_required:
+        profile["pending_graph_command"] = f"debug_{scope}"
+        save_profile(profile)
+        return auth_required
+
+    user_token = get_graph_access_token(profile)
+    if not user_token:
+        return [_text_response("Please sign in first — type **digest** or **inbox**, then run **debug inbox** again.")]
+
+    responses = []
+    if scope in ("inbox", "all"):
+        try:
+            inbox_data = run_inbox_diagnostics(user_token, profile)
+            responses.append(_text_response(format_inbox_diagnostics_report(inbox_data)))
+        except GraphApiError as exc:
+            responses.append(_text_response(
+                f"**Inbox debug failed** ({exc.status}): {exc.error_code or exc.error_message}\n\n{exc.hint or ''}"
+            ))
+        except Exception as exc:
+            logger.error("Inbox diagnostics error: %s", exc)
+            responses.append(_text_response(f"Inbox debug error: {exc}"))
+
+    if scope in ("calendar", "all"):
+        try:
+            calendar_data = run_calendar_diagnostics(user_token)
+            responses.append(_text_response(format_calendar_diagnostics_report(calendar_data)))
+        except GraphApiError as exc:
+            responses.append(_text_response(
+                f"**Calendar debug failed** ({exc.status}): {exc.error_code or exc.error_message}\n\n{exc.hint or ''}"
+            ))
+        except Exception as exc:
+            logger.error("Calendar diagnostics error: %s", exc)
+            responses.append(_text_response(f"Calendar debug error: {exc}"))
+
+    if not responses:
+        return [_text_response("Unknown debug scope. Try **debug inbox**, **debug calendar**, or **debug graph**.")]
+    return responses
+
+
 def handle_get_inbox(student_id: str) -> list:
     """Run inbox pipeline only — prompts sign-in on first use."""
     profile = get_profile(student_id)
@@ -1899,6 +1958,11 @@ def handle_get_inbox(student_id: str) -> list:
     archived = inbox_summary.get("archived", 0)
     kept = inbox_summary.get("kept", 0)
     lines = [f"📬 **Inbox update:** {processed} email(s) processed, {archived} archived, {kept} kept."]
+    if processed == 0:
+        lines.append(
+            "Nothing new was classified this run. Type **debug inbox** to see which account Graph is using, "
+            "unread counts, and whether messages were skipped as already processed."
+        )
     if inbox_error_note:
         lines.append(f"⚠️ {inbox_error_note}")
     responses = [_text_response("\n".join(lines))]
@@ -3614,6 +3678,18 @@ def handle_message(student_id: str, message: dict) -> list:
         return handle_get_scholarships(student_id)
 
     inbox_commands = {"inbox", "show inbox", "check inbox", "my inbox"}
+    debug_commands = {
+        "debug inbox": "inbox",
+        "inbox debug": "inbox",
+        "debug mail": "inbox",
+        "debug calendar": "calendar",
+        "calendar debug": "calendar",
+        "debug graph": "all",
+        "graph debug": "all",
+        "debug connection": "all",
+    }
+    if text in debug_commands:
+        return handle_graph_debug(student_id, debug_commands[text])
     if text in inbox_commands:
         return handle_get_inbox(student_id)
 

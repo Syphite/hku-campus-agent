@@ -149,12 +149,46 @@ def _graph_request(
 
 
 def get_unread_emails(user_token: str) -> list:
+    return get_inbox_messages(user_token, top=25, unread_only=True)
+
+
+def get_me_profile(user_token: str) -> dict:
+    """Signed-in user's mailbox identity via delegated /me."""
+    resp = _graph_request(
+        "GET",
+        ME_BASE,
+        user_token=user_token,
+        params={"$select": "displayName,mail,userPrincipalName"},
+    )
+    return resp.json()
+
+
+def get_inbox_folder_stats(user_token: str) -> dict:
+    """Inbox folder counts from Graph."""
+    resp = _graph_request(
+        "GET",
+        f"{ME_BASE}/mailFolders/inbox",
+        user_token=user_token,
+        params={"$select": "displayName,totalItemCount,unreadItemCount,id"},
+    )
+    return resp.json()
+
+
+def get_inbox_messages(
+    user_token: str,
+    *,
+    top: int = 25,
+    unread_only: bool = False,
+) -> list:
+    """Fetch inbox messages (newest first)."""
     url = f"{ME_BASE}/mailFolders/inbox/messages"
     params = {
-        "$filter": "isRead eq false",
-        "$top": 25,
-        "$select": "id,subject,from,receivedDateTime,bodyPreview,body,conversationId",
+        "$top": top,
+        "$select": "id,subject,from,isRead,receivedDateTime,bodyPreview",
+        "$orderby": "receivedDateTime desc",
     }
+    if unread_only:
+        params["$filter"] = "isRead eq false"
     resp = _graph_request("GET", url, user_token=user_token, params=params)
     return resp.json().get("value", [])
 
