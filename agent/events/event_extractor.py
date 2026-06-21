@@ -167,15 +167,12 @@ def extract_events(raw_items: list) -> list:
 
 def extract_events_for_student(student_id: str) -> list:
     """
-    Convenience function — loads mock data and extracts events.
-    In production this would be called with real scraped + email data.
+    Load mock social posts and return personalized event matches for the student.
+    Stage 1 keyword filter → extract → Stage 2 LLM reasoning.
     """
-    from agent.events.mock_linkedin import get_mock_linkedin_posts
-    from agent.events.mock_xiaohongshu import get_mock_xhs_posts
-    
-    all_posts = get_mock_linkedin_posts() + get_mock_xhs_posts()
-    
-    return extract_events(all_posts)
+    from agent.events.event_matching import run_event_matching
+
+    return run_event_matching(student_id)
 
 
 if __name__ == "__main__":

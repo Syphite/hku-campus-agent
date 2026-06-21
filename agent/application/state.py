@@ -40,6 +40,8 @@ def init_application_state(
         "pending_list_data": {},
         "pending_free_fields": {},
         "long_text_drafts": {},
+        "skipped_sections": [],
+        "ai_drafted_keys": [],
         "gap_queue": [],
         "current_gap": None,
         "form_json": None,

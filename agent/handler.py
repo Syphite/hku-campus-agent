@@ -28,10 +28,14 @@ from agent.question_extractor import extract_questions_from_file, extract_text_f
 from agent.form_filler import fill_application_form
 from agent.application.form_ai import (
     build_filled_data,
+    build_gap_overview,
+    build_section_prompt,
     detect_gaps,
     draft_long_text,
     merge_filled_data,
-    parse_list_entry,
+    parse_application_collection,
+    parse_list_entries_batch,
+    sort_collection_gaps,
 )
 from agent.application.fill_orchestrator import fill_application
 from agent.application.form_planner import build_form_plan, plan_has_fill_targets
@@ -1556,6 +1560,15 @@ def _event_card(event: dict) -> dict:
         }
     ]
 
+    if event.get("match_reason"):
+        body.append({
+            "type": "TextBlock",
+            "text": f"✨ {event['match_reason']}",
+            "wrap": True,
+            "size": "Small",
+            "color": "Good",
+        })
+
     if event.get("calendar_note"):
         body.append({
             "type": "TextBlock",
@@ -2079,9 +2092,7 @@ def _list_gaps(gaps: list) -> list:
 
 
 def _collection_gaps(gaps: list) -> list:
-    order = {"repeating_list": 0, "free_field": 1, "long_text": 2}
-    items = [gap for gap in gaps or [] if gap.get("type") in order]
-    return sorted(items, key=lambda gap: order[gap["type"]])
+    return sort_collection_gaps(gaps)
 
 
 def _long_text_gaps(gaps: list) -> list:
@@ -2116,6 +2127,8 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
     pending_lists = state.get("pending_list_data") or {}
     long_text_drafts = state.get("long_text_drafts") or {}
     pending_free_fields = state.get("pending_free_fields") or {}
+    skipped_sections = set(state.get("skipped_sections") or [])
+    ai_drafted_keys = set(state.get("ai_drafted_keys") or [])
 
     simple_fields = filled_data.get("simple_fields") or {}
     if simple_fields:
@@ -2156,6 +2169,19 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
                 "wrap": True,
             })
 
+    for gap in _collection_gaps(state.get("gap_queue", [])):
+        key = gap.get("key")
+        if key not in skipped_sections:
+            continue
+        label = gap.get("label") or key.replace("_", " ").title()
+        body.append({
+            "type": "TextBlock",
+            "text": f"{label} (skipped)",
+            "wrap": True,
+            "color": "Warning",
+            "spacing": "Medium",
+        })
+
     for key, text in long_text_drafts.items():
         if not text:
             continue
@@ -2167,14 +2193,15 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
             "spacing": "Medium",
         })
         preview = text if len(text) <= 1200 else f"{text[:1200]}..."
+        suffix = "\n\n_(AI draft)_" if key in ai_drafted_keys else ""
         body.append({
             "type": "TextBlock",
-            "text": preview,
+            "text": f"{preview}{suffix}",
             "wrap": True,
         })
 
     for key, text in pending_free_fields.items():
-        if not text:
+        if not text or key in long_text_drafts:
             continue
         body.append({
             "type": "TextBlock",
@@ -2184,9 +2211,10 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
             "spacing": "Medium",
         })
         preview = text if len(text) <= 1200 else f"{text[:1200]}..."
+        suffix = "\n\n_(AI draft)_" if key in ai_drafted_keys else ""
         body.append({
             "type": "TextBlock",
-            "text": preview,
+            "text": f"{preview}{suffix}",
             "wrap": True,
         })
 
@@ -2219,16 +2247,162 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
     }
 
 
+def _application_section_card(gap: dict) -> dict:
+    """Optional card for the current collection section with a skip button."""
+    label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": build_section_prompt(gap),
+                "wrap": True,
+            }
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "Skip this section",
+                "data": {
+                    "action": "skip_application_section",
+                    "section_key": gap.get("key", ""),
+                },
+            }
+        ],
+    }
+
+
+def _section_prompt_response(gap: dict) -> list:
+    prompt = build_section_prompt(gap)
+    return [
+        _text_response(prompt),
+        _card_response("Current section", _application_section_card(gap)),
+    ]
+
+
+def _mark_section_skipped(profile: dict, state: dict, section_key: str) -> dict:
+    skipped = list(state.get("skipped_sections") or [])
+    if section_key and section_key not in skipped:
+        skipped.append(section_key)
+    update_application_state(profile, skipped_sections=skipped)
+    return get_application_state(profile)
+
+
+def _skip_current_section(profile: dict, state: dict, response_text: str | None = None) -> list:
+    current = state.get("current_gap") or {}
+    section_key = current.get("key", "")
+    state = _mark_section_skipped(profile, state, section_key)
+    responses = _advance_application_gap(profile, state)
+    if response_text and responses:
+        responses.insert(0, _text_response(response_text))
+    return responses
+
+
+def _draft_current_section(profile: dict, state: dict, current_gap: dict) -> list:
+    gap_type = current_gap.get("type")
+    if gap_type not in ("long_text", "free_field"):
+        return [_text_response("I can only draft essay or open-answer sections. Please paste your entries instead.")]
+
+    key = current_gap.get("key")
+    schema = dict(current_gap.get("schema") or {})
+    schema.setdefault("anchor_label", current_gap.get("label", key))
+    schema.setdefault("target_words", 800)
+    draft = draft_long_text(schema, profile, state.get("pending_list_data") or {})
+
+    long_text_drafts = dict(state.get("long_text_drafts") or {})
+    pending_free_fields = dict(state.get("pending_free_fields") or {})
+    ai_drafted_keys = list(state.get("ai_drafted_keys") or [])
+
+    if gap_type == "long_text":
+        long_text_drafts[key] = draft
+    else:
+        pending_free_fields[key] = draft
+    if key and key not in ai_drafted_keys:
+        ai_drafted_keys.append(key)
+
+    update_application_state(
+        profile,
+        long_text_drafts=long_text_drafts,
+        pending_free_fields=pending_free_fields,
+        ai_drafted_keys=ai_drafted_keys,
+    )
+    save_profile(profile)
+
+    preview = draft if len(draft) <= 400 else f"{draft[:400]}..."
+    responses = [_text_response(f"Draft ready for **{current_gap.get('label', key)}**:\n\n{preview}")]
+    responses.extend(_advance_application_gap(profile, get_application_state(profile)))
+    return responses
+
+
+def _fill_current_section(profile: dict, state: dict, current_gap: dict, user_text: str, answer_text: str = "") -> list:
+    gap_type = current_gap.get("type")
+    text_value = (answer_text or user_text or "").strip()
+    list_key = current_gap.get("key")
+
+    if gap_type == "repeating_list":
+        list_schema = current_gap.get("schema") or {}
+        max_rows = int(list_schema.get("max_rows") or 5)
+        entries = parse_list_entries_batch(text_value, list_schema, max_rows)
+        if not entries:
+            return [_text_response(
+                "I couldn't parse any entries. Please paste all experiences in one message "
+                "(organization, role, dates, hours)."
+            )]
+        pending_list_data = dict(state.get("pending_list_data") or {})
+        pending_list_data[list_key] = entries
+        update_application_state(profile, pending_list_data=pending_list_data)
+        save_profile(profile)
+        label = current_gap.get("label") or list_key.replace("_", " ")
+        responses = [_text_response(f"Got {len(entries)} {label} entr{'y' if len(entries) == 1 else 'ies'}.")]
+        responses.extend(_advance_application_gap(profile, get_application_state(profile)))
+        return responses
+
+    if gap_type == "long_text":
+        if not text_value:
+            return [_text_response("Please paste your answer, say **draft**, or **skip**.")]
+        long_text_drafts = dict(state.get("long_text_drafts") or {})
+        long_text_drafts[list_key] = text_value
+        update_application_state(profile, long_text_drafts=long_text_drafts)
+        save_profile(profile)
+        responses = [_text_response(f"Saved your answer for **{current_gap.get('label', list_key)}**.")]
+        responses.extend(_advance_application_gap(profile, get_application_state(profile)))
+        return responses
+
+    if gap_type == "free_field":
+        if not text_value:
+            return [_text_response("Please paste your answer, say **draft**, or **skip**.")]
+        pending_free_fields = dict(state.get("pending_free_fields") or {})
+        pending_free_fields[list_key] = text_value
+        update_application_state(profile, pending_free_fields=pending_free_fields)
+        save_profile(profile)
+        responses = [_text_response(f"Saved your answer for **{current_gap.get('label', list_key)}**.")]
+        responses.extend(_advance_application_gap(profile, get_application_state(profile)))
+        return responses
+
+    return [_text_response("Say **skip** to move on, or reply with the requested information.")]
+
+
 def _begin_application_review(profile: dict, state: dict) -> list:
-    long_text_drafts = {}
+    long_text_drafts = dict(state.get("long_text_drafts") or {})
+    skipped = set(state.get("skipped_sections") or [])
+    ai_drafted_keys = list(state.get("ai_drafted_keys") or [])
+
     for gap in _long_text_gaps(state.get("gap_queue", [])):
-        long_text_drafts[gap["key"]] = draft_long_text(
+        key = gap["key"]
+        if key in skipped or long_text_drafts.get(key):
+            continue
+        long_text_drafts[key] = draft_long_text(
             gap["schema"],
             profile,
             state.get("pending_list_data") or {},
         )
+        if key not in ai_drafted_keys:
+            ai_drafted_keys.append(key)
 
     state["long_text_drafts"] = long_text_drafts
+    state["ai_drafted_keys"] = ai_drafted_keys
     state["step"] = "review"
     state["current_gap"] = None
     profile["pending_application_review"] = state.get("scholarship_id", "ss_472")
@@ -2266,7 +2440,7 @@ def _advance_application_gap(profile: dict, state: dict) -> list:
             step="collecting_list",
         )
         save_profile(profile)
-        return [_text_response(next_gap.get("prompt") or "Please share the next entry.")]
+        return _section_prompt_response(next_gap)
 
     return _begin_application_review(profile, get_application_state(profile))
 
@@ -2280,57 +2454,35 @@ def handle_application_collection_message(student_id: str, text: str) -> list | 
     if state.get("step") != "collecting_list":
         return None
 
-    if _looks_like_section_advance(text):
-        return _advance_application_gap(profile, state)
-
     current_gap = state.get("current_gap") or {}
-    gap_type = current_gap.get("type")
+    if not current_gap:
+        return [_text_response("No section is active right now.")]
 
-    if gap_type == "free_field":
-        key = current_gap.get("key")
-        if not (text or "").strip():
-            return [_text_response("Please provide your answer, or say **next** to skip for now.")]
-        pending_free_fields = dict(state.get("pending_free_fields") or {})
-        pending_free_fields[key] = text.strip()
-        update_application_state(profile, pending_free_fields=pending_free_fields)
-        save_profile(profile)
-        return _advance_application_gap(profile, get_application_state(profile))
+    if _looks_like_section_advance(text):
+        return _skip_current_section(profile, state, "Okay, skipping this section.")
 
-    if gap_type == "long_text":
-        key = current_gap.get("key")
-        if (text or "").strip():
-            long_text_drafts = dict(state.get("long_text_drafts") or {})
-            long_text_drafts[key] = text.strip()
-            update_application_state(profile, long_text_drafts=long_text_drafts)
-            save_profile(profile)
-        return _advance_application_gap(profile, get_application_state(profile))
+    parsed = parse_application_collection(text, current_gap, profile, state)
+    intent = parsed.get("intent", "unknown")
+    agent_response = parsed.get("agent_response") or ""
+    extracted = parsed.get("extracted_data") or {}
+    answer_text = str(extracted.get("answer_text") or "").strip()
 
-    if gap_type != "repeating_list":
-        return [_text_response("Say **next** when you're ready to continue.")]
+    if intent == "skip_section":
+        return _skip_current_section(profile, state, agent_response or None)
 
-    list_schema = current_gap.get("schema") or {}
-    list_key = current_gap.get("key")
-    entry = parse_list_entry(text, list_schema)
-    if not any(entry.values()):
-        return [_text_response(
-            "I couldn't parse that entry. Please include organization, role, dates, and hours if possible."
-        )]
+    if intent == "draft_section":
+        return _draft_current_section(profile, state, current_gap)
 
-    pending_list_data = dict(state.get("pending_list_data") or {})
-    entries = list(pending_list_data.get(list_key) or [])
-    entries.append(entry)
-    pending_list_data[list_key] = entries
-    update_application_state(profile, pending_list_data=pending_list_data)
-    save_profile(profile)
+    if intent == "fill_section":
+        return _fill_current_section(profile, state, current_gap, text, answer_text)
 
-    max_rows = int(list_schema.get("max_rows") or 5)
-    if len(entries) >= max_rows:
-        return _advance_application_gap(profile, get_application_state(profile))
+    if intent == "clarify" and agent_response:
+        return [_text_response(agent_response)]
 
-    label = current_gap.get("label") or list_key.replace("_", " ")
-    return [_text_response(
-        f"Got it! Do you have another {label} entry to add, or say **next** to move to the next section?"
-    )]
+    if agent_response:
+        return [_text_response(agent_response)]
+
+    return [_text_response(build_section_prompt(current_gap))]
 
 
 def _looks_like_application_approval(text: str) -> bool:
@@ -2424,24 +2576,25 @@ def handle_application_form_upload(
         pending_list_data={},
         pending_free_fields={},
         long_text_drafts={},
+        skipped_sections=[],
+        ai_drafted_keys=[],
     )
     profile["last_scholarship_id"] = "ss_472"
     profile["last_scholarship_name"] = DEMO_SCHOLARSHIP_472["name"]
     save_profile(profile)
 
     if first_gap:
+        overview = build_gap_overview(schema, filled_data, gaps)
         metadata = plan.get("metadata") or {}
-        imported_note = ""
         if metadata.get("analysis_errors"):
-            imported_note = " Some sections needed partial analysis."
-        return [
-            _text_response(
-                f"I analyzed your form and found {len(schema.get('simple_fields', []))} profile fields, "
-                f"{len(schema.get('repeating_lists', []))} repeating sections, and "
-                f"{len(free_fields)} open-ended questions.{imported_note}"
-            ),
-            _text_response(first_gap.get("prompt") or "Please share the first entry for this section."),
+            overview += "\n\n_Note: some sections needed partial analysis._"
+        first_label = first_gap.get("label") or first_gap.get("key", "section").replace("_", " ").title()
+        responses = [
+            _text_response(overview),
+            _text_response(f"Starting with **{first_label}**."),
         ]
+        responses.extend(_section_prompt_response(first_gap))
+        return responses
 
     return _begin_application_review(profile, get_application_state(profile))
 
@@ -2888,6 +3041,13 @@ def handle_message(student_id: str, message: dict) -> list:
 
     if action == "approve_application":
         return handle_approve_application(student_id, value)
+
+    if action == "skip_application_section":
+        profile = get_profile(student_id)
+        if profile and get_application_state(profile).get("step") == "collecting_list":
+            state = get_application_state(profile)
+            return _skip_current_section(profile, state, "Skipped this section.")
+        return [_text_response("No section is active to skip right now.")]
 
     if action == "cancel_application_review":
         return handle_cancel_application_review(student_id)

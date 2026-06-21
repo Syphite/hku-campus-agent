@@ -354,10 +354,8 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
             "label": field.get("label") or key.replace("_", " ").title(),
             "schema": field,
             "prompt": (
-                f"I see this form requires up to {field.get('max_rows', 'several')} "
-                f"{field.get('label') or key.replace('_', ' ')} entries, but your profile "
-                "doesn't have this yet. Let's add them!\n\n"
-                "Please tell me about your first experience: organization, role, dates, and hours."
+                f"**{field.get('label') or key.replace('_', ' ').title()}** — paste all entries in one message "
+                f"(up to {field.get('max_rows', 5)}). Include organization, role, dates, and hours for each."
             ),
         })
 
@@ -366,14 +364,15 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
         current = (filled_data.get("long_text") or {}).get(key) or ""
         if current.strip():
             continue
+        label = field.get("anchor_label") or key.replace("_", " ").title()
         gaps.append({
             "type": "long_text",
             "key": key,
-            "label": field.get("anchor_label") or key.replace("_", " ").title(),
+            "label": label,
             "schema": field,
             "prompt": (
-                f"Please provide your response for **{field.get('anchor_label', key)}**, "
-                "or say **next** to let me draft it from your profile."
+                f"**{label}** — paste your answer, say **draft** for an AI draft from your profile and activities, "
+                "or **skip** to leave blank."
             ),
         })
 
@@ -382,13 +381,15 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
         current = (filled_data.get("free_fields") or {}).get(key) or ""
         if current.strip():
             continue
+        label = field.get("question_text") or key.replace("_", " ").title()
         gaps.append({
             "type": "free_field",
             "key": key,
-            "label": field.get("question_text") or key.replace("_", " ").title(),
+            "label": label,
             "schema": field,
             "prompt": (
-                f"Please answer this form question:\n\n**{field.get('question_text', key)}**"
+                f"**{label}** — paste your answer, say **draft** for an AI draft from your profile and activities, "
+                "or **skip** to leave blank."
             ),
         })
 
@@ -396,6 +397,150 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
         logger.info("No structured list gaps detected")
 
     return gaps
+
+
+COLLECTION_GAP_ORDER = {"repeating_list": 0, "free_field": 1, "long_text": 2}
+
+
+def sort_collection_gaps(gaps: list) -> list:
+    items = [gap for gap in gaps or [] if gap.get("type") in COLLECTION_GAP_ORDER]
+    return sorted(items, key=lambda gap: COLLECTION_GAP_ORDER[gap["type"]])
+
+
+def build_section_prompt(gap: dict) -> str:
+    if not gap:
+        return "Please share the information for the next section."
+    if gap.get("prompt"):
+        return gap["prompt"]
+    label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
+    gap_type = gap.get("type")
+    if gap_type == "repeating_list":
+        schema = gap.get("schema") or {}
+        max_rows = schema.get("max_rows", 5)
+        return (
+            f"**{label}** — paste all entries in one message (up to {max_rows}). "
+            "Include organization, role, dates, and hours for each."
+        )
+    return (
+        f"**{label}** — paste your answer, say **draft** for an AI draft from your profile and activities, "
+        "or **skip** to leave blank."
+    )
+
+
+def build_gap_overview(schema: dict, filled_data: dict, gaps: list) -> str:
+    lines = ["I analyzed your form.", ""]
+
+    simple_fields = filled_data.get("simple_fields") or {}
+    filled_simple = [key.replace("_", " ").title() for key, value in simple_fields.items() if value]
+    if filled_simple:
+        lines.append("**Already filled from your profile:**")
+        for label in filled_simple[:12]:
+            lines.append(f"- {label}")
+        lines.append("")
+
+    collection_gaps = sort_collection_gaps(gaps)
+    if collection_gaps:
+        lines.append("**Still needed:**")
+        for index, gap in enumerate(collection_gaps, start=1):
+            label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
+            gap_type = gap.get("type")
+            if gap_type == "repeating_list":
+                max_rows = (gap.get("schema") or {}).get("max_rows", 5)
+                lines.append(f"{index}. {label} — up to {max_rows} entries (send all in one message)")
+            else:
+                lines.append(f"{index}. {label} — essay/open answer (**draft** or **skip** ok)")
+        lines.append("")
+        lines.append("Say **skip [section]** to skip a section. I'll walk you through each section one at a time.")
+    else:
+        lines.append("Your profile covers the required fields. Review the summary next.")
+
+    return "\n".join(lines)
+
+
+def parse_list_entries_batch(user_text: str, list_schema: dict, max_rows: int = 5) -> list[dict]:
+    prompt = _load_prompt("form_list_batch_parse.txt").format(
+        list_schema=json.dumps(list_schema, ensure_ascii=False, indent=2),
+        user_text=user_text,
+        max_rows=max_rows,
+    )
+    client = _get_openai_client()
+    response = client.chat.completions.create(
+        model=_deployment(),
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_tokens=2000,
+        temperature=0.1,
+    )
+    parsed = parse_llm_json(response.choices[0].message.content or "{}")
+    if not isinstance(parsed, dict):
+        return []
+
+    entries = []
+    for item in parsed.get("entries", []) or []:
+        if not isinstance(item, dict):
+            continue
+        normalized = {
+            "organization": str(item.get("organization") or "").strip(),
+            "role": str(item.get("role") or "").strip(),
+            "dates": str(item.get("dates") or "").strip(),
+            "hours": str(item.get("hours") or "").strip(),
+            "description": str(item.get("description") or "").strip(),
+        }
+        if any(normalized.values()):
+            entries.append(normalized)
+        if len(entries) >= max_rows:
+            break
+    return entries
+
+
+def parse_application_collection(user_text: str, current_gap: dict, profile: dict, state: dict) -> dict:
+    section_label = current_gap.get("label") or current_gap.get("key", "current section")
+    section_type = current_gap.get("type", "unknown")
+    current_section = json.dumps({
+        "type": section_type,
+        "label": section_label,
+        "key": current_gap.get("key"),
+        "prompt": build_section_prompt(current_gap),
+    }, ensure_ascii=False, indent=2)
+
+    prompt = _load_prompt("form_collection_router.txt").format(
+        current_section=current_section,
+        user_text=user_text,
+    )
+    try:
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=_deployment(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=800,
+            temperature=0.1,
+        )
+        parsed = parse_llm_json(response.choices[0].message.content or "{}")
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception as exc:
+        logger.warning("Application collection router failed: %s", exc)
+
+    lowered = (user_text or "").strip().lower()
+    if any(term in lowered for term in ("skip", "next", "move on", "pass")):
+        return {
+            "intent": "skip_section",
+            "extracted_data": {},
+            "agent_response": f"Okay, skipping **{section_label}**.",
+        }
+    if any(term in lowered for term in ("draft", "write it for me", "generate")):
+        if section_type in ("long_text", "free_field"):
+            return {
+                "intent": "draft_section",
+                "extracted_data": {},
+                "agent_response": f"I'll draft **{section_label}** from your profile.",
+            }
+    return {
+        "intent": "fill_section",
+        "extracted_data": {"answer_text": user_text},
+        "agent_response": "",
+    }
 
 
 def parse_list_entry(user_text: str, list_schema: dict) -> dict:

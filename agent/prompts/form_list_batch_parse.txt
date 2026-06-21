@@ -1,0 +1,18 @@
+Parse the user's message into structured list entries for a scholarship application form section.
+
+Return ONLY valid JSON:
+{{"entries": [
+  {{"organization": "...", "role": "...", "dates": "...", "hours": "...", "description": "..."}}
+]}}
+
+Rules:
+- Extract every distinct experience/entry mentioned in the user message.
+- Return at most {max_rows} entries.
+- Use empty strings for missing fields. Do not invent organizations or dates.
+- Preserve the user's wording in description when provided.
+
+List section schema:
+{list_schema}
+
+User message:
+{user_text}
