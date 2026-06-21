@@ -49,7 +49,6 @@ from agent.application.state import (
     init_application_state,
     update_application_state,
 )
-from agent.file_hosting import upload_to_public_host
 from agent.digest   import assemble_digest, format_digest_message
 
 # Import event pipeline
@@ -264,45 +263,6 @@ def _file_download_response(filename: str, file_bytes: bytes, content_type: str,
             "bytes": file_bytes,
         },
     }
-
-
-def _filled_form_download_card(public_url: str) -> dict:
-    return {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "type": "AdaptiveCard",
-        "version": "1.3",
-        "body": [
-            {
-                "type": "TextBlock",
-                "text": "Your application form is filled and ready!",
-                "weight": "Bolder",
-                "size": "Large",
-                "wrap": True,
-            },
-            {
-                "type": "TextBlock",
-                "text": "Click the button below to download your completed form.",
-                "wrap": True,
-            },
-        ],
-        "actions": [
-            {
-                "type": "Action.OpenUrl",
-                "title": "Download Filled Form",
-                "url": public_url,
-            }
-        ],
-    }
-
-
-def _public_download_response(public_url: str) -> list:
-    return [
-        _text_response("Approved! Your filled application form is ready to download."),
-        _card_response(
-            "Download your completed application form:",
-            _filled_form_download_card(public_url),
-        ),
-    ]
 
 
 def _help_card_response() -> dict:
@@ -2907,11 +2867,29 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
     if not os.path.exists(output_path):
         return [_text_response("The filled form could not be generated. Please try again.")]
 
-    public_url = upload_to_public_host(output_path)
+    try:
+        with open(output_path, "rb") as handle:
+            file_bytes = handle.read()
+    except OSError as exc:
+        logger.error("Could not read filled form at %s: %s", output_path, exc)
+        return [_text_response("The filled form was created but could not be read for download. Please try again.")]
+
+    if not file_bytes:
+        return [_text_response("The filled form is empty. Please review your answers and try again.")]
+
+    download_name = os.path.basename(output_path) or "filled_application_form.docx"
+    download_type = content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     _clear_application_review_state(profile)
     save_profile(profile)
 
-    return _public_download_response(public_url)
+    return [
+        _file_download_response(
+            download_name,
+            file_bytes,
+            download_type,
+            text="Approved! Your filled application form is ready — use the attachment below to download it.",
+        )
+    ]
 
 
 def handle_cancel_application_collection(student_id: str) -> list:

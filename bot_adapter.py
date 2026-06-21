@@ -97,7 +97,7 @@ async def messages(req: web.Request) -> web.Response:
 
                 file_download = r.get("file_download")
                 if file_download:
-                    # Application approval uses 0x0.st via handler; this path is for legacy callers only.
+                    # Serve filled forms and other generated files via the bot download endpoint.
                     token = _register_download(
                         file_download["bytes"],
                         file_download["filename"],
