@@ -794,7 +794,7 @@ def handle_graph_token_response(student_id: str, token_payload) -> list:
     if schedule_note:
         responses.append(_text_response(schedule_note))
 
-    if pending in ("digest", "first_digest"):
+    if pending == "digest":
         digest_result = handle_get_digest(student_id)
         if isinstance(digest_result, dict):
             responses.append(_text_response(digest_result.get("text", "Please try **digest** again.")))
@@ -814,7 +814,10 @@ def handle_graph_token_response(student_id: str, token_payload) -> list:
         else:
             responses.extend(debug_result)
     else:
-        responses.append(_text_response("Type **digest** or **inbox** when you're ready."))
+        responses.append(_text_response(
+            "You're all set. Type **digest** for a full update, **events** for event matches, "
+            "or **inbox** to triage your email."
+        ))
     return responses
 
 _WEEKDAY_NAMES = (
@@ -2160,7 +2163,7 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
     )
     cv_prompt = _text_response(
         "📄 **Next step:** attach your PDF CV to this chat and type **CV**. "
-        "I'll use it to improve scholarship and event matching."
+        "After that, type **digest**, **events**, or **inbox** whenever you want an update."
     )
     return [welcome, cv_prompt]
 
@@ -2186,21 +2189,24 @@ def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
     )
 
     if needs_signin:
-        profile["pending_graph_command"] = "first_digest"
+        profile["pending_graph_command"] = "signin"
         save_profile(profile)
         return [
             cv_ack,
             _oauth_login_required(
                 "Smart Inbox and calendar features need a one-time Microsoft sign-in "
-                "for email access. I'll run your first digest right after.",
-                pending_command="first_digest",
+                "for email access. After signing in, type **digest**, **events**, or **inbox**.",
+                pending_command="signin",
             ),
         ]
 
-    digest_responses = handle_get_digest(student_id)
-    if isinstance(digest_responses, dict):
-        return [cv_ack, digest_responses]
-    return [cv_ack] + list(digest_responses)
+    return [
+        cv_ack,
+        _text_response(
+            "When you're ready, type **digest** for a full update, **events** for event matches, "
+            "or **inbox** to triage your email."
+        ),
+    ]
 
 def handle_graph_debug(student_id: str, scope: str) -> list:
     """Show what delegated Graph actually returns for inbox and/or calendar."""
@@ -3808,15 +3814,15 @@ def handle_agent_help(student_id: str) -> list:
     name = (profile or {}).get("name", "").split()[0] if profile else ""
     greeting = f"Hi {name}! " if name else ""
     return [_text_response(
-        f"{greeting}I'm your **HKU Campus Agent** — I work proactively across scholarships, events, and inbox.\n\n"
-        "**Try asking naturally:**\n"
-        "• *What's new this week?* — full briefing with suggested next steps\n"
-        "• *Show scholarships I can apply for*\n"
-        "• *Apply to Chen scholarship* — start a guided application\n"
-        "• *Check my inbox* — triage and archive noise\n"
-        "• *What should I focus on?* — priorities based on deadlines\n"
-        "• *Change my GPA to 3.8* — update your profile\n\n"
-        "Between visits I remember your last digest so I can tell you what changed."
+        f"{greeting}I'm your **HKU Campus Agent** — I work across scholarships, events, and inbox.\n\n"
+        "**Commands (or ask in your own words):**\n"
+        "• **digest** — full update (scholarships, events, inbox)\n"
+        "• **events** — event and competition matches only\n"
+        "• **scholarships** — scholarship matches only\n"
+        "• **inbox** — email triage and archive\n"
+        "• **help** — this message\n\n"
+        "**Natural language also works**, e.g. *what's new*, *show me competitions*, "
+        "*check my email*, *apply to Chen scholarship*, *change my GPA to 3.8*."
     )]
 
 
@@ -4143,7 +4149,8 @@ def handle_message(student_id: str, message: dict) -> list:
         return [_text_response("Please attach your PDF CV to the chat first, then type CV again.")]
 
     event_commands = {
-        "events", "show events", "competitions", "show me events", "event matches",
+        "event", "events", "show events", "show event", "competitions",
+        "show me events", "show me event", "event matches",
     }
     if text in event_commands:
         return handle_get_events(student_id)
@@ -4217,7 +4224,7 @@ def handle_message(student_id: str, message: dict) -> list:
                 "and opportunities tailored to you, and help you apply. Let's get you set up:",
                 card
             )]
-        return handle_get_digest(student_id)
+        return handle_agent_help(student_id)
 
     # Default — onboard new users, otherwise ask for clarification.
     if not profile or not profile.get("onboarding_complete"):

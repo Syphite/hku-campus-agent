@@ -29,6 +29,15 @@ logger = logging.getLogger(__name__)
 SCAN_MODE = "unread_scan"
 
 
+def _parse_duplicate_result(result) -> tuple[bool, str]:
+    """Normalize check_duplicate output — tolerate legacy bool-only returns."""
+    if isinstance(result, tuple) and len(result) >= 2:
+        return bool(result[0]), str(result[1] or "")
+    if isinstance(result, bool):
+        return result, "Duplicate detected." if result else ""
+    return False, ""
+
+
 def fetch_inbox_candidates(user_token: str, profile: dict) -> tuple[list, str]:
     """Always scan unread inbox messages (paginated)."""
     del profile  # kept for API compatibility with diagnostics
@@ -85,12 +94,14 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             continue
 
         fingerprint = content_fingerprint(sender, subject)
-        is_dup, dup_reason = check_duplicate(
-            fingerprint,
-            preview,
-            batch_fingerprints=batch_fingerprints,
-            archived_fingerprints=archived_fingerprints,
-            batch_previews=batch_previews,
+        is_dup, dup_reason = _parse_duplicate_result(
+            check_duplicate(
+                fingerprint,
+                preview,
+                batch_fingerprints=batch_fingerprints,
+                archived_fingerprints=archived_fingerprints,
+                batch_previews=batch_previews,
+            )
         )
         batch_fingerprints.add(fingerprint)
         batch_previews[fingerprint] = preview_signature(preview)

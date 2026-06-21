@@ -36,13 +36,16 @@ VALID_INTENTS = {
 }
 
 EXACT_COMMANDS = {
-    "digest": {"digest", "update", "show me", "what's new", "whats new", "opportunities"},
+    "digest": {"digest", "full update", "my update", "daily update", "weekly update"},
     "scholarships": {
         "scholarship", "scholarships", "show scholarships", "browse scholarships",
         "show me scholarships", "scholarship matches",
     },
-    "events": {"events", "show events", "competitions", "show me events", "event matches"},
-    "inbox": {"inbox", "show inbox", "check inbox", "my inbox"},
+    "events": {
+        "event", "events", "show events", "show event", "competitions",
+        "show me events", "show me event", "event matches",
+    },
+    "inbox": {"inbox", "show inbox", "check inbox", "my inbox", "check my email", "clean my inbox"},
     "help": {"help", "commands", "what can you do"},
 }
 
@@ -69,9 +72,22 @@ def _keyword_route(text: str) -> dict | None:
         "what should i focus", "what do i need to do", "plan my week",
         "priorities", "anything urgent", "what's urgent", "whats urgent",
         "brief me", "catch me up", "my week", "weekly update",
+        "what's new", "whats new", "anything i should know", "update me",
+        "show me opportunities", "what can i apply for",
     )
     if any(term in normalized for term in focus_terms):
         return {"intent": "digest", "scholarship_query": "", "confidence": "high", "source": "keyword"}
+
+    event_terms = (
+        "competition", "competitions", "hackathon", "workshop", "seminar",
+        "talks on campus", "campus events", "upcoming events",
+    )
+    if any(term in normalized for term in event_terms) and "scholarship" not in normalized:
+        return {"intent": "events", "scholarship_query": "", "confidence": "medium", "source": "keyword"}
+
+    inbox_terms = ("check my email", "clean my inbox", "triage my email", "email triage")
+    if any(term in normalized for term in inbox_terms):
+        return {"intent": "inbox", "scholarship_query": "", "confidence": "high", "source": "keyword"}
 
     for pattern in APPLY_PATTERNS:
         match = pattern.search(text or "")
