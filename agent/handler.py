@@ -22,7 +22,7 @@ openai_client = AzureOpenAI(
 
 # Import agent modules using absolute paths from project root
 from agent.profile  import get_profile, save_profile, build_profile_from_form, update_profile_fields, extract_cv_text, get_graph_access_token, save_graph_token, clear_pending_graph_command
-from agent.matching import run_matching
+from agent.matching import run_matching, find_scholarship_by_query
 from agent.drafter  import extract_application_questions, generate_draft_answers
 from agent.question_extractor import extract_questions_from_file, extract_text_from_application_file
 from agent.form_filler import fill_application_form
@@ -57,6 +57,8 @@ from agent.conflict_checker        import run_conflict_checks_batch
 
 # Import email pipeline
 from agent.email_pipeline import run_inbox_pipeline
+from agent.intent_router import route_message
+from agent.proactive import format_digest_with_proactive, update_agent_snapshot
 from agent.storage.blob_storage import upload_filled_application
 from agent.graph import (
     GraphApiError,
@@ -1757,6 +1759,196 @@ def _archive_review_card(review_item: dict) -> dict:
         ]
     }
 
+def _inbox_urgent_card(item: dict) -> dict:
+    subject = item.get("subject") or "Urgent email"
+    timing = item.get("timing") or {}
+    body = [
+        {
+            "type": "TextBlock",
+            "text": f"🚨 **Urgent:** {subject}",
+            "weight": "Bolder",
+            "wrap": True,
+        },
+        {
+            "type": "TextBlock",
+            "text": item.get("reason") or "",
+            "wrap": True,
+            "size": "Small",
+        },
+    ]
+    if timing.get("deadline_display"):
+        body.append({
+            "type": "TextBlock",
+            "text": f"📅 **Deadline:** {timing['deadline_display']}",
+            "wrap": True,
+            "color": "Attention",
+        })
+    for index, action in enumerate(item.get("action_items") or [], start=1):
+        body.append({
+            "type": "TextBlock",
+            "text": f"{index}. {action}",
+            "wrap": True,
+            "size": "Small",
+        })
+    if item.get("calendar_added"):
+        body.append({
+            "type": "TextBlock",
+            "text": "✅ Deadline added to your Outlook calendar automatically.",
+            "wrap": True,
+            "color": "Good",
+            "size": "Small",
+        })
+    elif item.get("calendar_error"):
+        body.append({
+            "type": "TextBlock",
+            "text": f"⚠️ Could not add to calendar: {item['calendar_error']}",
+            "wrap": True,
+            "color": "Warning",
+            "size": "Small",
+        })
+    if item.get("calendar_note"):
+        body.append({
+            "type": "TextBlock",
+            "text": f"⚠️ {item['calendar_note']}",
+            "wrap": True,
+            "color": "Warning",
+            "size": "Small",
+        })
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.3",
+        "body": body,
+    }
+
+
+def _inbox_relevant_card(item: dict) -> dict:
+    subject = item.get("subject") or "Relevant email"
+    timing = item.get("timing") or {}
+    body = [
+        {
+            "type": "TextBlock",
+            "text": f"📌 **Relevant:** {subject}",
+            "weight": "Bolder",
+            "wrap": True,
+        },
+        {
+            "type": "TextBlock",
+            "text": item.get("reason") or "",
+            "wrap": True,
+            "size": "Small",
+        },
+    ]
+    if timing.get("deadline_display"):
+        label = "Event" if timing.get("kind") == "event" else "Deadline"
+        body.append({
+            "type": "TextBlock",
+            "text": f"📅 **{label}:** {timing['deadline_display']}",
+            "wrap": True,
+        })
+    for index, action in enumerate(item.get("action_items") or [], start=1):
+        body.append({
+            "type": "TextBlock",
+            "text": f"{index}. {action}",
+            "wrap": True,
+            "size": "Small",
+        })
+    if item.get("calendar_note"):
+        body.append({
+            "type": "TextBlock",
+            "text": f"⚠️ {item['calendar_note']}",
+            "wrap": True,
+            "color": "Warning",
+            "size": "Small",
+        })
+    actions = []
+    if timing.get("start_iso") and timing.get("end_iso"):
+        actions.append({
+            "type": "Action.Submit",
+            "title": "Add to Calendar",
+            "data": {
+                "action": "confirm_email_calendar_add",
+                "email_id": item.get("email_id", ""),
+                "title": subject[:120],
+                "start_iso": timing["start_iso"],
+                "end_iso": timing["end_iso"],
+                "kind": timing.get("kind", "event"),
+            },
+        })
+        actions.append({
+            "type": "Action.Submit",
+            "title": "Not now",
+            "data": {"action": "cancel_email_calendar_add"},
+        })
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.3",
+        "body": body,
+        "actions": actions,
+    }
+
+
+def _append_inbox_calendar_sections(responses: list, inbox_summary: dict | None) -> None:
+    if not inbox_summary:
+        return
+    urgent = inbox_summary.get("urgent_items") or []
+    relevant = inbox_summary.get("relevant_items") or []
+    if urgent:
+        responses.append(_text_response("**🚨 Urgent emails — action needed:**"))
+        for item in urgent[:5]:
+            responses.append({
+                "type": "message",
+                "text": "Urgent email",
+                "attachments": [{
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": _inbox_urgent_card(item),
+                }],
+            })
+    if relevant:
+        responses.append(_text_response("**📌 Relevant emails — review & register:**"))
+        for item in relevant[:5]:
+            responses.append({
+                "type": "message",
+                "text": "Relevant email",
+                "attachments": [{
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": _inbox_relevant_card(item),
+                }],
+            })
+
+
+def handle_confirm_email_calendar_add(student_id: str, value: dict) -> list:
+    """Add a relevant inbox email event/deadline to calendar after user confirms."""
+    profile = get_profile(student_id)
+    if not profile:
+        return [_text_response("Please complete onboarding first.")]
+
+    title = value.get("title") or "Email event"
+    start_iso = value.get("start_iso") or ""
+    end_iso = value.get("end_iso") or ""
+    kind = value.get("kind") or "event"
+    if not start_iso or not end_iso:
+        return [_text_response("I couldn't read the event time from that email.")]
+
+    auth_required = _require_graph_token(profile, needs_calendar=True)
+    if auth_required:
+        return [auth_required]
+
+    user_token = get_graph_access_token(profile)
+    cal_title = f"Deadline: {title[:80]}" if kind == "deadline" else f"Event: {title[:80]}"
+    result = create_calendar_event(user_token, cal_title, start_iso, end_iso)
+    if not result.get("success"):
+        logger.error("Email calendar add failed: %s", result.get("error"))
+        return [_text_response("I couldn't add that to your calendar right now. Please try again.")]
+
+    from agent.email_calendar import mark_email_calendar_added
+    mark_email_calendar_added(profile, title, start_iso)
+    save_profile(profile)
+    display = _format_event_datetime_display(start_iso, end_iso)
+    return [_text_response(f"✅ Added **{cal_title}** to your calendar ({display}).")]
+
+
 # ---------------------------------------------------------------------------
 # Intent handlers
 # ---------------------------------------------------------------------------
@@ -1960,7 +2152,7 @@ def handle_get_inbox(student_id: str) -> list:
     kept = inbox_summary.get("kept", 0)
     scan_mode = inbox_summary.get("scan_mode", "")
     duplicates = inbox_summary.get("duplicates_archived", 0)
-    mode_label = "first-time unread scan" if scan_mode == "initial_unread_scan" else "today's mail (HKT)"
+    mode_label = "unread inbox scan" if scan_mode == "unread_scan" else scan_mode.replace("_", " ")
     lines = [
         f"📬 **Inbox update:** {processed} email(s) processed, {archived} archived, {kept} kept in inbox.",
         f"Scan mode: **{mode_label}**.",
@@ -1969,12 +2161,14 @@ def handle_get_inbox(student_id: str) -> list:
         lines.append(f"Duplicates archived: **{duplicates}**.")
     if processed == 0:
         lines.append(
-            "Nothing new was classified this run. Type **debug inbox** to see which account Graph is using, "
-            "unread counts, and whether messages were skipped as already processed."
+            "Nothing new was classified this run. Type **debug inbox** to see unread counts "
+            "and agent folder status."
         )
     if inbox_error_note:
         lines.append(f"⚠️ {inbox_error_note}")
     responses = [_text_response("\n".join(lines))]
+
+    _append_inbox_calendar_sections(responses, inbox_summary)
 
     if inbox_summary.get("archived_items"):
         review_item = inbox_summary["archived_items"][0]
@@ -2048,13 +2242,19 @@ def handle_get_digest(student_id: str) -> list:
         inbox_summary=inbox_summary  # Pass the real inbox summary here
     )
 
-    responses.append(_text_response(format_digest_message(digest)))
+    update_agent_snapshot(profile, digest)
+    save_profile(profile)
+
+    opening = format_digest_with_proactive(profile, digest, format_digest_message(digest))
+    responses.append(_text_response(opening))
 
     if inbox_error_note:
         responses.append(_text_response(f"📬 **Inbox:** {inbox_error_note}"))
 
     if "scholarships" in modules:
         _append_scholarship_sections(responses, digest["scholarships"])
+
+    _append_inbox_calendar_sections(responses, inbox_summary)
 
     # Event cards — urgent
     if digest["events"]["urgent"]:
@@ -3469,6 +3669,114 @@ def handle_semester_refresh(student_id: str, form_data: dict, dismissed: bool = 
     else:
         return [_text_response("Profile unchanged.")]
 
+
+def handle_agent_help(student_id: str) -> list:
+    """Describe agent capabilities in natural language."""
+    profile = get_profile(student_id)
+    name = (profile or {}).get("name", "").split()[0] if profile else ""
+    greeting = f"Hi {name}! " if name else ""
+    return [_text_response(
+        f"{greeting}I'm your **HKU Campus Agent** — I work proactively across scholarships, events, and inbox.\n\n"
+        "**Try asking naturally:**\n"
+        "• *What's new this week?* — full briefing with suggested next steps\n"
+        "• *Show scholarships I can apply for*\n"
+        "• *Apply to Chen scholarship* — start a guided application\n"
+        "• *Check my inbox* — triage and archive noise\n"
+        "• *What should I focus on?* — priorities based on deadlines\n"
+        "• *Change my GPA to 3.8* — update your profile\n\n"
+        "Between visits I remember your last digest so I can tell you what changed."
+    )]
+
+
+def handle_apply_to_scholarship(student_id: str, query: str) -> list:
+    """Compound flow: resolve scholarship by name and start application or draft."""
+    profile = get_profile(student_id)
+    if not profile:
+        return [_card_response("Please complete onboarding first:", _build_onboarding_card())]
+
+    query = (query or "").strip()
+    if not query:
+        return [_text_response(
+            "Which scholarship would you like to apply for? "
+            "Try *apply to Chen scholarship* or tap **Start Application** on a card."
+        )]
+
+    scholarship = find_scholarship_by_query(student_id, query)
+    if not scholarship:
+        try:
+            scholarship_result = run_matching(student_id)
+        except Exception as exc:
+            logger.error("Scholarship lookup failed: %s", exc)
+            scholarship_result = {"apply_now": [], "prepare": []}
+        scholarship = find_scholarship_by_query(student_id, query, scholarship_result)
+
+    if not scholarship:
+        responses = [
+            _text_response(
+                f"I couldn't find a strong match for **{query}**. "
+                "Here are your current scholarship matches — reply with the exact name to apply."
+            )
+        ]
+        try:
+            scholarship_result = run_matching(student_id)
+        except Exception:
+            scholarship_result = {"apply_now": [], "prepare": []}
+        _append_scholarship_sections(responses, scholarship_result)
+        return responses
+
+    scholarship_id = str(scholarship.get("scholarship_id") or scholarship.get("id") or "")
+    scholarship_name = str(scholarship.get("name") or query).strip()
+
+    if scholarship_id == "ss_472" or scholarship.get("is_prototype"):
+        responses = [
+            _text_response(
+                f"Got it — I'll guide you through **{scholarship_name}**. "
+                "Upload the application form (PDF or DOCX) when you're ready."
+            )
+        ]
+        responses.extend(handle_start_application(student_id))
+        return responses
+
+    responses = [
+        _text_response(
+            f"Starting **{scholarship_name}**. "
+            "Upload the application form or paste the essay questions when ready."
+        )
+    ]
+    responses.extend(handle_start_draft(student_id, scholarship_id, scholarship_name))
+    return responses
+
+
+def _dispatch_intent(student_id: str, route: dict, original_text: str) -> list | None:
+    """Map routed intent to handler; return None to fall through to legacy routing."""
+    intent = route.get("intent", "unknown")
+    confidence = route.get("confidence", "low")
+    source = route.get("source", "")
+
+    if intent == "unknown":
+        return None
+    if confidence == "low" and source == "llm":
+        return None
+
+    if intent == "digest":
+        return handle_get_digest(student_id)
+    if intent == "scholarships":
+        return handle_get_scholarships(student_id)
+    if intent == "events":
+        return handle_get_events(student_id)
+    if intent == "inbox":
+        return handle_get_inbox(student_id)
+    if intent == "help":
+        return handle_agent_help(student_id)
+    if intent == "apply_scholarship":
+        query = route.get("scholarship_query") or original_text
+        return handle_apply_to_scholarship(student_id, query)
+    if intent == "profile_update":
+        return handle_profile_update(student_id, original_text)
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main router
 # ---------------------------------------------------------------------------
@@ -3551,6 +3859,12 @@ def handle_message(student_id: str, message: dict) -> list:
 
     if action == "cancel_calendar_add":
         return [_text_response("No problem — I did not add anything to your calendar.")]
+
+    if action == "confirm_email_calendar_add":
+        return handle_confirm_email_calendar_add(student_id, value)
+
+    if action == "cancel_email_calendar_add":
+        return [_text_response("No problem — I did not add that email to your calendar.")]
 
     if action == "edit_profile":
         if profile:
@@ -3735,22 +4049,35 @@ def handle_message(student_id: str, message: dict) -> list:
         return handle_get_inbox(student_id)
 
     if profile and profile.get("last_scholarship_id") and text:
-        digest_terms = ["digest", "update", "what's new", "show me", "opportunities"]
+        digest_terms = ["digest", "update", "what's new", "whats new", "opportunities", "brief me", "catch me up"]
         help_terms = ["hello", "hi", "hey", "start", "help"]
         if not any(kw in text for kw in digest_terms + help_terms):
             return handle_text_pasted(student_id, message.get("text") or "")
 
-    if any(kw in text for kw in ["digest", "update", "what's new", "show me", "opportunities"]):
+    digest_phrases = (
+        "digest", "full update", "my update", "what's new", "whats new",
+        "daily update", "weekly update", "catch me up", "brief me", "opportunities",
+    )
+    if any(phrase in text for phrase in digest_phrases):
         return handle_get_digest(student_id)
+
+    original_text = (message.get("text") or "").strip()
+    if profile and profile.get("onboarding_complete") and original_text:
+        routed = _dispatch_intent(student_id, route_message(original_text, profile), original_text)
+        if routed is not None:
+            return routed
 
     if any(kw in text for kw in ["draft", "apply", "application"]):
         return [_text_response(
-            "Which scholarship would you like to draft? "
-            "Tap 'Start Draft' on any scholarship card in your digest, "
-            "or tell me the scholarship name."
+            "Which scholarship would you like to work on? "
+            "Try *apply to Chen scholarship*, tap **Start Application** on a card, "
+            "or say *show scholarships* to browse matches."
         )]
 
-    if any(kw in text for kw in ["hello", "hi", "hey", "start", "help"]):
+    if text in ("help", "commands", "what can you do"):
+        return handle_agent_help(student_id)
+
+    if any(kw in text for kw in ["hello", "hi", "hey", "start"]):
         if not profile or not profile.get("onboarding_complete"):
             card = _build_onboarding_card()
             return [_card_response(
@@ -3758,8 +4085,7 @@ def handle_message(student_id: str, message: dict) -> list:
                 "and opportunities tailored to you, and help you apply. Let's get you set up:",
                 card
             )]
-        else:
-            return handle_get_digest(student_id)
+        return handle_get_digest(student_id)
 
     # Default — onboard new users, otherwise ask for clarification.
     if not profile or not profile.get("onboarding_complete"):
@@ -3771,8 +4097,12 @@ def handle_message(student_id: str, message: dict) -> list:
         )]
 
     return [_text_response(
-        "I didn't quite understand that.\n\n"
-        "Did you mean to update your profile, add a class to your timetable, add an event to your calendar, or see your daily digest?"
+        "I'm not sure yet — try asking in your own words, for example:\n"
+        "• *What's new this week?*\n"
+        "• *Apply to Chen scholarship*\n"
+        "• *Show scholarships* or *check my inbox*\n"
+        "• *Change my GPA to 3.8*\n\n"
+        "Type **help** to see everything I can do."
     )]
 
 # ---------------------------------------------------------------------------

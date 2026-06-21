@@ -671,6 +671,59 @@ def run_matching(student_id: str) -> dict:
     return result
 
 
+def find_scholarship_by_query(student_id: str, query: str, scholarship_result: dict | None = None) -> dict | None:
+    """
+    Resolve a scholarship name fragment to a match from cached or fresh results.
+    Returns the best matching scholarship dict, or None.
+    """
+    query = (query or "").strip().lower()
+    if not query:
+        return None
+
+    if scholarship_result is None:
+        profile = get_profile(student_id)
+        cache = (profile or {}).get("scholarship_cache") or {}
+        scholarship_result = cache.get("result") or {}
+        if not scholarship_result.get("apply_now") and not scholarship_result.get("prepare"):
+            try:
+                scholarship_result = run_matching(student_id)
+            except Exception as exc:
+                logger.warning("find_scholarship_by_query matching failed: %s", exc)
+                scholarship_result = {}
+
+    candidates: list[dict] = []
+    for tier in ("apply_now", "prepare"):
+        candidates.extend(scholarship_result.get(tier) or [])
+
+    chen_aliases = ("chen", "d. h. chen", "dh chen", "d h chen")
+    if any(alias in query for alias in chen_aliases):
+        for candidate in candidates:
+            cid = str(candidate.get("scholarship_id") or candidate.get("id") or "")
+            if cid == "ss_472" or candidate.get("is_prototype"):
+                return candidate
+        if _student_gpa(get_profile(student_id) or {}) >= 3.5:
+            return PROTOTYPE_SCHOLARSHIP_472.copy()
+
+    best: dict | None = None
+    best_score = 0
+    for candidate in candidates:
+        name = str(candidate.get("name") or "").lower()
+        if not name:
+            continue
+        if query in name:
+            score = 100 + len(query)
+        elif name in query:
+            score = 80
+        else:
+            tokens = [token for token in query.split() if len(token) >= 3]
+            score = sum(10 for token in tokens if token in name)
+        if score > best_score:
+            best_score = score
+            best = candidate
+
+    return best if best_score >= 10 else None
+
+
 # ---------------------------------------------------------------------------
 # Local test — run from hku_agent/ folder
 # ---------------------------------------------------------------------------

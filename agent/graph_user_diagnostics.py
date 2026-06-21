@@ -7,16 +7,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from agent.email_dedup import load_stored_fingerprints
+from agent.email_dedup import load_archived_fingerprints
 from agent.email_pipeline import fetch_inbox_candidates
 from agent.graph import (
     GraphApiError,
     calendar_events_to_blocked_slots,
+    get_agent_folder_stats,
     get_calendar_events,
     get_inbox_folder_stats,
     get_inbox_messages,
     get_me_profile,
-    hk_today_start_utc_iso,
 )
 from agent.graph_diagnostics import decode_jwt_payload
 
@@ -49,54 +49,42 @@ def _token_summary(user_token: str, profile: dict) -> dict:
 
 
 def _pipeline_filter_description(scan_mode: str) -> str:
-    if scan_mode == "initial_unread_scan":
-        return "isRead eq false, paginated (initial scan, max 500)"
-    return f"receivedDateTime ge {hk_today_start_utc_iso()} (today HKT, max 100)"
+    if scan_mode == "unread_scan":
+        return "isRead eq false, paginated (max 500)"
+    return scan_mode or "unread inbox"
 
 
 def _inbox_likely_causes(stats: dict) -> list[str]:
     causes = []
     candidates = int(stats.get("candidates_fetched") or 0)
-    skipped_processed = int(stats.get("skipped_already_processed") or 0)
-    scan_mode = stats.get("scan_mode") or ""
     folder_unread = stats.get("folder_unread")
     folder_total = stats.get("folder_total")
-    initial_complete = stats.get("inbox_initial_scan_complete")
+    archive_exists = stats.get("agent_archive_exists")
+    ambiguous_exists = stats.get("agent_ambiguous_exists")
 
-    if scan_mode == "initial_unread_scan":
-        if folder_unread == 0 and folder_total and folder_total > 0:
-            causes.append("Your inbox has messages, but **none are unread**. The first scan only processes unread mail.")
-        elif folder_unread == 0 and folder_total == 0:
-            causes.append("Graph returned an **empty inbox folder** for this signed-in account.")
-    else:
-        if candidates == 0:
-            causes.append("No messages **received today (HKT)** in inbox. Daily runs only look at today's mail after the first scan.")
+    if folder_unread == 0 and folder_total and folder_total > 0:
+        causes.append("Your inbox has messages, but **none are unread**. The pipeline only processes unread mail.")
+    elif folder_unread == 0 and folder_total == 0:
+        causes.append("Graph returned an **empty inbox folder** for this signed-in account.")
+    elif candidates == 0 and folder_unread and folder_unread > 0:
+        causes.append("Graph reports unread mail, but the unread query returned nothing — possible sync delay.")
 
-    if candidates > 0 and skipped_processed == candidates:
-        causes.append(
-            f"All **{candidates}** candidate message(s) were already in your processed list from a prior run."
-        )
-    elif candidates > 0 and skipped_processed > 0:
-        causes.append(
-            f"**{skipped_processed}** candidate message(s) were skipped as already processed; only new IDs are classified."
-        )
-
-    if not initial_complete:
-        causes.append("**First inbox scan not complete** — next run will paginate all unread messages.")
+    if archive_exists is False:
+        causes.append("**Agent Archived** folder not found yet — run **inbox** to create it when noise mail is archived.")
+    if ambiguous_exists is False:
+        causes.append("**Agent Ambiguous** folder not found yet — it is created on first ambiguous move.")
 
     if not causes:
-        causes.append("Graph is returning mail for this account. If counts are still zero, wait for new mail or run **inbox** again.")
+        causes.append(
+            "Unread mail is fetched each run. Duplicate re-sends (same sender + subject as archived mail) "
+            "are collapsed automatically — no message-ID blocklist."
+        )
     return causes
 
 
 def run_inbox_diagnostics(user_token: str, profile: dict) -> dict:
     """Inspect mailbox identity, folder counts, and pipeline visibility."""
-    processed_ids = profile.get("processed_email_ids") or []
-    if not isinstance(processed_ids, list):
-        processed_ids = []
-    processed_set = {str(eid) for eid in processed_ids if eid}
-    stored_fingerprints = load_stored_fingerprints(profile)
-    initial_complete = bool(profile.get("inbox_initial_scan_complete"))
+    archived_fingerprints = load_archived_fingerprints(profile)
 
     result = {
         "ok": True,
@@ -104,6 +92,7 @@ def run_inbox_diagnostics(user_token: str, profile: dict) -> dict:
         "account": {},
         "token": _token_summary(user_token, profile),
         "folder": {},
+        "agent_folders": [],
         "stats": {},
         "candidate_sample": [],
         "recent_sample": [],
@@ -133,6 +122,11 @@ def run_inbox_diagnostics(user_token: str, profile: dict) -> dict:
     except GraphApiError as exc:
         result["error"] = f"Inbox folder stats failed ({exc.status}): {exc.error_code or exc.error_message}"
 
+    try:
+        result["agent_folders"] = get_agent_folder_stats(user_token)
+    except GraphApiError:
+        pass
+
     candidates = []
     scan_mode = ""
     try:
@@ -142,46 +136,45 @@ def run_inbox_diagnostics(user_token: str, profile: dict) -> dict:
         result["error"] = result["error"] or f"Inbox fetch failed ({exc.status}): {exc.error_code or exc.error_message}"
         return result
 
-    skipped = 0
     for email in candidates:
         eid = str(email.get("id") or "")
-        if eid in processed_set:
-            skipped += 1
         result["candidate_sample"].append({
             "id": eid[:24] + "…" if len(eid) > 24 else eid,
             "subject": _shorten(email.get("subject", "")),
             "from": _sender_address(email),
             "received": (email.get("receivedDateTime") or "")[:19],
             "is_read": bool(email.get("isRead")),
-            "already_processed": eid in processed_set,
             "preview": _shorten(email.get("bodyPreview", ""), 100),
         })
 
     try:
         recent = get_inbox_messages(user_token, top=8, unread_only=False)
         for email in recent:
-            eid = str(email.get("id") or "")
             result["recent_sample"].append({
                 "subject": _shorten(email.get("subject", "")),
                 "from": _sender_address(email),
                 "received": (email.get("receivedDateTime") or "")[:19],
                 "is_read": bool(email.get("isRead")),
-                "already_processed": eid in processed_set,
             })
     except GraphApiError:
         pass
 
+    agent_folders = result.get("agent_folders") or []
+    archive_folder = next((f for f in agent_folders if f.get("name") == "Agent Archived"), {})
+    ambiguous_folder = next((f for f in agent_folders if f.get("name") == "Agent Ambiguous"), {})
+
     result["stats"] = {
-        "processed_ids_stored": len(processed_set),
-        "content_fingerprints_stored": len(stored_fingerprints),
-        "inbox_initial_scan_complete": initial_complete,
+        "archived_content_fingerprints": len(archived_fingerprints),
         "scan_mode": scan_mode,
         "candidates_fetched": len(candidates),
-        "skipped_already_processed": skipped,
-        "would_process_now": len(candidates) - skipped,
+        "would_process_now": len(candidates),
         "folder_total": result["folder"].get("total_item_count"),
         "folder_unread": result["folder"].get("unread_item_count"),
         "pipeline_filter": _pipeline_filter_description(scan_mode),
+        "agent_archive_exists": archive_folder.get("exists", False),
+        "agent_archive_total": archive_folder.get("total", 0),
+        "agent_ambiguous_exists": ambiguous_folder.get("exists", False),
+        "agent_ambiguous_total": ambiguous_folder.get("total", 0),
     }
     result["likely_causes"] = _inbox_likely_causes(result["stats"])
     return result
@@ -280,8 +273,6 @@ def format_inbox_diagnostics_report(data: dict) -> str:
     folder = data.get("folder") or {}
     stats = data.get("stats") or {}
     token = data.get("token") or {}
-    scan_mode = stats.get("scan_mode") or ""
-    mode_label = "first-time unread scan" if scan_mode == "initial_unread_scan" else "today's mail (HKT)"
 
     lines = [
         "**Inbox debug — what Graph sees**",
@@ -299,33 +290,41 @@ def format_inbox_diagnostics_report(data: dict) -> str:
         f"- Total messages: {folder.get('total_item_count', '?')}",
         f"- Unread (Graph folder stat): {folder.get('unread_item_count', '?')}",
         "",
-        "**Pipeline query**",
-        f"- Scan mode: **{mode_label}**",
-        f"- Initial scan complete: **{stats.get('inbox_initial_scan_complete', False)}**",
-        f"- Filter: `{stats.get('pipeline_filter', '')}`",
-        f"- Candidates fetched: **{stats.get('candidates_fetched', 0)}**",
-        f"- Already processed (skipped): **{stats.get('skipped_already_processed', 0)}**",
-        f"- Would process on next inbox run: **{stats.get('would_process_now', 0)}**",
-        f"- Processed IDs stored on profile: **{stats.get('processed_ids_stored', 0)}**",
-        f"- Content fingerprints stored: **{stats.get('content_fingerprints_stored', 0)}**",
+        "**Agent folders**",
     ]
 
+    agent_folders = data.get("agent_folders") or []
+    if agent_folders:
+        for item in agent_folders:
+            if item.get("exists"):
+                lines.append(
+                    f"- **{item.get('name')}**: {item.get('total', 0)} message(s) "
+                    f"({item.get('unread', 0)} unread)"
+                )
+            else:
+                lines.append(f"- **{item.get('name')}**: not created yet")
+    else:
+        lines.append("- (could not load agent folder stats)")
+
+    lines.extend([
+        "",
+        "**Pipeline query**",
+        f"- Filter: `{stats.get('pipeline_filter', '')}`",
+        f"- Unread candidates fetched: **{stats.get('candidates_fetched', 0)}**",
+        f"- Would classify on next inbox run: **{stats.get('would_process_now', 0)}**",
+        f"- Archived content fingerprints stored: **{stats.get('archived_content_fingerprints', 0)}** "
+        "(used for duplicate re-send detection, not message IDs)",
+    ])
+
     candidate_sample = data.get("candidate_sample") or []
-    sample_title = "Candidate messages (pipeline view)"
     if candidate_sample:
-        lines.extend(["", f"**{sample_title}**"])
+        lines.extend(["", "**Unread candidates (pipeline view)**"])
         for index, item in enumerate(candidate_sample[:8], start=1):
-            flags = []
-            if item.get("already_processed"):
-                flags.append("already processed")
-            if item.get("is_read"):
-                flags.append("marked read")
-            flag_text = f" ({', '.join(flags)})" if flags else ""
             lines.append(
-                f"{index}. **{item.get('subject')}** — {item.get('from')} · {item.get('received')}{flag_text}"
+                f"{index}. **{item.get('subject')}** — {item.get('from')} · {item.get('received')}"
             )
     else:
-        lines.extend(["", f"**{sample_title}:** none returned"])
+        lines.extend(["", "**Unread candidates:** none returned"])
 
     recent = data.get("recent_sample") or []
     if recent:

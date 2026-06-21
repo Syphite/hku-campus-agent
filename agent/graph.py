@@ -263,19 +263,97 @@ def get_inbox_messages(
     return resp.json().get("value", [])
 
 
+def is_protected_sender(email_address: str) -> bool:
+    """Check if sender should never be archived."""
+    addr = email_address.lower()
+    return any(p in addr for p in PROTECTED_SENDERS)
+
+
+def is_protected_email(sender: str, subject: str = "", preview: str = "") -> bool:
+    """Senders and CEDARS-on-behalf messages are never archived."""
+    if is_protected_sender(sender):
+        return True
+    text = f"{subject or ''} {preview or ''}".lower()
+    return "on behalf of cedars" in text
+
+
+def _list_mail_folders(user_token: str, parent_folder_id: str | None = None) -> list:
+    if parent_folder_id:
+        url = f"{ME_BASE}/mailFolders/{parent_folder_id}/childFolders"
+    else:
+        url = f"{ME_BASE}/mailFolders"
+    resp = _graph_request("GET", url, user_token=user_token, params={"$top": 100})
+    return resp.json().get("value", [])
+
+
+def find_mail_folder_id(user_token: str, display_name: str) -> str | None:
+    """Find a mail folder by display name anywhere under the mailbox root."""
+
+    def search(parent_id: str | None) -> str | None:
+        for folder in _list_mail_folders(user_token, parent_id):
+            if folder.get("displayName") == display_name:
+                return folder["id"]
+            child_id = search(folder["id"])
+            if child_id:
+                return child_id
+        return None
+
+    return search(None)
+
+
 def get_or_create_mail_folder(user_token: str, display_name: str) -> str:
+    existing = find_mail_folder_id(user_token, display_name)
+    if existing:
+        return existing
     url = f"{ME_BASE}/mailFolders"
-    resp = _graph_request("GET", url, user_token=user_token)
-    for folder in resp.json().get("value", []):
-        if folder.get("displayName") == display_name:
-            return folder["id"]
     resp = _graph_request(
         "POST",
         url,
         user_token=user_token,
         json_body={"displayName": display_name},
     )
-    return resp.json()["id"]
+    folder_id = resp.json().get("id")
+    if not folder_id:
+        raise GraphApiError(
+            f"Could not create mail folder {display_name}",
+            method="POST",
+            url=url,
+            status=resp.status_code,
+        )
+    logger.info("Created mail folder %s (%s)", display_name, folder_id)
+    return folder_id
+
+
+def ensure_agent_mail_folders(user_token: str) -> dict:
+    """Pre-create agent triage folders so both exist before moving mail."""
+    return {
+        "archive": get_or_create_mail_folder(user_token, AGENT_FOLDER_NOISE),
+        "ambiguous": get_or_create_mail_folder(user_token, AGENT_FOLDER_AMBIGUOUS),
+    }
+
+
+def get_agent_folder_stats(user_token: str) -> list[dict]:
+    """Return message counts for agent-managed folders (for diagnostics)."""
+    stats = []
+    for name in (AGENT_FOLDER_NOISE, AGENT_FOLDER_AMBIGUOUS):
+        folder_id = find_mail_folder_id(user_token, name)
+        if not folder_id:
+            stats.append({"name": name, "exists": False, "total": 0, "unread": 0})
+            continue
+        resp = _graph_request(
+            "GET",
+            f"{ME_BASE}/mailFolders/{folder_id}",
+            user_token=user_token,
+            params={"$select": "displayName,totalItemCount,unreadItemCount,id"},
+        )
+        folder = resp.json()
+        stats.append({
+            "name": folder.get("displayName") or name,
+            "exists": True,
+            "total": folder.get("totalItemCount", 0),
+            "unread": folder.get("unreadItemCount", 0),
+        })
+    return stats
 
 
 def get_or_create_archive_folder(user_token: str) -> str:
@@ -327,12 +405,6 @@ def restore_email(email_id: str, user_token: str) -> bool:
     except GraphApiError as exc:
         logger.error("restore_email failed: %s", exc.to_log_dict())
         return False
-
-
-def is_protected_sender(email_address: str) -> bool:
-    """Check if sender should never be archived."""
-    addr = email_address.lower()
-    return any(p in addr for p in PROTECTED_SENDERS)
 
 
 def get_calendar_events(

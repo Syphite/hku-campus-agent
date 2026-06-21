@@ -7,41 +7,38 @@ import logging
 
 from agent.classifier import classify_email
 from agent.email_dedup import (
-    append_fingerprints,
     check_duplicate,
     content_fingerprint,
-    load_stored_fingerprints,
+    load_archived_fingerprints,
     preview_signature,
+    record_archived_fingerprint,
 )
+from agent.email_calendar import enrich_inbox_with_calendar
 from agent.graph import (
     GraphApiError,
     archive_email,
+    ensure_agent_mail_folders,
     get_all_unread_emails,
-    get_inbox_messages_since,
-    hk_today_start_utc_iso,
-    is_protected_sender,
+    is_protected_email,
     move_to_ambiguous_folder,
 )
 from agent.profile import save_profile
 
 logger = logging.getLogger(__name__)
 
+SCAN_MODE = "unread_scan"
+
 
 def fetch_inbox_candidates(user_token: str, profile: dict) -> tuple[list, str]:
-    """
-    Initial run: all unread (paginated).
-    Later runs: messages received today (HKT) only.
-    """
-    if not profile.get("inbox_initial_scan_complete"):
-        return get_all_unread_emails(user_token), "initial_unread_scan"
-    since = hk_today_start_utc_iso()
-    return get_inbox_messages_since(user_token, since), "today_received"
+    """Always scan unread inbox messages (paginated)."""
+    del profile  # kept for API compatibility with diagnostics
+    return get_all_unread_emails(user_token), SCAN_MODE
 
 
 def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | None = None) -> dict:
     """
     Reads inbox, classifies emails, routes to folders.
-    Returns structured summary for digest.py.
+    Dedup is content-based (sender + subject), not Graph message IDs.
     """
     profile = profile or {}
     if not user_token:
@@ -49,6 +46,12 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             "Graph sign-in required",
             hint="Sign in with Microsoft to access your inbox.",
         )
+
+    try:
+        ensure_agent_mail_folders(user_token)
+    except GraphApiError as exc:
+        logger.error("Could not ensure agent mail folders: %s", exc.to_log_dict())
+        raise
 
     try:
         emails, scan_mode = fetch_inbox_candidates(user_token, profile)
@@ -60,19 +63,14 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
         )
         raise
 
-    processed_email_ids = profile.get("processed_email_ids", [])
-    if not isinstance(processed_email_ids, list):
-        processed_email_ids = []
-    processed_set = {str(eid) for eid in processed_email_ids if eid}
-    stored_fingerprints = load_stored_fingerprints(profile)
+    archived_fingerprints = load_archived_fingerprints(profile)
 
     archived_items = []
     relevant_items = []
     urgent_items = []
     ambiguous_items = []
     duplicate_items = []
-    newly_processed_ids = []
-    new_fingerprints: list[str] = []
+    skipped_duplicates = 0
 
     batch_fingerprints: set[str] = set()
     batch_previews: dict[str, str] = {}
@@ -83,7 +81,7 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
         preview = email.get("bodyPreview", "")
         eid = email.get("id", "")
 
-        if not eid or eid in processed_set:
+        if not eid:
             continue
 
         fingerprint = content_fingerprint(sender, subject)
@@ -91,15 +89,11 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             fingerprint,
             preview,
             batch_fingerprints=batch_fingerprints,
-            stored_fingerprints=stored_fingerprints,
+            archived_fingerprints=archived_fingerprints,
             batch_previews=batch_previews,
         )
         batch_fingerprints.add(fingerprint)
         batch_previews[fingerprint] = preview_signature(preview)
-
-        newly_processed_ids.append(eid)
-        processed_set.add(eid)
-        new_fingerprints.append(fingerprint)
 
         item = {
             "email_id": eid,
@@ -110,6 +104,11 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             "body_preview": preview,
         }
 
+        if is_protected_email(sender, subject, preview):
+            item["reason"] = "Protected sender or CEDARS message — kept in inbox"
+            urgent_items.append(item)
+            continue
+
         if is_dup:
             item["reason"] = dup_reason
             result = archive_email(eid, user_token)
@@ -117,13 +116,11 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
                 item["email_id"] = result.get("new_id") or eid
                 archived_items.append(item)
                 duplicate_items.append(item)
+                record_archived_fingerprint(profile, fingerprint)
+                archived_fingerprints.add(fingerprint)
             else:
+                skipped_duplicates += 1
                 ambiguous_items.append({**item, "reason": f"{dup_reason} (could not archive)"})
-            continue
-
-        if is_protected_sender(sender):
-            item["reason"] = "Protected sender — always kept in inbox"
-            urgent_items.append(item)
             continue
 
         result = classify_email(subject, preview, sender, profile)
@@ -135,6 +132,8 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             if move_result.get("success"):
                 item["email_id"] = move_result.get("new_id") or eid
                 archived_items.append(item)
+                record_archived_fingerprint(profile, fingerprint)
+                archived_fingerprints.add(fingerprint)
             else:
                 ambiguous_items.append({**item, "reason": "Classified as noise but could not archive."})
 
@@ -155,15 +154,17 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
         else:
             ambiguous_items.append(item)
 
+    enrich_inbox_with_calendar(urgent_items, relevant_items, profile, user_token)
+
     if profile.get("id"):
-        if newly_processed_ids:
-            profile["processed_email_ids"] = processed_email_ids + newly_processed_ids
-        append_fingerprints(profile, new_fingerprints)
-        if newly_processed_ids or not profile.get("inbox_initial_scan_complete"):
-            profile["inbox_initial_scan_complete"] = True
         save_profile(profile)
 
-    processed_count = len(newly_processed_ids)
+    processed_count = (
+        len(archived_items)
+        + len(urgent_items)
+        + len(relevant_items)
+        + len(ambiguous_items)
+    )
     kept_in_inbox = len(urgent_items) + len(relevant_items)
     return {
         "processed": processed_count,
@@ -173,6 +174,7 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
         "scan_mode": scan_mode,
         "candidates_fetched": len(emails),
         "duplicates_archived": len(duplicate_items),
+        "skipped_duplicates": skipped_duplicates,
         "archived_items": archived_items,
         "relevant_items": relevant_items,
         "urgent_items": urgent_items,

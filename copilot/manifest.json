@@ -43,6 +43,14 @@
               "description": "Show my latest scholarships, events and inbox summary"
             },
             {
+              "title": "What should I focus on?",
+              "description": "Proactive briefing with suggested next steps"
+            },
+            {
+              "title": "Apply to a scholarship",
+              "description": "Start a guided application by name"
+            },
+            {
               "title": "Show scholarships",
               "description": "Show scholarships I can apply for right now"
             },

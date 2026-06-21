@@ -129,6 +129,8 @@ def assemble_digest(
             "events_upcoming":      len(upcoming_events),
             "emails_processed":     inbox_summary.get("processed", 0),
             "emails_archived":      inbox_summary.get("archived", 0),
+            "inbox_urgent":         len(inbox_summary.get("urgent_items") or []),
+            "inbox_relevant":       len(inbox_summary.get("relevant_items") or []),
         }
     }
 
@@ -170,11 +172,18 @@ def format_digest_message(digest: dict) -> str:
         lines.append(
             f"📌 **{s['events_upcoming']} upcoming event(s)** worth bookmarking."
         )
+    if s.get("inbox_urgent", 0) > 0:
+        lines.append(
+            f"🚨 **{s['inbox_urgent']} urgent email(s)** — deadlines auto-added to your calendar; see action steps below."
+        )
+    if s.get("inbox_relevant", 0) > 0:
+        lines.append(
+            f"📌 **{s['inbox_relevant']} relevant email(s)** — talks and events with schedule checks; tap **Add to Calendar** if you want to register."
+        )
     if s["emails_processed"] > 0:
         lines.append(
             f"📬 **Inbox:** {s['emails_processed']} emails processed, "
-            f"{s['emails_archived']} archived. "
-            f"Your inbox is clean."
+            f"{s['emails_archived']} archived."
         )
     if len(lines) == 1:
         lines.append("Nothing new to report today — check back soon.")
