@@ -17,6 +17,7 @@ from openai import AzureOpenAI
 
 from agent.classifier import build_profile_keywords
 from agent.events.event_extractor import extract_events
+from agent.events.event_filters import filter_open_events
 from agent.profile import get_profile
 
 load_dotenv()
@@ -40,6 +41,106 @@ GENERIC_EVENT_TERMS = frozenset({
     "workshop", "seminar", "talk", "career fair", "networking", "opportunity",
     "event", "lecture", "webinar", "info session", "briefing",
 })
+
+_GRADUATE_ONLY_PHRASES = (
+    "graduate programme", "graduate program", "grad programme", "grad program",
+    "final year undergraduate", "final-year undergraduate", "final year undergraduates",
+    "fresh graduate", "fresh graduates", "penultimate year", "graduating class",
+    "campus hire", "graduate intake", "graduate recruitment",
+)
+
+
+def _normalize_year_token(value: str) -> str:
+    token = str(value or "").strip().lower()
+    if not token:
+        return ""
+    if token in {"year 1", "year1", "y1", "1st year", "first year"}:
+        return "1"
+    if token in {"year 2", "year2", "y2", "2nd year", "second year"}:
+        return "2"
+    if token in {"year 3", "year3", "y3", "3rd year", "third year"}:
+        return "3"
+    if token in {"year 4", "year4", "y4", "4th year", "fourth year", "final year", "final"}:
+        return "4"
+    if token in {"master", "masters", "postgraduate", "pg", "mphil", "phd"}:
+        return token
+    match = re.search(r"\b([1-4])\b", token)
+    if match and "year" in token:
+        return match.group(1)
+    if token.isdigit() and token in {"1", "2", "3", "4"}:
+        return token
+    return token
+
+
+def _student_is_early_undergrad(student_year: str) -> bool:
+    return _normalize_year_token(student_year) in {"1", "2", "3"}
+
+
+def _event_text_blob(event: dict) -> str:
+    return " ".join(
+        str(event.get(key) or "")
+        for key in ("title", "summary", "eligibility", "organiser", "type")
+    ).lower()
+
+
+def _is_graduate_or_final_year_event(event: dict) -> bool:
+    blob = _event_text_blob(event)
+    return any(phrase in blob for phrase in _GRADUATE_ONLY_PHRASES)
+
+
+def _event_year_tags(event: dict) -> set[str]:
+    tags = event.get("year_relevant") or event.get("year_tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    normalized = {_normalize_year_token(tag) for tag in tags if str(tag).strip()}
+    return {tag for tag in normalized if tag}
+
+
+def _event_year_eligible(event: dict, profile: dict) -> bool:
+    student_year = _normalize_year_token(_student_year(profile))
+    if not student_year:
+        return True
+
+    tags = _event_year_tags(event)
+    if _student_is_early_undergrad(student_year) and _is_graduate_or_final_year_event(event):
+        return False
+
+    if not tags or tags == {"all"}:
+        return True
+
+    specific = tags - {"all"}
+    if not specific:
+        return True
+
+    if student_year in specific:
+        return True
+
+    if student_year in {"1", "2", "3", "4"} and specific.intersection({"4", "master", "masters", "postgraduate", "pg"}):
+        return student_year == "4" and "4" in specific
+
+    return False
+
+
+def _reason_is_profile_grounded(reason: str, profile: dict) -> bool:
+    reason_lower = str(reason or "").strip().lower()
+    if not reason_lower:
+        return False
+
+    interests = [str(i).strip().lower() for i in (profile.get("interests") or []) if str(i).strip()]
+    activities = [str(a).strip().lower() for a in (profile.get("activities") or []) if str(a).strip()]
+    profile_terms = interests + activities
+
+    weak_only_phrases = (
+        "open to hku students in",
+        "relevant to ",
+        "listed in this week's campus events",
+    )
+    if any(phrase in reason_lower for phrase in weak_only_phrases):
+        return any(term in reason_lower for term in profile_terms)
+
+    if any(marker in reason_lower for marker in ("matches your interests", "related to your activity", "related to your cv")):
+        return True
+    return any(term in reason_lower for term in profile_terms)
 
 
 def _student_faculty(profile: dict) -> str:
@@ -68,12 +169,22 @@ def _faculty_matches(post: dict, student_faculty: str) -> bool:
 
 def _year_matches(post: dict, student_year: str) -> bool:
     tags = post.get("year_tags") or ["all"]
-    normalized = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
-    if not normalized or "all" in normalized:
+    normalized = {_normalize_year_token(tag) for tag in tags if str(tag).strip()}
+    normalized = {tag for tag in normalized if tag}
+    if not normalized or normalized == {"all"}:
         return True
     if not student_year:
         return True
-    return student_year in normalized
+
+    student = _normalize_year_token(student_year)
+    specific = normalized - {"all"}
+    if not specific:
+        return True
+    if student in specific:
+        return True
+    if student in {"1", "2", "3"} and specific.intersection({"4", "master", "masters", "postgraduate", "pg"}):
+        return False
+    return False
 
 
 def _post_search_text(post: dict) -> str:
@@ -146,14 +257,19 @@ def _score_post(post: dict, profile: dict, profile_keywords: list[str]) -> int:
             score += 3
 
     if _faculty_matches(post, _student_faculty(profile)):
-        score += 3
+        score += 2
     else:
         score -= 4
 
     if _year_matches(post, _student_year(profile)):
         score += 2
     else:
-        score -= 3
+        score -= 8
+
+    if _student_is_early_undergrad(_student_year(profile)) and _is_graduate_or_final_year_event(
+        {"title": post.get("raw_text", ""), "summary": post.get("raw_text", ""), "eligibility": post.get("raw_text", "")}
+    ):
+        score -= 10
 
     return score
 
@@ -207,6 +323,26 @@ def _compact_event(event: dict) -> dict:
     }
 
 
+def _passes_profile_fit(event: dict, profile: dict, *, min_term_hits: int = 1) -> bool:
+    if not _event_year_eligible(event, profile):
+        return False
+    blob = _event_text_blob(event)
+    match_terms = _profile_match_terms(profile)
+    hits = sum(
+        1 for term in match_terms
+        if term.lower() in blob and term.lower() not in GENERIC_EVENT_TERMS
+    )
+    interest_hits = _meaningful_term_hits(
+        [str(i) for i in (profile.get("interests") or [])],
+        blob,
+    )
+    activity_hits = _meaningful_term_hits(
+        [str(a) for a in (profile.get("activities") or [])],
+        blob,
+    )
+    return hits >= min_term_hits or bool(interest_hits) or bool(activity_hits)
+
+
 def stage2_reasoning(profile: dict, events: list) -> list[dict]:
     """LLM reasoning — keep strong personalized matches only."""
     if not events:
@@ -247,7 +383,14 @@ def stage2_reasoning(profile: dict, events: list) -> list[dict]:
                 continue
             enriched = deepcopy(event)
             enriched["match_strength"] = "strong"
-            enriched["match_reason"] = str(item.get("reason") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            if not _passes_profile_fit(event, profile):
+                continue
+            if not _reason_is_profile_grounded(reason, profile):
+                reason = _fallback_match_reason(event, profile, _event_text_blob(event))
+                if not _reason_is_profile_grounded(reason, profile):
+                    continue
+            enriched["match_reason"] = reason
             matched.append(enriched)
 
         if matched:
@@ -284,43 +427,31 @@ def _fallback_match_reason(event: dict, profile: dict, blob: str) -> str:
         return f"Related to your activity: {activity_hits[0][:80]}."
 
     cv_hits = _meaningful_term_hits(_profile_match_terms(profile), blob)
-    if cv_hits and not interests:
+    if cv_hits:
         return f"Related to your CV/experience: {cv_hits[0][:80]}."
 
-    student_faculty = _student_faculty(profile)
-    faculty_tags = event.get("faculty_relevant") or []
-    if _faculty_matches({"faculty_tags": faculty_tags}, student_faculty):
-        relevant = [
-            str(tag).strip()
-            for tag in faculty_tags
-            if str(tag).strip().lower() not in {"", "all"}
-        ]
-        if relevant:
-            return f"Relevant to {relevant[0]} students."
-        if student_faculty:
-            return f"Open to HKU students in {student_faculty.title()}."
-    return "Listed in this week's campus events."
+    return ""
 
 
 def _fallback_rank(profile: dict, events: list) -> list:
     """Heuristic fallback when LLM is unavailable."""
-    match_terms = _profile_match_terms(profile)
     ranked = []
     for event in events:
-        blob = " ".join(
-            str(event.get(key, "") or "")
-            for key in ("title", "summary", "eligibility", "organiser", "type")
-        ).lower()
-        hits = sum(1 for term in match_terms if term.lower() in blob and term.lower() not in GENERIC_EVENT_TERMS)
-        faculty_match = _faculty_matches(
-            {"faculty_tags": event.get("faculty_relevant") or ["all"]},
-            _student_faculty(profile),
+        if not _passes_profile_fit(event, profile):
+            continue
+        blob = _event_text_blob(event)
+        match_terms = _profile_match_terms(profile)
+        hits = sum(
+            1 for term in match_terms
+            if term.lower() in blob and term.lower() not in GENERIC_EVENT_TERMS
         )
-        if hits >= 1 or faculty_match:
-            copy = deepcopy(event)
-            copy["match_strength"] = "strong"
-            copy["match_reason"] = _fallback_match_reason(event, profile, blob)
-            ranked.append((hits, copy))
+        reason = _fallback_match_reason(event, profile, blob)
+        if not reason or not _reason_is_profile_grounded(reason, profile):
+            continue
+        copy = deepcopy(event)
+        copy["match_strength"] = "strong"
+        copy["match_reason"] = reason
+        ranked.append((hits, copy))
 
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [event for _, event in ranked[:MAX_RESULTS]]
@@ -337,7 +468,7 @@ def match_events_for_student(profile: dict, posts: list) -> list:
 
     matched = stage2_reasoning(profile, extracted)
     logger.info("Event stage 2: %s personalized matches from %s extracted", len(matched), len(extracted))
-    return matched
+    return filter_open_events(matched)
 
 
 def run_event_matching(student_id: str) -> list:

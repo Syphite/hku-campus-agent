@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from dotenv import load_dotenv
@@ -453,7 +454,11 @@ def _compact_profile_for_mapping(profile: dict) -> dict:
     }
 
 
-def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
+def suggest_profile_entries_for_gap(
+    gap: dict,
+    profile: dict,
+    used_entries: list[str] | None = None,
+) -> list[dict]:
     activity_blobs = extract_profile_activity_blobs(profile)
     if not activity_blobs or gap.get("type") != "repeating_list":
         return []
@@ -468,11 +473,13 @@ def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
         "instructions": schema.get("instructions") or "",
     }
     field_keys = list_entry_field_keys(schema)
+    used_lower = {str(item).strip().lower() for item in (used_entries or []) if str(item).strip()}
 
     prompt = _load_prompt("form_profile_section_map.txt").format(
         student_profile=json.dumps(_compact_profile_for_mapping(profile), ensure_ascii=False, indent=2),
         section_schema=json.dumps(section_payload, ensure_ascii=False, indent=2),
         field_keys=", ".join(field_keys),
+        used_entries=json.dumps(list(used_entries or []), ensure_ascii=False),
     )
     try:
         client = _get_openai_client()
@@ -496,6 +503,9 @@ def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
             entry = {key: str(mapped.get(key) or "").strip() for key in field_keys}
             if not any(entry.values()):
                 continue
+            source_text = str(item.get("source_text") or "").strip()
+            if source_text.lower() in used_lower:
+                continue
             for prog_key in field_keys:
                 if "programme" in prog_key.lower() or "qualification" in prog_key.lower():
                     if entry.get(prog_key):
@@ -514,7 +524,7 @@ def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
             desc_limit = int(schema.get("description_target_words") or 0)
             if desc_limit and entry.get("description"):
                 entry["description"] = draft_list_description(entry, profile, schema, desc_limit)
-            entry["_source_text"] = str(item.get("source_text") or "").strip()
+            entry["_source_text"] = source_text
             entry["_confidence"] = str(item.get("confidence") or "").strip()
             suggestions.append(entry)
             if len(suggestions) >= safe_max_rows(schema):
@@ -525,15 +535,58 @@ def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
         return []
 
 
-def build_profile_suggestions_for_gaps(gaps: list, profile: dict) -> dict:
+def profile_entry_usage_key(entry: dict) -> str:
+    """Stable key for deduping CV/profile items across form sections."""
+    source = str(entry.get("_source_text") or "").strip()
+    if source:
+        return source.lower()
+    parts = [
+        str(entry.get("organization") or entry.get("employer") or "").strip(),
+        str(entry.get("role") or entry.get("position") or entry.get("award") or "").strip(),
+        str(entry.get("dates") or entry.get("period") or "").strip(),
+    ]
+    return " | ".join(part for part in parts if part).lower()
+
+
+def filter_entries_by_used(entries: list[dict], used_entries: list[str] | None) -> tuple[list[dict], list[dict]]:
+    """Drop entries already assigned to another section."""
+    used_lower = {str(item).strip().lower() for item in (used_entries or []) if str(item).strip()}
+    kept, skipped = [], []
+    for entry in entries or []:
+        key = profile_entry_usage_key(entry)
+        if key and key in used_lower:
+            skipped.append(entry)
+            continue
+        kept.append(entry)
+    return kept, skipped
+
+
+def mark_entries_used(used_entries: list[str], entries: list[dict]) -> list[str]:
+    used = list(used_entries or [])
+    seen = {item.lower() for item in used}
+    for entry in entries or []:
+        key = profile_entry_usage_key(entry)
+        if key and key not in seen:
+            used.append(key)
+            seen.add(key)
+    return used
+
+
+def build_profile_suggestions_for_gaps(
+    gaps: list,
+    profile: dict,
+    used_entries: list[str] | None = None,
+) -> dict:
     suggestions = {}
+    used = list(used_entries or [])
     for gap in consolidate_collection_gaps(gaps):
         section_id = gap.get("section_id") or gap.get("key")
         if not section_id:
             continue
-        entries = suggest_profile_entries_for_gap(gap, profile)
+        entries = suggest_profile_entries_for_gap(gap, profile, used_entries=used)
         if entries:
             suggestions[section_id] = entries
+            used = mark_entries_used(used, entries)
     return suggestions
 
 
@@ -664,8 +717,7 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
             "label": label,
             "schema": field,
             "prompt": (
-                f"**{label}** — paste your answer, say **draft** for an AI draft from your profile and activities, "
-                "or **skip** to leave blank."
+                f"**{label}** — paste your answer below, or use **Draft from profile** / **Skip**."
             ),
         })
 
@@ -683,8 +735,7 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
             "label": label,
             "schema": field,
             "prompt": (
-                f"**{label}** — paste your answer, say **draft** for an AI draft from your profile and activities, "
-                "or **skip** to leave blank."
+                f"**{label}** — paste your answer below, or use **Draft from profile** / **Skip**."
             ),
         })
 
@@ -784,10 +835,7 @@ def build_section_prompt(gap: dict) -> str:
     if gap_type == "repeating_list":
         return build_list_section_prompt(gap)
     label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
-    return (
-        f"**{label}** — paste your answer, say **draft** for an AI draft from your profile and activities, "
-        "or **skip** to leave blank."
-    )
+    return f"**{label}** — paste your answer below, or use **Draft from profile** / **Skip**."
 
 
 DECLARATIONS_DOCX_NOTE = (
@@ -821,7 +869,7 @@ def build_gap_overview(schema: dict, filled_data: dict, gaps: list) -> str:
                 lines.append(f"{index}. {label} — up to {max_rows} entries (send all in one message)")
             elif gap_type in ("long_text", "free_field"):
                 short_label = label if len(label) <= 100 else f"{label[:97]}..."
-                lines.append(f"{index}. {short_label} — essay/open answer (**draft** or **skip** ok)")
+                lines.append(f"{index}. {short_label} — essay/open answer (use Draft or Skip)")
             else:
                 lines.append(f"{index}. {label}")
         lines.append("")
@@ -1063,6 +1111,84 @@ def draft_long_text(field_schema: dict, profile: dict, collected_lists: dict) ->
     if isinstance(parsed, dict):
         return str(parsed.get("text") or "").strip()
     return ""
+
+
+def _normalize_section_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", normalize_text(value)).strip()
+
+
+def resolve_approved_repeating_lists(
+    table_schema: dict,
+    pending_list_data: dict,
+    gap_queue: list | None = None,
+) -> tuple[dict[str, list], list[str]]:
+    """
+    Map approved pending_list_data keys onto schema repeating_list keys.
+    Returns (resolved_lists keyed by schema field key, warning messages).
+    """
+    pending = pending_list_data or {}
+    warnings: list[str] = []
+    resolved: dict[str, list] = {}
+
+    gap_index: dict[str, dict] = {}
+    for gap in consolidate_collection_gaps(gap_queue or []):
+        for key in gap_data_keys(gap):
+            gap_index[key] = gap
+
+    for field in table_schema.get("repeating_lists") or []:
+        schema_key = field.get("key")
+        if not schema_key:
+            continue
+
+        items = pending.get(schema_key)
+        if items:
+            resolved[schema_key] = list(items)
+            continue
+
+        label_norm = _normalize_section_label(field.get("label") or schema_key)
+        field_kind = field.get("list_kind") or infer_list_kind(field)
+        field_table = field.get("table_index")
+
+        matched_key = None
+        for pending_key, pending_items in pending.items():
+            if not pending_items:
+                continue
+            gap = gap_index.get(pending_key)
+            if gap:
+                gap_schema = gap.get("schema") or {}
+                gap_label = _normalize_section_label(gap.get("label") or pending_key)
+                gap_kind = gap_schema.get("list_kind") or infer_list_kind(gap_schema)
+                gap_table = gap_schema.get("table_index")
+                if gap_label == label_norm:
+                    matched_key = pending_key
+                    break
+                if gap_table == field_table and gap_kind == field_kind:
+                    matched_key = pending_key
+                    break
+            pending_norm = _normalize_section_label(pending_key)
+            if pending_norm == label_norm or label_norm in pending_norm or pending_norm in label_norm:
+                matched_key = pending_key
+                break
+
+        if matched_key:
+            resolved[schema_key] = list(pending[matched_key])
+            if matched_key != schema_key:
+                logger.info(
+                    "Resolved repeating list %s from approved key %s",
+                    schema_key,
+                    matched_key,
+                )
+                warnings.append(
+                    f"Mapped approved data from '{matched_key}' to form section '{schema_key}'."
+                )
+        elif any(pending.values()):
+            logger.warning(
+                "No approved data matched schema repeating list %s (%s)",
+                schema_key,
+                field.get("label"),
+            )
+
+    return resolved, warnings
 
 
 def merge_filled_data(

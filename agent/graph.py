@@ -156,7 +156,7 @@ def _graph_request(
 
 
 def get_unread_emails(user_token: str) -> list:
-    return get_all_unread_emails(user_token, max_messages=25)
+    return get_all_unread_emails(user_token)
 
 
 def hk_today_start_utc_iso() -> str:
@@ -169,14 +169,14 @@ def _graph_get_paged(
     url: str,
     *,
     params: dict | None = None,
-    max_messages: int = 500,
+    max_messages: int | None = None,
 ) -> list:
     headers = _delegated_headers(user_token)
     messages: list = []
     next_url: str | None = url
     next_params = params
 
-    while next_url and len(messages) < max_messages:
+    while next_url and (max_messages is None or len(messages) < max_messages):
         resp = requests.get(next_url, headers=headers, params=next_params, timeout=30)
         if not resp.ok:
             from agent.graph_diagnostics import parse_graph_error_response
@@ -199,10 +199,20 @@ def _graph_get_paged(
         next_url = data.get("@odata.nextLink")
         next_params = None
 
+    if max_messages is None:
+        return messages
     return messages[:max_messages]
 
 
-def get_all_unread_emails(user_token: str, *, max_messages: int = 500) -> list:
+def _sort_emails_newest_first(emails: list) -> list:
+    return sorted(
+        emails,
+        key=lambda email: email.get("receivedDateTime") or "",
+        reverse=True,
+    )
+
+
+def get_all_unread_emails(user_token: str, *, max_messages: int | None = None) -> list:
     url = f"{ME_BASE}/mailFolders/inbox/messages"
     params = {
         "$filter": "isRead eq false",
@@ -210,7 +220,8 @@ def get_all_unread_emails(user_token: str, *, max_messages: int = 500) -> list:
         "$select": MESSAGE_SELECT,
         "$orderby": "receivedDateTime desc",
     }
-    return _graph_get_paged(user_token, url, params=params, max_messages=max_messages)
+    emails = _graph_get_paged(user_token, url, params=params, max_messages=max_messages)
+    return _sort_emails_newest_first(emails)
 
 
 def get_inbox_messages_since(user_token: str, since_iso: str, *, max_messages: int = 100) -> list:
@@ -288,14 +299,57 @@ def _list_mail_folders(user_token: str, parent_folder_id: str | None = None) -> 
     return resp.json().get("value", [])
 
 
+def _deleted_items_folder_id(user_token: str) -> str | None:
+    try:
+        resp = _graph_request(
+            "GET",
+            f"{ME_BASE}/mailFolders/deleteditems",
+            user_token=user_token,
+            params={"$select": "id"},
+        )
+        return resp.json().get("id")
+    except GraphApiError:
+        return None
+
+
+def _folder_ids_under(user_token: str, root_folder_id: str) -> set[str]:
+    """All folder IDs in a subtree (including root)."""
+    ids = {root_folder_id}
+    stack = [root_folder_id]
+    while stack:
+        parent_id = stack.pop()
+        for folder in _list_mail_folders(user_token, parent_id):
+            folder_id = folder.get("id")
+            if folder_id and folder_id not in ids:
+                ids.add(folder_id)
+                stack.append(folder_id)
+    return ids
+
+
+def _deleted_items_subtree_ids(user_token: str) -> set[str]:
+    deleted_root = _deleted_items_folder_id(user_token)
+    if not deleted_root:
+        return set()
+    return _folder_ids_under(user_token, deleted_root)
+
+
 def find_mail_folder_id(user_token: str, display_name: str) -> str | None:
-    """Find a mail folder by display name anywhere under the mailbox root."""
+    """Find a mail folder by display name, excluding folders under Deleted Items."""
+    deleted_ids = _deleted_items_subtree_ids(user_token)
+
+    for folder in _list_mail_folders(user_token, None):
+        folder_id = folder.get("id")
+        if folder.get("displayName") == display_name and folder_id and folder_id not in deleted_ids:
+            return folder_id
 
     def search(parent_id: str | None) -> str | None:
         for folder in _list_mail_folders(user_token, parent_id):
+            folder_id = folder.get("id")
+            if not folder_id or folder_id in deleted_ids:
+                continue
             if folder.get("displayName") == display_name:
-                return folder["id"]
-            child_id = search(folder["id"])
+                return folder_id
+            child_id = search(folder_id)
             if child_id:
                 return child_id
         return None
@@ -485,6 +539,25 @@ def create_calendar_event(
         }
     except Exception as exc:
         logger.error("create_calendar_event error: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+def delete_calendar_event(user_token: str, event_id: str) -> dict:
+    """Delete an Outlook calendar event for the signed-in user."""
+    if not event_id:
+        return {"success": False, "error": "Missing calendar event id"}
+    url = f"{ME_BASE}/calendar/events/{event_id}"
+    try:
+        _graph_request("DELETE", url, user_token=user_token)
+        return {"success": True, "error": ""}
+    except GraphApiError as exc:
+        logger.error("delete_calendar_event failed: %s", exc.to_log_dict())
+        return {
+            "success": False,
+            "error": f"Could not delete calendar event ({exc.status}): {exc.error_code or exc.error_message}",
+        }
+    except Exception as exc:
+        logger.error("delete_calendar_event error: %s", exc)
         return {"success": False, "error": str(exc)}
 
 

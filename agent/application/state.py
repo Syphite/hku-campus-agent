@@ -44,6 +44,7 @@ def init_application_state(
         "ai_drafted_keys": [],
         "profile_suggestions": {},
         "suggestions_reviewed": [],
+        "used_profile_entries": [],
         "gap_queue": [],
         "current_gap": None,
         "form_json": None,

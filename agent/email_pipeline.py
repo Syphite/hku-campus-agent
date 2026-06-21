@@ -29,6 +29,25 @@ logger = logging.getLogger(__name__)
 SCAN_MODE = "unread_scan"
 
 
+def _dedupe_inbox_items(items: list[dict]) -> list[dict]:
+    """Collapse duplicate unread messages (same sender + subject)."""
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        fingerprint = content_fingerprint(item.get("from", ""), item.get("subject", ""))
+        email_id = str(item.get("email_id") or "").strip()
+        key = email_id or fingerprint
+        if key in seen:
+            continue
+        seen.add(key)
+        if fingerprint:
+            seen.add(fingerprint)
+        deduped.append(item)
+    return deduped
+
+
 def _parse_duplicate_result(result) -> tuple[bool, str]:
     """Normalize check_duplicate output — tolerate legacy bool-only returns."""
     if isinstance(result, tuple) and len(result) >= 2:
@@ -39,9 +58,9 @@ def _parse_duplicate_result(result) -> tuple[bool, str]:
 
 
 def fetch_inbox_candidates(user_token: str, profile: dict) -> tuple[list, str]:
-    """Always scan unread inbox messages (paginated)."""
+    """Fetch all unread inbox messages, newest first (fully paginated)."""
     del profile  # kept for API compatibility with diagnostics
-    return get_all_unread_emails(user_token), SCAN_MODE
+    return get_all_unread_emails(user_token, max_messages=None), SCAN_MODE
 
 
 def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | None = None) -> dict:
@@ -167,6 +186,9 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             ambiguous_items.append(item)
 
     enrich_inbox_with_calendar(urgent_items, relevant_items, profile, user_token)
+
+    urgent_items = _dedupe_inbox_items(urgent_items)
+    relevant_items = _dedupe_inbox_items(relevant_items)
 
     if profile.get("id"):
         save_profile(profile)

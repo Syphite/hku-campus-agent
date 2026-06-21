@@ -15,11 +15,17 @@ Return ONLY valid JSON:
 Rules:
 - Only suggest entries that clearly fit this section's list_kind and column headers.
 - Use mapped_fields keys from this list only: {field_keys}
-- For awards: dates = year (MM/YY), role = award name, organization = awarding unit.
-- For work: dates = period, organization = employer, role = position, employment_type = Part Time/Full Time/Internship, description = brief summary (max 50 words).
+- For awards: dates = year (MM/YY), role = award name, organization = awarding unit. Do NOT include jobs, internships, or volunteering in awards sections.
+- For work: dates = period, organization = employer, role = position, employment_type = Part Time/Full Time/Internship, description = brief summary (max 50 words). Do NOT reuse volunteer-only activities unless they were paid employment.
+- For volunteer / extra-curricular: do NOT reuse the same source_text as work experience unless the activity is clearly both (e.g. paid tutoring listed as work only).
+- Each CV/profile activity may appear in **at most one** section. Once used elsewhere, never suggest it again.
+- Do not suggest any entry whose source_text appears in the already-used list below.
 - Do not invent achievements not present in the student profile.
 - Return an empty suggestions array if nothing fits.
 - Prefer high-confidence matches only.
+
+Already used in other sections (do not re-suggest unless clearly a different category):
+{used_entries}
 
 Student profile:
 {student_profile}

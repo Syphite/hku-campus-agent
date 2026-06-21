@@ -58,7 +58,10 @@ def assemble_digest(
     # Split into: apply now (has deadline within 30 days or no deadline)
     # and upcoming (deadline further out)
     from datetime import date
+    from agent.events.event_filters import filter_open_events
+
     today = date.today()
+    events = filter_open_events(events, today=today)
 
     urgent_events  = []
     upcoming_events = []
@@ -80,6 +83,9 @@ def assemble_digest(
 
         if str(e.get("type", "")).lower() == "scholarship":
             # Scholarship applications are handled by Azure AI Search, not event feeds.
+            continue
+
+        if days_left is not None and days_left < 0:
             continue
 
         if days_left is not None and days_left <= 30:

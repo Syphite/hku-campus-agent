@@ -125,12 +125,12 @@ def heuristic_classify(subject, body_preview, sender, profile=None):
             return {
                 "label": "relevant",
                 "reason": f"ASSO_FORUM post matches your profile keywords: {', '.join(profile_hits[:4])}.",
-                "decisive": len(profile_hits) >= 2,
+                "decisive": True,
             }
         return {
-            "label": "ambiguous",
-            "reason": "ASSO_FORUM post may be useful, but it does not clearly match your interests or major.",
-            "decisive": False,
+            "label": "relevant",
+            "reason": "ASSO_FORUM post may be useful for HKU student life even without a direct profile keyword match.",
+            "decisive": True,
         }
 
     if urgent_hits:
@@ -155,14 +155,14 @@ def heuristic_classify(subject, body_preview, sender, profile=None):
         return {
             "label": "relevant",
             "reason": f"Matches your interests/major/year keywords: {', '.join(profile_hits[:4])}.",
-            "decisive": len(profile_hits) >= 2,
+            "decisive": len(profile_hits) >= 1,
         }
 
     if is_university_sender:
         return {
-            "label": "ambiguous",
-            "reason": "University sender, but the content is not clearly important for your profile.",
-            "decisive": False,
+            "label": "relevant",
+            "reason": "University sender — likely useful for HKU student life even without a direct profile keyword match.",
+            "decisive": True,
         }
 
     return {
@@ -190,7 +190,7 @@ Classify this email into exactly one label:
 - urgent: requires immediate action
 - relevant: useful for the student based on profile or student life
 - noise: promotional, spam, irrelevant mass email
-- ambiguous: unclear, needs human judgment
+- ambiguous: genuinely unclear — use sparingly when you cannot reasonably choose urgent, relevant, or noise
 
 Student profile:
 {json.dumps(profile_text, ensure_ascii=False, indent=2)}
@@ -205,8 +205,10 @@ Preview: {body_preview}
 
 Rules:
 - Use the student profile strongly.
-- ASSO_FORUM posts are often useful, but only mark them relevant when they match interests, major, year, or likely courses.
+- Prefer relevant over ambiguous for HKU/university mail that could plausibly matter to the student.
+- ASSO_FORUM posts are often useful; mark them relevant unless clearly spam or off-topic.
 - If the email is marketing/promo and not relevant to the profile, mark it noise.
+- Use ambiguous only when the email could go either way and human judgment is truly needed.
 - Return JSON only with keys: label, reason.
 """
 

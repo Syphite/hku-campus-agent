@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 
 from agent.application.cell_utils import is_empty_cell, normalize_text, texts_match
 from agent.application.fill_geometry import resolve_description_target, resolve_docx_table_target
 
 logger = logging.getLogger(__name__)
+
+_ROW_LABEL_RE = re.compile(r"^[A-Z]\d+$", re.IGNORECASE)
+
+
+def _is_row_label_cell(text: str) -> bool:
+    compact = normalize_text(text).replace(" ", "")
+    return bool(_ROW_LABEL_RE.match(compact))
 
 
 def _set_cell_text(cell, value: str) -> None:
@@ -73,12 +81,24 @@ def _fill_at_location(table, row_index: int, col_index: int, cells, fill_locatio
 
 def _find_header_row(table, headers: list[str]):
     normalized_headers = [normalize_text(header) for header in headers if header]
+    if len(normalized_headers) < 2:
+        return None
+
+    best_match = None
+    best_score = 0
     for row_index, row in enumerate(table.rows):
         cells = _row_cells(table, row_index)
         row_texts = [normalize_text(cell.text) for cell in cells]
-        if all(any(header in text or text in header for text in row_texts) for header in normalized_headers):
-            return row_index, cells
-    return None
+        if len([text for text in row_texts if text]) <= 1:
+            continue
+        score = 0
+        for header in normalized_headers:
+            if any(texts_match(header, text) for text in row_texts):
+                score += 1
+        if score >= 2 and score > best_score:
+            best_match = (row_index, cells)
+            best_score = score
+    return best_match
 
 
 def _header_column_map(cells, headers: list[str], item_fields: dict) -> dict:
@@ -87,6 +107,8 @@ def _header_column_map(cells, headers: list[str], item_fields: dict) -> dict:
     for logical_key, header_label in (item_fields or {}).items():
         header_norm = normalize_text(header_label)
         for col_index, text in enumerate(row_texts):
+            if col_index < len(cells) and _is_row_label_cell(cells[col_index].text):
+                continue
             if texts_match(header_label, text) or header_norm in text or text in header_norm:
                 mapping[logical_key] = col_index
                 break
@@ -99,15 +121,25 @@ def _is_description_row(cells) -> bool:
 
 
 def _next_empty_data_row(table, start_row: int, column_map: dict, max_rows: int, *, description_row: bool = False):
+    data_columns = sorted(set(column_map.values()))
+    if not data_columns:
+        return None
+
+    rows_checked = 0
     for row_index in range(start_row + 1, len(table.rows)):
+        if rows_checked >= max_rows:
+            break
         cells = _row_cells(table, row_index)
         if description_row and _is_description_row(cells):
             continue
         values = []
-        for col_index in column_map.values():
+        for col_index in data_columns:
             if col_index < len(cells):
                 values.append(cells[col_index].text)
-        if values and all(is_empty_cell(value) for value in values):
+        if not values:
+            continue
+        if all(is_empty_cell(value) for value in values):
+            rows_checked += 1
             return row_index, cells
     return None
 
@@ -135,10 +167,11 @@ def _fill_repeating_list(table, list_schema: dict, items: list[dict]) -> int:
 
     use_description_row = bool(list_schema.get("description_row"))
     filled = 0
+    last_row = header_row_index
     for item in items[:max_rows]:
         target = _next_empty_data_row(
             table,
-            header_row_index,
+            last_row,
             column_map,
             max_rows,
             description_row=use_description_row,
@@ -159,10 +192,20 @@ def _fill_repeating_list(table, list_schema: dict, items: list[dict]) -> int:
                 if target_cell is not None:
                     _set_cell_text(target_cell, description)
         filled += 1
+        last_row = row_index
+    if items and filled == 0:
+        logger.warning(
+            "Repeating list %s had %d items but filled 0 rows (table_index=%s, headers=%s, column_map=%s)",
+            list_schema.get("key"),
+            len(items),
+            list_schema.get("table_index"),
+            headers,
+            column_map,
+        )
     return filled
 
 
-def fill_docx_form(original_path: str, filled_data: dict, schema: dict, output_path: str | None = None) -> str:
+def fill_docx_form(original_path: str, filled_data: dict, schema: dict, output_path: str | None = None) -> tuple[str, dict]:
     from docx import Document
 
     if not os.path.exists(original_path):
@@ -175,6 +218,7 @@ def fill_docx_form(original_path: str, filled_data: dict, schema: dict, output_p
 
     doc = Document(target_path)
     tables = doc.tables
+    fill_report = {"repeating_lists": {}}
 
     for field in schema.get("simple_fields", []):
         table_index = int(field.get("table_index", 0))
@@ -244,11 +288,13 @@ def fill_docx_form(original_path: str, filled_data: dict, schema: dict, output_p
             continue
         items = (filled_data.get("repeating_lists") or {}).get(field.get("key"), [])
         if items:
-            _fill_repeating_list(tables[table_index], field, items)
+            field_key = field.get("key")
+            filled_count = _fill_repeating_list(tables[table_index], field, items)
+            fill_report["repeating_lists"][field_key] = filled_count
 
     doc.save(target_path)
     logger.info("Filled DOCX saved to %s", target_path)
-    return target_path
+    return target_path, fill_report
 
 
 def fill_free_fields_docx(

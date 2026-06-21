@@ -43,11 +43,24 @@ _AT_DATETIME = re.compile(
 _ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 
 _TALK_SESSION = re.compile(
-    r"(?:talk|seminar|workshop|lecture|briefing|info session|sharing session)"
+    r"(?:talk|seminar|workshop|lecture|briefing|info session|sharing session|oral examination)"
     r".{0,80}?"
     r"(?:on\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+"
     r"(january|february|march|april|may|june|july|august|september|october|november|december)"
     r"\s+(\d{1,2}),?\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})\s*(am|pm)",
+    re.IGNORECASE,
+)
+
+_DATE_TIME_LINE = re.compile(
+    r"date\s*/\s*time\s*:\s*"
+    r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+    r"\s+(\d{1,2})\s+"
+    r"(\d{4})"
+    r"(?:\s*\([a-z]{3,9}\))?"
+    r"\s+"
+    r"(\d{1,2}):(\d{2})\s*(am|pm)"
+    r"\s*[–\-—]\s*"
+    r"(\d{1,2}):(\d{2})\s*(am|pm)",
     re.IGNORECASE,
 )
 
@@ -92,6 +105,42 @@ def _build_deadline(month_name: str, day: int, year: int, hour: int, minute: int
     }
 
 
+def _build_event_range(
+    month_name: str,
+    day: int,
+    year: int,
+    start_hour: int,
+    start_minute: int,
+    start_meridiem: str,
+    end_hour: int,
+    end_minute: int,
+    end_meridiem: str,
+) -> dict | None:
+    month = _MONTHS.get(month_name.lower())
+    if not month:
+        return None
+    try:
+        start_hour, start_minute = _to_24h(start_hour, start_minute, start_meridiem)
+        end_hour, end_minute = _to_24h(end_hour, end_minute, end_meridiem)
+        start_dt = datetime(year, month, day, start_hour, start_minute, tzinfo=HK_TZ)
+        end_dt = datetime(year, month, day, end_hour, end_minute, tzinfo=HK_TZ)
+        if end_dt <= start_dt:
+            end_dt += timedelta(hours=1)
+    except ValueError:
+        return None
+    display = (
+        f"{start_dt.strftime('%B %d %Y (%a) %I:%M %p')} – "
+        f"{end_dt.strftime('%I:%M %p')} HKT"
+    )
+    return {
+        "start_iso": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "end_iso": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "deadline_display": display,
+        "deadline_date": start_dt.date().isoformat(),
+        "kind": "event",
+    }
+
+
 def extract_deadline(subject: str, preview: str) -> dict | None:
     text = f"{subject or ''}\n{preview or ''}"
     for pattern in (_DEADLINE_LINE, _AT_DATETIME):
@@ -118,6 +167,19 @@ def extract_deadline(subject: str, preview: str) -> dict | None:
 
 def extract_event_session(subject: str, preview: str) -> dict | None:
     text = f"{subject or ''}\n{preview or ''}"
+    match = _DATE_TIME_LINE.search(text)
+    if match:
+        return _build_event_range(
+            match.group(1),
+            int(match.group(2)),
+            int(match.group(3)),
+            int(match.group(4)),
+            int(match.group(5)),
+            match.group(6),
+            int(match.group(7)),
+            int(match.group(8)),
+            match.group(9),
+        )
     match = _TALK_SESSION.search(text)
     if not match:
         return None

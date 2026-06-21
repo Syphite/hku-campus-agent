@@ -68,12 +68,13 @@ def fill_application(
     output_path: str,
     merged_data: dict,
     content_type: str,
-) -> str:
+) -> tuple[str, dict]:
     """
     Fill an application form using table schema and free-field definitions.
 
-    Returns the output file path.
+    Returns (output file path, fill report).
     """
+    fill_report: dict = {"repeating_lists": {}}
     if not os.path.exists(input_path):
         raise FileNotFoundError(input_path)
 
@@ -88,9 +89,9 @@ def fill_application(
         fill_pdf_form(input_path, merged_data, table_schema, output_path)
         _fill_pdf_acroform_fields(output_path, free_field_defs, free_field_values)
     else:
-        fill_docx_form(input_path, merged_data, table_schema, output_path)
+        _, fill_report = fill_docx_form(input_path, merged_data, table_schema, output_path)
         fill_free_fields_docx(output_path, free_field_defs, free_field_values)
 
     if not os.path.exists(output_path):
         raise RuntimeError("Filled form was not created")
-    return output_path
+    return output_path, fill_report

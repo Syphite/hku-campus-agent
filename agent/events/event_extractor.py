@@ -14,6 +14,9 @@ import logging
 import os
 from datetime import datetime, timezone
 
+from agent.event_registration import normalize_event_calendar_fields
+from agent.events.event_filters import filter_open_events
+
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 
@@ -38,12 +41,15 @@ Keep eligibility and summary under 120 characters each.
 
 - is_relevant: true only if this is a genuine student event or opportunity such as a competition, hackathon, internship with a specific application deadline, workshop, talk, cultural programme, volunteering opportunity, career fair, recruitment event, or research opportunity. false if it is noise (food reviews, generic job ads for non-students, unrelated content).
 - Set is_relevant: false for posts primarily about scholarship applications. Scholarship matching comes from the Azure AI Search scholarship index, not social media scraping.
-- Set is_relevant: false for purely informational posts such as job recruitment timelines, general application calendars, or industry guides without one specific event/application workflow.
+- Set is_relevant: false for events whose application deadline or scheduled end date is already in the past.
 - type: "competition" | "hackathon" | "internship" | "workshop" | "talk" | "cultural_exchange" | "volunteering" | "career_fair" | "recruitment" | "research" | "other"
 - title: clean, concise event name
 - organiser: who is running it
 - deadline: application/registration deadline as ISO date YYYY-MM-DD (or null)
-- event_sessions: list of recurring session times if mentioned (e.g., [{{"day": "Tuesday", "start": "14:00", "end": "17:00", "label": "Team sessions"}}])
+- event_sessions: list of session times if mentioned. Use either:
+  * recurring weekday sessions: {{"day": "Tuesday", "start": "14:00", "end": "17:00", "label": "Team sessions"}}
+  * fixed calendar dates: {{"date": "2026-06-24", "end_date": "2026-06-25", "start": "19:00", "end": "19:00", "label": "Finals"}}
+  For multi-day events, set date to the start day and end_date to the end day with clock times.
 - eligibility: plain English description of who can apply (max 120 chars)
 - faculty_relevant: list of relevant faculties (e.g., ["Engineering", "all"])
 - year_relevant: list of eligible years (e.g., ["1", "2", "3", "4", "all"])
@@ -212,8 +218,11 @@ def _enrich_events(extracted: list, source_map: dict) -> list:
             event["source_url"] = orig.get("source_url", "")
             event["found_for"] = orig.get("found_for", "all")
             event["posted_date"] = orig.get("posted_date") or orig.get("received_date", "")
+            if not event.get("year_relevant"):
+                event["year_relevant"] = orig.get("year_tags") or ["all"]
+            event["_source_text"] = orig.get("raw_text", "")
         event["extracted_at"] = datetime.now(timezone.utc).isoformat()
-        results.append(event)
+        results.append(normalize_event_calendar_fields(event))
     return results
 
 
@@ -249,8 +258,14 @@ def extract_events(raw_items: list) -> list:
             logger.error("Event extraction error for batch %s-%s: %s", offset, offset + len(batch), exc)
 
     results = _enrich_events(all_extracted, source_map)
-    logger.info("Extracted %s relevant events from %s items", len(results), len(raw_items))
-    return results
+    open_results = filter_open_events(results)
+    logger.info(
+        "Extracted %s relevant events from %s items (%s still open)",
+        len(open_results),
+        len(raw_items),
+        len(open_results),
+    )
+    return open_results
 
 
 def extract_events_for_student(student_id: str) -> list:

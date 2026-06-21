@@ -50,7 +50,7 @@ def _token_summary(user_token: str, profile: dict) -> dict:
 
 def _pipeline_filter_description(scan_mode: str) -> str:
     if scan_mode == "unread_scan":
-        return "isRead eq false, paginated (max 500)"
+        return "isRead eq false, newest first, fully paginated (all unread)"
     return scan_mode or "unread inbox"
 
 

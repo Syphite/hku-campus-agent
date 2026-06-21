@@ -36,10 +36,14 @@ from agent.application.form_ai import (
     detect_gaps,
     draft_long_text,
     enrich_list_descriptions,
+    filter_entries_by_used,
     gap_data_keys,
+    infer_list_kind,
+    mark_entries_used,
     merge_filled_data,
     parse_application_collection,
     parse_list_entries_batch,
+    resolve_approved_repeating_lists,
     safe_max_rows,
 )
 from agent.application.fill_orchestrator import fill_application
@@ -54,12 +58,13 @@ from agent.digest   import assemble_digest, format_digest_message
 
 # Import event pipeline
 from agent.events.event_extractor  import extract_events_for_student
+from agent.event_registration import assess_registration_impact, apply_registration_calendar_changes, resolve_event_schedule
 from agent.conflict_checker        import run_conflict_checks_batch
 
 # Import email pipeline
 from agent.datetime_utils import normalize_time_hhmm
-from agent.email_events import inbox_items_to_events
-from agent.email_pipeline import run_inbox_pipeline
+from agent.events.event_filters import filter_open_events
+from agent.email_pipeline import _dedupe_inbox_items, run_inbox_pipeline
 from agent.intent_router import route_message
 from agent.proactive import format_digest_with_proactive, update_agent_snapshot
 from agent.storage.blob_storage import upload_filled_application
@@ -378,6 +383,18 @@ FIELD_LABELS = {
 }
 
 SENSITIVE_PROFILE_FIELDS = {"faculty", "programme", "year_of_study", "local_status"}
+
+
+def _profile_change_impact_message(field: str) -> str:
+    if field == "local_status":
+        return (
+            "This will affect your scholarship matches and may change event and inbox recommendations."
+        )
+    return (
+        "This will affect your scholarship matches, event recommendations, "
+        "and how your inbox is triaged."
+    )
+
 
 def _field_label(field: str) -> str:
     return FIELD_LABELS.get(field, str(field).replace("_", " ").title())
@@ -868,41 +885,7 @@ def _prefill_timetable_from_calendar(profile: dict, manual_slots: list, consent_
 
 def _event_to_calendar_times(event: dict) -> dict | None:
     """Derive concrete calendar start/end datetimes for an extracted event."""
-    sessions = event.get("event_sessions") or []
-    deadline = event.get("deadline")
-    now = _hk_now()
-
-    if sessions:
-        session = sessions[0]
-        day_name = (session.get("day") or "").strip()
-        start_time = _format_time_value(session.get("start", "09:00"))
-        end_time = _format_time_value(session.get("end", "10:00"))
-        target_weekday = _WEEKDAY_INDEX.get(day_name.lower())
-        if target_weekday is None:
-            return None
-        days_ahead = (target_weekday - now.weekday()) % 7
-        if days_ahead == 0 and now.strftime("%H:%M") >= start_time:
-            days_ahead = 7
-        event_date = (now + timedelta(days=days_ahead)).date()
-        return {
-            "start_iso": f"{event_date.isoformat()}T{start_time}:00",
-            "end_iso": f"{event_date.isoformat()}T{end_time}:00",
-            "display_date": event_date.strftime("%A, %d %B %Y"),
-            "display_time": f"{start_time}–{end_time}",
-        }
-
-    if deadline:
-        try:
-            event_date = datetime.strptime(str(deadline)[:10], "%Y-%m-%d").date()
-        except ValueError:
-            return None
-        return {
-            "start_iso": f"{event_date.isoformat()}T09:00:00",
-            "end_iso": f"{event_date.isoformat()}T10:00:00",
-            "display_date": event_date.strftime("%A, %d %B %Y"),
-            "display_time": "09:00–10:00",
-        }
-    return None
+    return resolve_event_schedule(event)
 
 def _format_event_datetime_display(start_iso: str, end_iso: str) -> str:
     try:
@@ -1091,43 +1074,77 @@ def _calendar_add_confirmation_card(data: dict) -> dict:
         ],
     }
 
-def _event_registration_confirmation_card(event_data: dict) -> dict:
+def _event_registration_confirmation_card(event_data: dict, impact: dict | None = None) -> dict:
     title = event_data.get("title", "Event")
     display_date = event_data.get("display_date", "")
     display_time = event_data.get("display_time", "")
+    impact = impact or {}
+    body = [
+        {
+            "type": "TextBlock",
+            "text": f"Confirm registration for **{title}**?",
+            "weight": "Bolder",
+            "wrap": True,
+        },
+        {
+            "type": "TextBlock",
+            "text": f"**When:** {display_time or display_date}",
+            "wrap": True,
+        },
+    ]
+    warnings = impact.get("warnings") or []
+    if warnings:
+        body.append({
+            "type": "TextBlock",
+            "text": "**Calendar check**",
+            "weight": "Bolder",
+            "wrap": True,
+        })
+        for warning in warnings[:4]:
+            body.append({
+                "type": "TextBlock",
+                "text": f"⚠️ {warning}",
+                "wrap": True,
+                "color": "Attention",
+                "size": "Small",
+            })
+        replace_events = impact.get("replace_events") or []
+        if replace_events:
+            body.append({
+                "type": "TextBlock",
+                "text": "If you confirm, I'll add this event to your calendar and remove the conflicting item(s) above.",
+                "wrap": True,
+                "size": "Small",
+            })
+    actions = [
+        {
+            "type": "Action.Submit",
+            "title": "✅ Confirm register",
+            "style": "positive",
+            "data": {
+                "action": "confirm_event_registration",
+                "event_id": event_data.get("event_id", ""),
+                "title": title,
+                "location": event_data.get("location", ""),
+                "start_iso": event_data.get("start_iso", ""),
+                "end_iso": event_data.get("end_iso", ""),
+                "display_date": display_date,
+                "display_time": display_time,
+                "replace_event_ids": impact.get("replace_event_ids") or [],
+            },
+        },
+        {
+            "type": "Action.Submit",
+            "title": "❌ Not now",
+            "data": {"action": "cancel_event_registration"},
+        },
+    ]
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
         "version": "1.4",
-        "body": [
-            {
-                "type": "TextBlock",
-                "text": f"Confirm registration for **{title}** on **{display_date}** at **{display_time}**?",
-                "wrap": True,
-            }
-        ],
-        "actions": [
-            {
-                "type": "Action.Submit",
-                "title": "✅ Yes",
-                "style": "positive",
-                "data": {
-                    "action": "confirm_event_registration",
-                    "event_id": event_data.get("event_id", ""),
-                    "title": title,
-                    "location": event_data.get("location", ""),
-                    "start_iso": event_data.get("start_iso", ""),
-                    "end_iso": event_data.get("end_iso", ""),
-                    "display_date": display_date,
-                    "display_time": display_time,
-                },
-            },
-            {
-                "type": "Action.Submit",
-                "title": "❌ No",
-                "data": {"action": "cancel_event_registration"},
-            },
-        ],
+        "body": body,
+        "actions": actions,
     }
 
 def _store_shown_events(profile: dict, events: list) -> None:
@@ -1183,11 +1200,21 @@ def _find_event_for_registration(profile: dict, text: str) -> dict | None:
             }
     return None
 
-def handle_start_event_registration(event_data: dict) -> list:
+def handle_start_event_registration(student_id: str, event_data: dict) -> list:
     if not event_data.get("start_iso") or not event_data.get("end_iso"):
         return [_text_response("I couldn't determine the event schedule for registration.")]
-    card = _event_registration_confirmation_card(event_data)
-    return [_card_response("Please confirm your registration.", card)]
+
+    profile = get_profile(student_id) or {}
+    user_token = get_graph_access_token(profile) if _has_calendar_consent(profile) else None
+    impact = assess_registration_impact(
+        user_token,
+        profile,
+        title=event_data.get("title", "Event"),
+        start_iso=event_data.get("start_iso", ""),
+        end_iso=event_data.get("end_iso", ""),
+    )
+    card = _event_registration_confirmation_card(event_data, impact)
+    return [_card_response("Review calendar impact before registering.", card)]
 
 def handle_confirm_event_registration(student_id: str, value: dict) -> list:
     profile = get_profile(student_id)
@@ -1217,12 +1244,34 @@ def handle_confirm_event_registration(student_id: str, value: dict) -> list:
         return [auth_required]
 
     user_token = get_graph_access_token(profile)
-    result = create_calendar_event(user_token, title, start_iso, end_iso, location)
+    replace_ids = value.get("replace_event_ids") or []
+    if isinstance(replace_ids, str):
+        try:
+            replace_ids = json.loads(replace_ids)
+        except json.JSONDecodeError:
+            replace_ids = [replace_ids] if replace_ids else []
+
+    result = apply_registration_calendar_changes(
+        user_token,
+        title=title,
+        start_iso=start_iso,
+        end_iso=end_iso,
+        location=location,
+        replace_event_ids=replace_ids,
+    )
     save_profile(profile)
-    if result.get("success"):
+    created = result.get("created") or {}
+    if created.get("success"):
         display = _format_event_datetime_display(start_iso, end_iso)
-        return [_text_response(f"✅ Added {title} to your calendar for {display}.")]
-    logger.error(f"Event registration calendar create failed: {result.get('error')}")
+        lines = [f"✅ Added **{title}** to your calendar ({display})."]
+        removed = result.get("removed_ids") or []
+        if removed:
+            lines.append(f"Removed {len(removed)} conflicting calendar item(s) to make room.")
+        errors = result.get("errors") or []
+        if errors:
+            lines.append(f"⚠️ Some calendar items could not be removed: {errors[0]}")
+        return [_text_response(" ".join(lines))]
+    logger.error(f"Event registration calendar create failed: {created.get('error')}")
     return [_text_response("I couldn't reach your calendar right now. Please try again later.")]
 
 def handle_confirm_calendar_add(student_id: str, value: dict) -> list:
@@ -1265,7 +1314,7 @@ def handle_event_registration(student_id: str, text: str) -> list:
             "I couldn't find that event. Try 'events' or your digest first, then say "
             "'register for [event name]'."
         )]
-    return handle_start_event_registration(event_data)
+    return handle_start_event_registration(student_id, event_data)
 
 PROFILE_UPDATE_SYSTEM_PROMPT = """You are an intelligent university campus agent. Analyze the user's message to determine their intent and extract relevant information.
 
@@ -1466,7 +1515,7 @@ def _profile_update_confirmation_card(field: str, old_value, new_value, operatio
             },
             {
                 "type": "TextBlock",
-                "text": "This will affect your scholarship matches.",
+                "text": _profile_change_impact_message(field),
                 "wrap": True,
                 "color": "Warning"
             }
@@ -1539,7 +1588,13 @@ def _strong_scholarships(scholarships: list) -> list:
         )
     )
 
-def _append_event_digest_sections(responses: list, events_dict: dict, limit: int = 3) -> None:
+def _append_event_digest_sections(
+    responses: list,
+    events_dict: dict,
+    limit: int = 3,
+    *,
+    include_inbox_events: bool = False,
+) -> None:
     urgent = events_dict.get("urgent") or []
     upcoming = events_dict.get("upcoming") or []
     email_urgent = [e for e in urgent if e.get("source") == "email"]
@@ -1547,7 +1602,7 @@ def _append_event_digest_sections(responses: list, events_dict: dict, limit: int
     external_urgent = [e for e in urgent if e.get("source") != "email"]
     external_upcoming = [e for e in upcoming if e.get("source") != "email"]
 
-    if email_urgent or email_upcoming:
+    if include_inbox_events and (email_urgent or email_upcoming):
         responses.append(_text_response("**From your inbox:**"))
         for event in (email_urgent + email_upcoming)[:limit]:
             card = _event_card(event)
@@ -1725,6 +1780,8 @@ def _event_card(event: dict) -> dict:
     }.get(event.get("type", "other"), "")
 
     deadline_value = event.get("deadline_display") or event.get("deadline") or "See event page"
+    has_schedule = bool(event.get("calendar_start_iso") or (event.get("event_sessions") and event.get("deadline_display")))
+    deadline_label = "When" if has_schedule else "Deadline"
     body = [
         {
             "type": "TextBlock",
@@ -1737,7 +1794,7 @@ def _event_card(event: dict) -> dict:
             "facts": [
                 {"title": "Type",       "value": event.get("type", " ").replace("_", " ").capitalize()},
                 {"title": "Organiser",  "value": event.get("organiser", " ")},
-                {"title": "Deadline",   "value": deadline_value},
+                {"title": deadline_label, "value": deadline_value},
                 {"title": "Location",   "value": event.get("location", " ")},
             ]
         },
@@ -2001,8 +2058,8 @@ def _inbox_relevant_card(item: dict) -> dict:
 def _append_inbox_calendar_sections(responses: list, inbox_summary: dict | None) -> None:
     if not inbox_summary:
         return
-    urgent = inbox_summary.get("urgent_items") or []
-    relevant = inbox_summary.get("relevant_items") or []
+    urgent = _dedupe_inbox_items(inbox_summary.get("urgent_items") or [])
+    relevant = _dedupe_inbox_items(inbox_summary.get("relevant_items") or [])
     if urgent:
         responses.append(_text_response("**🚨 Urgent emails — action needed:**"))
         for item in urgent[:5]:
@@ -2376,7 +2433,7 @@ def handle_get_digest(student_id: str) -> list:
                     inbox_summary.get("urgent_items") or [],
                     inbox_summary.get("relevant_items") or [],
                 )
-            combined = list(raw_events) + email_events
+            combined = dedupe_events(filter_open_events(list(raw_events) + email_events))
             checked_events = run_conflict_checks_batch(combined, profile)
             _store_shown_events(profile, checked_events)
             save_profile(profile)
@@ -2690,8 +2747,25 @@ def _gap_for_section_id(state: dict, section_id: str) -> dict | None:
 
 
 def _store_gap_value(mapping: dict, gap: dict, value) -> None:
-    for key in gap_data_keys(gap):
-        mapping[key] = value
+    primary = gap.get("key")
+    if not primary:
+        return
+    mapping[primary] = value
+
+    primary_schema = gap.get("schema") or {}
+    primary_table = primary_schema.get("table_index")
+    primary_kind = primary_schema.get("list_kind") or infer_list_kind(primary_schema)
+
+    for variant in gap.get("schema_variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        variant_key = variant.get("key")
+        if not variant_key or variant_key == primary:
+            continue
+        variant_table = variant.get("table_index")
+        variant_kind = variant.get("list_kind") or infer_list_kind(variant)
+        if variant_table == primary_table and variant_kind == primary_kind:
+            mapping[variant_key] = value
 
 
 def _long_text_gaps(gaps: list) -> list:
@@ -2981,8 +3055,27 @@ def _application_review_card(scholarship_id: str, scholarship_name: str, state: 
 
 
 def _section_collection_message(gap: dict) -> dict:
-    """Single message: section prompt as text + skip button card (no duplicate TextBlock)."""
+    """Single message: section prompt as text + action buttons."""
     prompt = build_section_prompt(gap)
+    section_id = _section_storage_id(gap)
+    actions = []
+    if gap.get("type") in ("long_text", "free_field"):
+        actions.append({
+            "type": "Action.Submit",
+            "title": "Draft from profile",
+            "data": {
+                "action": "draft_application_section",
+                "section_key": section_id,
+            },
+        })
+    actions.append({
+        "type": "Action.Submit",
+        "title": "Skip this section",
+        "data": {
+            "action": "skip_application_section",
+            "section_key": section_id,
+        },
+    })
     return {
         "type": "message",
         "text": f"**Current section**\n\n{prompt}",
@@ -2993,27 +3086,32 @@ def _section_collection_message(gap: dict) -> dict:
                     "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                     "type": "AdaptiveCard",
                     "version": "1.4",
-                    "actions": [
-                        {
-                            "type": "Action.Submit",
-                            "title": "Skip this section",
-                            "data": {
-                                "action": "skip_application_section",
-                                "section_key": _section_storage_id(gap),
-                            },
-                        }
-                    ],
+                    "actions": actions,
                 },
             }
         ],
     }
 
 
+def _filter_used_profile_suggestions(suggestions: list, used_entries: list | None) -> list:
+    used_lower = {str(item).strip().lower() for item in (used_entries or []) if str(item).strip()}
+    if not used_lower:
+        return list(suggestions or [])
+    filtered = []
+    for entry in suggestions or []:
+        source = str(entry.get("_source_text") or "").strip().lower()
+        if source and source in used_lower:
+            continue
+        filtered.append(entry)
+    return filtered
+
+
 def _section_prompt_response(profile: dict, gap: dict, state: dict | None = None) -> list:
     state = state or {}
     section_id = _section_storage_id(gap)
     reviewed = set(state.get("suggestions_reviewed") or [])
-    suggestions = (state.get("profile_suggestions") or {}).get(section_id) or []
+    cached = (state.get("profile_suggestions") or {}).get(section_id) or []
+    suggestions = _filter_used_profile_suggestions(cached, state.get("used_profile_entries"))
     if gap.get("type") == "repeating_list" and suggestions and section_id not in reviewed:
         return [_card_response("Include from profile?", _profile_suggestions_card(gap, suggestions))]
 
@@ -3041,18 +3139,41 @@ def _accept_profile_suggestions(profile: dict, state: dict, section_id: str) -> 
         return _section_prompt_response(profile, current_gap, get_application_state(profile))
 
     cleaned = []
+    used_entries = list(state.get("used_profile_entries") or [])
     for entry in suggestions:
         cleaned.append({k: v for k, v in entry.items() if not str(k).startswith("_")})
 
+    kept, skipped = filter_entries_by_used(cleaned, used_entries)
+    if not kept:
+        if skipped:
+            _mark_suggestion_reviewed(profile, section_id)
+            return [_text_response(
+                "Those profile entries are already used in another section. "
+                "Paste different entries or say **skip**."
+            )] + _section_prompt_response(profile, state.get("current_gap") or {}, get_application_state(profile))
+        _mark_suggestion_reviewed(profile, section_id)
+        current_gap = state.get("current_gap") or {}
+        return _section_prompt_response(profile, current_gap, get_application_state(profile))
+
+    used_entries = mark_entries_used(used_entries, kept)
+
     gap = _gap_for_section_id(state, section_id) or state.get("current_gap") or {}
     pending_list_data = dict(state.get("pending_list_data") or {})
-    _store_gap_value(pending_list_data, gap, cleaned)
+    _store_gap_value(pending_list_data, gap, kept)
     _mark_suggestion_reviewed(profile, section_id)
-    update_application_state(profile, pending_list_data=pending_list_data)
+    update_application_state(
+        profile,
+        pending_list_data=pending_list_data,
+        used_profile_entries=used_entries,
+    )
     save_profile(profile)
 
     label = gap.get("label") or section_id.replace("_", " ")
-    responses = [_text_response(f"Added {len(cleaned)} entr{'y' if len(cleaned) == 1 else 'ies'} from your profile for **{label}**.")]
+    responses = [_text_response(f"Added {len(kept)} entr{'y' if len(kept) == 1 else 'ies'} from your profile for **{label}**.")]
+    if skipped:
+        responses.append(_text_response(
+            f"Skipped {len(skipped)} entr{'y' if len(skipped) == 1 else 'ies'} already used in another section."
+        ))
     responses.extend(_advance_application_gap(profile, get_application_state(profile)))
     return responses
 
@@ -3130,12 +3251,30 @@ def _fill_current_section(profile: dict, state: dict, current_gap: dict, user_te
             if _looks_like_section_advance(text_value):
                 return _skip_current_section(profile, state)
             return _section_prompt_response(profile, current_gap, state)
+        used_entries = list(state.get("used_profile_entries") or [])
+        entries, skipped = filter_entries_by_used(entries, used_entries)
+        if not entries:
+            if skipped:
+                return [_text_response(
+                    "That entry is already listed in another section. "
+                    "Paste a different item or say **skip**."
+                )] + _section_prompt_response(profile, current_gap, state)
+            return _section_prompt_response(profile, current_gap, state)
+        used_entries = mark_entries_used(used_entries, entries)
         pending_list_data = dict(state.get("pending_list_data") or {})
         _store_gap_value(pending_list_data, current_gap, entries)
-        update_application_state(profile, pending_list_data=pending_list_data)
+        update_application_state(
+            profile,
+            pending_list_data=pending_list_data,
+            used_profile_entries=used_entries,
+        )
         save_profile(profile)
         label = current_gap.get("label") or list_key.replace("_", " ")
         responses = [_text_response(f"Got {len(entries)} {label} entr{'y' if len(entries) == 1 else 'ies'}.")]
+        if skipped:
+            responses.append(_text_response(
+                f"Skipped {len(skipped)} duplicate entr{'y' if len(skipped) == 1 else 'ies'} already used elsewhere."
+            ))
         responses.extend(_advance_application_gap(profile, get_application_state(profile)))
         return responses
 
@@ -3443,15 +3582,37 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
         "free_fields": [],
     }
     table_schema = form_plan.get("table_schema") or state.get("schema") or {}
+    pending_lists = state.get("pending_list_data") or {}
+    resolved_lists, _resolve_warnings = resolve_approved_repeating_lists(
+        table_schema,
+        pending_lists,
+        state.get("gap_queue"),
+    )
+    repeating = dict(merged_data.get("repeating_lists") or {})
+    repeating.update(resolved_lists)
+    merged_data["repeating_lists"] = repeating
     merged_data = enrich_list_descriptions(merged_data, table_schema, profile)
 
+    fill_warnings: list[str] = []
     try:
-        fill_application(form_plan, input_path, output_path, merged_data, content_type)
+        _, fill_report = fill_application(form_plan, input_path, output_path, merged_data, content_type)
     except Exception as exc:
         logger.error(f"Application form fill failed: {exc}")
         return [_text_response(
             "I couldn't fill that form template. Please try uploading the form again."
         )]
+
+    for field in table_schema.get("repeating_lists") or []:
+        schema_key = field.get("key")
+        if not schema_key:
+            continue
+        label = field.get("label") or schema_key.replace("_", " ").title()
+        approved_items = resolved_lists.get(schema_key) or pending_lists.get(schema_key) or []
+        filled_count = (fill_report.get("repeating_lists") or {}).get(schema_key, 0)
+        if approved_items and filled_count == 0:
+            fill_warnings.append(
+                f"**{label}** could not be written to the form table — please check the downloaded file."
+            )
 
     if not os.path.exists(output_path):
         return [_text_response("The filled form could not be generated. Please try again.")]
@@ -3468,23 +3629,33 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
     save_profile(profile)
 
     if download_url:
+        card_body = [
+            {
+                "type": "TextBlock",
+                "text": "✅ Your filled application is ready!",
+                "weight": "Bolder",
+                "size": "Large",
+            },
+            {
+                "type": "TextBlock",
+                "text": "Click the button below to download your completed form.",
+                "wrap": True,
+            },
+        ]
+        if fill_warnings:
+            card_body.append(
+                {
+                    "type": "TextBlock",
+                    "text": "⚠️ " + " ".join(fill_warnings),
+                    "wrap": True,
+                    "color": "Attention",
+                }
+            )
         card = {
             "type": "AdaptiveCard",
             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
             "version": "1.4",
-            "body": [
-                {
-                    "type": "TextBlock",
-                    "text": "✅ Your filled application is ready!",
-                    "weight": "Bolder",
-                    "size": "Large",
-                },
-                {
-                    "type": "TextBlock",
-                    "text": "Click the button below to download your completed form.",
-                    "wrap": True,
-                },
-            ],
+            "body": card_body,
             "actions": [
                 {
                     "type": "Action.OpenUrl",
@@ -3503,12 +3674,16 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
         logger.error("Could not read filled form at %s: %s", output_path, exc)
         return [_text_response("The filled form was created but could not be read for download. Please try again.")]
 
+    download_text = "Approved! Your filled application form is ready — use the attachment below to download it."
+    if fill_warnings:
+        download_text += "\n\n⚠️ " + " ".join(fill_warnings)
+
     return [
         _file_download_response(
             download_name,
             file_bytes,
             download_type,
-            text="Approved! Your filled application form is ready — use the attachment below to download it.",
+            text=download_text,
         )
     ]
 
@@ -3977,14 +4152,17 @@ def handle_message(student_id: str, message: dict) -> list:
         if profile and field:
             _apply_profile_update(profile, field, new_value, operation)
             save_profile(profile)
-            return [_text_response(f"✅ Updated! Your {_field_label(field)} is now {new_value}.")]
+            message = f"✅ Updated! Your {_field_label(field)} is now {new_value}."
+            if field in SENSITIVE_PROFILE_FIELDS:
+                message += " Run **digest** to refresh scholarships, events, and inbox."
+            return [_text_response(message)]
         return [_text_response("Could not apply that profile change.")]
 
     if action == "cancel_profile_update":
         return [_text_response("No problem — I cancelled that profile change.")]
 
     if action == "start_event_registration":
-        return handle_start_event_registration(value)
+        return handle_start_event_registration(student_id, value)
 
     if action == "confirm_event_registration":
         return handle_confirm_event_registration(student_id, value)
@@ -4030,6 +4208,19 @@ def handle_message(student_id: str, message: dict) -> list:
                 _mark_suggestion_reviewed(profile, section_id)
             return _skip_current_section(profile, state, "Skipped this section.")
         return [_text_response("No section is active to skip right now.")]
+
+    if action == "draft_application_section":
+        profile = get_profile(student_id)
+        if profile and get_application_state(profile).get("step") == "collecting_list":
+            state = get_application_state(profile)
+            current_gap = state.get("current_gap") or {}
+            section_id = value.get("section_key") or _section_storage_id(current_gap)
+            if section_id and _section_storage_id(current_gap) != section_id:
+                matched = _gap_for_section_id(state, section_id)
+                if matched:
+                    current_gap = matched
+            return _draft_current_section(profile, state, current_gap)
+        return [_text_response("No section is active to draft right now.")]
 
     if action == "accept_profile_suggestions":
         profile = get_profile(student_id)

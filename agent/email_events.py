@@ -110,19 +110,49 @@ def inbox_item_to_event(item: dict) -> dict | None:
     }
 
 
+def _event_dedupe_key(event: dict) -> str:
+    if event.get("source") == "email":
+        email_id = str(event.get("email_id") or "").strip()
+        if email_id:
+            return f"email:{email_id}"
+        return f"email:{str(event.get('title') or '').strip().lower()}"
+    source_id = str(event.get("source_id") or event.get("id") or "").strip()
+    if source_id:
+        return source_id.lower()
+    return str(event.get("title") or "").strip().lower()
+
+
+def dedupe_events(events: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        key = _event_dedupe_key(event)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(event)
+    return deduped
+
+
 def inbox_items_to_events(urgent_items: list, relevant_items: list) -> list[dict]:
     """Build event list from inbox urgent + relevant items (deduped by email_id)."""
     events = []
     seen_ids = set()
+    seen_fingerprints = set()
     for item in (urgent_items or []) + (relevant_items or []):
         if not isinstance(item, dict):
             continue
         email_id = item.get("email_id")
-        if email_id in seen_ids:
+        fingerprint = f"{str(item.get('from') or '').lower()}|{str(item.get('subject') or '').lower()}"
+        if email_id in seen_ids or fingerprint in seen_fingerprints:
             continue
         event = inbox_item_to_event(item)
         if not event:
             continue
-        seen_ids.add(email_id)
+        if email_id:
+            seen_ids.add(email_id)
+        seen_fingerprints.add(fingerprint)
         events.append(event)
     return events

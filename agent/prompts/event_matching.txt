@@ -7,8 +7,12 @@ You will be given:
 1. A student profile (faculty, programme, year, interests, activities, CV excerpt)
 2. A list of structured event candidates that already passed keyword pre-filtering
 
-For each event, assess fit based on eligibility, faculty/year alignment, skills,
+For each event, assess fit based on eligibility, year alignment, skills,
 interests, activities, and CV content. Ignore scholarship-only posts (those are handled elsewhere).
+
+Use common sense about student stage:
+- Year 1–3 undergraduates should NOT get graduate programmes, final-year-only recruitment, or fresh-graduate hiring unless the event explicitly welcomes their year.
+- A shared faculty alone is NOT enough — the student needs a plausible interest, activity, skill, or CV link.
 
 ---
 
@@ -30,10 +34,10 @@ Return ONLY a valid JSON array. Each item must include:
 
 Rules:
 - Output ONLY events where is_relevant is true AND match_strength is "strong"
-- Prefer events aligned with the student's faculty, year, interests, activities, or CV
-- The reason MUST cite a specific profile field (e.g. an interest, CV phrase, programme, faculty, activity)
-- Do NOT use generic event-type words alone (workshop, seminar, talk) as the reason
-- Exclude events clearly aimed at wrong year (e.g. final-year-only for a Year 1 student)
+- The reason MUST cite a specific interest, activity, CV phrase, skill, or programme focus — NOT faculty alone
+- Do NOT use reasons like "Open to HKU students in [Faculty]" or "Relevant to [Faculty] students"
+- Exclude graduate programmes / Big Four graduate intake / final-year-only posts for Year 1–3 students
+- Exclude events clearly aimed at the wrong year even if faculty matches
 - Exclude generic noise, food reviews, or mass recruitment with no student angle
 - Do not invent eligibility requirements not present in the candidate data
 - Preserve source_id exactly so results can be merged back
@@ -44,6 +48,6 @@ Example output:
     "source_id": "li_001",
     "is_relevant": true,
     "match_strength": "strong",
-    "reason": "Matches your CS programme and hackathon activity; open to all HK undergraduates."
+    "reason": "Matches your interest in AI and hackathon experience; open to all HK undergraduates."
   }}
 ]

@@ -100,7 +100,7 @@ def main() -> int:
 
     output_path = "/tmp/smoke_filled_application.docx"
     merged = merge_filled_data(filled_data, filled_data.get("repeating_lists", {}), {})
-    result_path = fill_docx_form(fixture, merged, schema, output_path)
+    result_path, _fill_report = fill_docx_form(fixture, merged, schema, output_path)
     print(f"Filled form written to: {result_path}")
     return 0
 
