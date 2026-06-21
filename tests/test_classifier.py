@@ -81,5 +81,21 @@ class HeuristicClassifierTests(unittest.TestCase):
         self.assertEqual(result["label"], "noise")
 
 
+    def test_catholic_society_not_relevant_for_ai_lab_profile(self):
+        profile = {
+            "interests": ["AI", "robotics"],
+            "academic": {"programme": "Bachelor of Science in Computer Science"},
+        }
+        subject = "Catholic Society- Lecture Series , June Talk | 六月講座"
+        preview = "Monthly lecture series for students."
+        result = classify_email(subject, preview, "club@hku.hk", profile)
+        self.assertNotEqual(result["label"], "relevant")
+        self.assertNotIn("ai, lab", result.get("reason", "").lower())
+
+    def test_keyword_in_text_rejects_ai_inside_catholic(self):
+        from agent.classifier import _keyword_in_text
+        self.assertFalse(_keyword_in_text("ai", "Catholic Society lecture series"))
+
+
 if __name__ == "__main__":
     unittest.main()

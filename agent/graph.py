@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from agent.datetime_utils import validate_iso_datetime
+from agent.datetime_utils import parse_graph_datetime_field, validate_iso_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -623,18 +623,12 @@ _WEEKDAYS = (
 )
 
 
-def _parse_graph_datetime(value: str) -> tuple[str, str] | None:
-    """Parse Graph dateTime string into (weekday_name, HH:MM)."""
-    if not value:
+def _parse_graph_datetime(value: str, time_zone: str = "Asia/Hong_Kong") -> tuple[str, str] | None:
+    """Parse Graph dateTime string into (weekday_name, HH:MM) in HKT."""
+    dt = parse_graph_datetime_field({"dateTime": value, "timeZone": time_zone})
+    if not dt:
         return None
-    try:
-        normalized = value.split(".")[0]
-        if normalized.endswith("Z"):
-            normalized = normalized[:-1] + "+00:00"
-        dt = datetime.fromisoformat(normalized)
-        return _WEEKDAYS[dt.weekday()], f"{dt.hour:02d}:{dt.minute:02d}"
-    except (ValueError, TypeError):
-        return None
+    return _WEEKDAYS[dt.weekday()], f"{dt.hour:02d}:{dt.minute:02d}"
 
 
 def calendar_events_to_blocked_slots(events: list, max_slots: int = 10) -> list:
@@ -649,8 +643,14 @@ def calendar_events_to_blocked_slots(events: list, max_slots: int = 10) -> list:
             continue
         start_info = event.get("start") or {}
         end_info = event.get("end") or {}
-        start_parsed = _parse_graph_datetime(start_info.get("dateTime", ""))
-        end_parsed = _parse_graph_datetime(end_info.get("dateTime", ""))
+        start_parsed = _parse_graph_datetime(
+            start_info.get("dateTime", ""),
+            start_info.get("timeZone", "Asia/Hong_Kong"),
+        )
+        end_parsed = _parse_graph_datetime(
+            end_info.get("dateTime", ""),
+            end_info.get("timeZone", "Asia/Hong_Kong"),
+        )
         if not start_parsed or not end_parsed:
             continue
         day, start_time = start_parsed

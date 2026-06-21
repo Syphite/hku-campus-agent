@@ -4,6 +4,18 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+HK_TZ = ZoneInfo("Asia/Hong_Kong")
+
+_GRAPH_TZ_ALIASES = {
+    "utc": ZoneInfo("UTC"),
+    "tcoordinated universal time": ZoneInfo("UTC"),
+    "china standard time": ZoneInfo("Asia/Shanghai"),
+    "hong kong standard time": HK_TZ,
+    "asia/hong_kong": HK_TZ,
+    "asia/shanghai": ZoneInfo("Asia/Shanghai"),
+}
 
 _ISO_DATETIME = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$"
@@ -43,6 +55,40 @@ def combine_date_and_time(date_iso: str, time_hhmm: str) -> str:
     date_part = str(date_iso or "").strip()[:10]
     time_part = normalize_time_hhmm(time_hhmm) or "09:00"
     return f"{date_part}T{time_part}:00"
+
+
+def resolve_graph_timezone(tz_name: str, default: ZoneInfo = HK_TZ) -> ZoneInfo:
+    """Map Microsoft Graph timeZone strings to zoneinfo."""
+    key = str(tz_name or "").strip().lower()
+    if key in _GRAPH_TZ_ALIASES:
+        return _GRAPH_TZ_ALIASES[key]
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return default
+
+
+def parse_graph_datetime_field(field: dict, *, target_tz: ZoneInfo = HK_TZ) -> datetime | None:
+    """
+    Parse a Graph calendar start/end field into the target timezone.
+
+    Graph stores dateTime in the timezone named on the field — not always HKT.
+    """
+    raw = str((field or {}).get("dateTime") or "").strip()
+    if not raw:
+        return None
+    source_tz = resolve_graph_timezone(str((field or {}).get("timeZone") or "Asia/Hong_Kong"))
+    try:
+        normalized = raw.split(".")[0]
+        if normalized.endswith("Z"):
+            dt = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        elif "+" in normalized[10:] or normalized.count("-") > 2:
+            dt = datetime.fromisoformat(normalized)
+        else:
+            dt = datetime.fromisoformat(normalized).replace(tzinfo=source_tz)
+        return dt.astimezone(target_tz)
+    except (TypeError, ValueError):
+        return None
 
 
 def validate_iso_datetime(value: str) -> bool:

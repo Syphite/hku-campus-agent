@@ -136,11 +136,6 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             "web_link": email.get("webLink") or "",
         }
 
-        if is_protected_email(sender, subject, preview):
-            item["reason"] = "Protected sender or CEDARS message — kept in inbox"
-            urgent_items.append(item)
-            continue
-
         if is_dup:
             item["reason"] = dup_reason
             result = archive_email(eid, user_token)
@@ -153,6 +148,11 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             else:
                 skipped_duplicates += 1
                 ambiguous_items.append({**item, "reason": f"{dup_reason} (could not archive)"})
+            continue
+
+        if is_protected_email(sender, subject, preview):
+            item["reason"] = "Protected sender or CEDARS message — kept in inbox"
+            urgent_items.append(item)
             continue
 
         result = classify_email(subject, preview, sender, profile)

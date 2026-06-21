@@ -65,6 +65,7 @@ from agent.conflict_checker        import run_conflict_checks_batch
 from agent.datetime_utils import normalize_time_hhmm
 from agent.events.event_filters import filter_open_events
 from agent.email_pipeline import _dedupe_inbox_items, run_inbox_pipeline
+from agent.email_calendar import _normalize_action_step
 from agent.intent_router import route_message
 from agent.proactive import format_digest_with_proactive, update_agent_snapshot
 from agent.storage.blob_storage import upload_filled_application
@@ -1878,7 +1879,6 @@ def _event_card(event: dict) -> dict:
     }
 
 def _archive_review_card(review_item: dict) -> dict:
-    """Build an Adaptive Card asking whether an archived email was correct."""
     email_id = review_item.get("email_id", "")
     subject = review_item.get("subject", "Archived email")
     reason = review_item.get("reason", "Classified as noise")
@@ -1944,6 +1944,112 @@ def _archive_review_card(review_item: dict) -> dict:
         ]
     }
 
+
+def _pick_next_ambiguous_review(profile: dict, ambiguous_items: list[dict]) -> dict | None:
+    """Rotate through ambiguous emails so each inbox run surfaces a different one."""
+    items = [item for item in (ambiguous_items or []) if isinstance(item, dict)]
+    if not items:
+        return None
+    index = int(profile.get("inbox_ambiguous_review_index") or 0)
+    item = items[index % len(items)]
+    profile["inbox_ambiguous_review_index"] = (index + 1) % len(items)
+    return item
+
+
+def _ambiguous_review_card(review_item: dict) -> dict:
+    """Build an Adaptive Card for reviewing an ambiguous email."""
+    email_id = review_item.get("email_id", "")
+    subject = review_item.get("subject", "Ambiguous email")
+    reason = review_item.get("reason", "Needs your review")
+    body_preview = review_item.get("body_preview", "")
+
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.3",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "🤔 **Ambiguous Email — where should this go?**",
+                "weight": "Bolder",
+                "color": "Accent",
+                "wrap": True,
+            },
+            {
+                "type": "TextBlock",
+                "text": f"**{subject}**",
+                "wrap": True,
+            },
+            {
+                "type": "TextBlock",
+                "text": f"Reason: {reason}",
+                "size": "Small",
+                "color": "Good",
+                "wrap": True,
+            },
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "📥 Move to Inbox",
+                "data": {
+                    "action": "move_ambiguous_to_inbox",
+                    "email_id": email_id,
+                    "subject": subject,
+                    "body_preview": body_preview,
+                },
+            },
+            {
+                "type": "Action.Submit",
+                "title": "🗂️ Move to Archive",
+                "data": {
+                    "action": "move_ambiguous_to_archive",
+                    "email_id": email_id,
+                    "subject": subject,
+                },
+            },
+            {
+                "type": "Action.Submit",
+                "title": "Keep in Ambiguous",
+                "data": {
+                    "action": "keep_ambiguous",
+                    "email_id": email_id,
+                },
+            },
+        ],
+    }
+
+
+def _append_inbox_review_cards(responses: list, profile: dict, inbox_summary: dict | None) -> None:
+    if not inbox_summary or not profile:
+        return
+
+    ambiguous_items = inbox_summary.get("ambiguous_items") or []
+    review_item = _pick_next_ambiguous_review(profile, ambiguous_items)
+    if review_item:
+        responses.append({
+            "type": "message",
+            "text": "Ambiguous review",
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": _ambiguous_review_card(review_item),
+            }],
+        })
+
+    archived_items = inbox_summary.get("archived_items") or []
+    if archived_items:
+        responses.append({
+            "type": "message",
+            "text": "Archive review",
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": _archive_review_card(archived_items[0]),
+            }],
+        })
+
+    if profile.get("id"):
+        save_profile(profile)
+
 def _inbox_urgent_card(item: dict) -> dict:
     subject = item.get("subject") or "Urgent email"
     timing = item.get("timing") or {}
@@ -1971,7 +2077,7 @@ def _inbox_urgent_card(item: dict) -> dict:
     for index, action in enumerate(item.get("action_items") or [], start=1):
         body.append({
             "type": "TextBlock",
-            "text": f"{index}. {action}",
+            "text": f"{index}. {_normalize_action_step(action)}",
             "wrap": True,
             "size": "Small",
         })
@@ -2034,7 +2140,7 @@ def _inbox_relevant_card(item: dict) -> dict:
     for index, action in enumerate(item.get("action_items") or [], start=1):
         body.append({
             "type": "TextBlock",
-            "text": f"{index}. {action}",
+            "text": f"{index}. {_normalize_action_step(action)}",
             "wrap": True,
             "size": "Small",
         })
@@ -2369,19 +2475,7 @@ def handle_get_inbox(student_id: str) -> list:
     responses = [_text_response("\n".join(lines))]
 
     _append_inbox_calendar_sections(responses, inbox_summary)
-
-    if inbox_summary.get("archived_items"):
-        review_item = inbox_summary["archived_items"][0]
-        responses.append({
-            "type": "message",
-            "text": "Archive review",
-            "attachments": [
-                {
-                    "contentType": "application/vnd.microsoft.card.adaptive",
-                    "content": _archive_review_card(review_item),
-                }
-            ],
-        })
+    _append_inbox_review_cards(responses, profile, inbox_summary)
     return responses
 
 
@@ -2423,16 +2517,7 @@ def handle_get_digest(student_id: str) -> list:
             elif inbox_summary and inbox_summary.get("processed", 0) == 0:
                 section_responses.append(_text_response("Inbox scan complete — no new emails to classify."))
             _append_inbox_calendar_sections(section_responses, inbox_summary)
-            if inbox_summary and inbox_summary.get("archived_items"):
-                review_item = inbox_summary["archived_items"][0]
-                section_responses.append({
-                    "type": "message",
-                    "text": "Archive review",
-                    "attachments": [{
-                        "contentType": "application/vnd.microsoft.card.adaptive",
-                        "content": _archive_review_card(review_item),
-                    }],
-                })
+            _append_inbox_review_cards(section_responses, profile, inbox_summary)
         else:
             section_responses.append(_text_response(
                 "Inbox processing skipped — sign in with Microsoft to enable email triage."
@@ -4276,6 +4361,50 @@ def handle_message(student_id: str, message: dict) -> list:
 
     if action == "keep_archived":
         return [_text_response("Noted! I'll keep it archived. Thanks for the feedback!")]
+
+    if action == "keep_ambiguous":
+        return [_text_response("Got it — I'll leave that one in **Agent Ambiguous** for now.")]
+
+    if action == "move_ambiguous_to_inbox":
+        email_id = value.get("email_id", "")
+        subject = value.get("subject", "")
+        body_preview = value.get("body_preview", "")
+        if not email_id:
+            return [_text_response("No email ID provided to restore.")]
+        from agent.graph import restore_email
+        from agent.learner import extract_learned_interests
+        profile = get_profile(student_id)
+        user_token = get_graph_access_token(profile)
+        if not user_token:
+            return [_text_response("Please sign in with Microsoft to move emails.")]
+        if not restore_email(email_id, user_token):
+            return [_text_response("Could not move that email to your inbox.")]
+        learned_interests = extract_learned_interests(subject, body_preview)
+        if profile and learned_interests:
+            existing_interests = profile.get("interests", []) or []
+            seen = {str(item).strip().lower() for item in existing_interests if str(item).strip()}
+            for interest in learned_interests:
+                cleaned = str(interest).strip()
+                if cleaned and cleaned.lower() not in seen:
+                    existing_interests.append(cleaned)
+                    seen.add(cleaned.lower())
+            profile["interests"] = existing_interests
+            save_profile(profile)
+        return [_text_response("✅ Moved to your inbox.")]
+
+    if action == "move_ambiguous_to_archive":
+        email_id = value.get("email_id", "")
+        if not email_id:
+            return [_text_response("No email ID provided to archive.")]
+        from agent.graph import archive_email
+        profile = get_profile(student_id)
+        user_token = get_graph_access_token(profile)
+        if not user_token:
+            return [_text_response("Please sign in with Microsoft to archive emails.")]
+        result = archive_email(email_id, user_token)
+        if not result.get("success"):
+            return [_text_response("Could not move that email to archive.")]
+        return [_text_response("✅ Moved to **Agent Archived**.")]
 
     if action == "undo_archive":
         email_id = value.get("email_id", "")

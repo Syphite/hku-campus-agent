@@ -211,6 +211,13 @@ def _mark_added(profile: dict, key: str) -> None:
     profile["inbox_calendar_added"] = stored[-100:]
 
 
+def _normalize_action_step(action: str) -> str:
+    text = str(action or "").strip()
+    text = re.sub(r"^step\s+\d+\s*[:.\-)\]]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\d+\s*[:.\-)\]]\s*", "", text)
+    return text.strip()
+
+
 def _heuristic_actions(subject: str, preview: str, timing: dict | None) -> list[str]:
     text = f"{subject} {preview}".lower()
     actions = []
@@ -224,7 +231,7 @@ def _heuristic_actions(subject: str, preview: str, timing: dict | None) -> list[
         actions.append("Block time to attend if you are interested.")
     if not actions:
         actions.append("Review this email and complete any required action before the date mentioned.")
-    return actions[:3]
+    return [_normalize_action_step(action) for action in actions[:3]]
 
 
 def suggest_urgent_actions(subject: str, preview: str, timing: dict | None) -> list[str]:
@@ -239,6 +246,7 @@ Rules:
 - 2-3 short, concrete steps
 - Mention the deadline if one exists
 - Do not invent requirements not implied by the email
+- Do not prefix steps with "Step 1" or numbers — plain sentences only
 
 Subject: {subject}
 Preview: {preview}
@@ -254,7 +262,8 @@ Deadline: {(timing or {}).get('deadline_display') or 'unknown'}
         )
         parsed = json.loads(response.choices[0].message.content or "{}")
         actions = parsed.get("actions") or []
-        cleaned = [str(item).strip() for item in actions if str(item).strip()]
+        cleaned = [_normalize_action_step(str(item)) for item in actions if str(item).strip()]
+        cleaned = [item for item in cleaned if item]
         return cleaned[:3] or heuristic
     except Exception as exc:
         logger.warning("Urgent action LLM failed: %s", exc)

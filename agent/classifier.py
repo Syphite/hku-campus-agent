@@ -106,6 +106,59 @@ def build_profile_keywords(profile, include_generic=True):
 
     return sorted(keywords)
 
+def _keyword_in_text(keyword: str, text: str) -> bool:
+    """Match profile keywords without substring false positives (e.g. ai in Catholic)."""
+    token = str(keyword or "").strip().lower()
+    if not token:
+        return False
+    if len(token) <= 4 or token in {"ai", "lab", "cv", "pg", "data", "bio", "case"}:
+        return bool(re.search(rf"\b{re.escape(token)}\b", text, re.IGNORECASE))
+    return token in text.lower()
+
+
+def _profile_keyword_hits(keywords: list[str], text: str) -> list[str]:
+    return [keyword for keyword in keywords if _keyword_in_text(keyword, text)]
+
+
+def _post_validate_classification(result: dict, subject: str, preview: str, profile: dict) -> dict:
+    """Downgrade relevant labels when the reason cites terms not present in the email."""
+    if result.get("label") != "relevant":
+        return result
+
+    text = f"{subject} {preview}".lower()
+    interests = [str(item).strip() for item in (profile.get("interests") or []) if str(item).strip()]
+    courses = [str(item).strip() for item in (profile.get("courses") or []) if str(item).strip()]
+    interest_hits = _profile_keyword_hits([item.lower() for item in interests], text)
+    course_hits = _profile_keyword_hits([item.lower() for item in courses], text)
+
+    if interest_hits:
+        result["reason"] = f"Matches your interests: {', '.join(interest_hits[:3])}."
+        return result
+    if course_hits:
+        result["reason"] = f"Related to your courses: {', '.join(course_hits[:3])}."
+        return result
+
+    reason = str(result.get("reason") or "")
+    cited_terms = []
+    for prefix in ("strong profile match:", "matches your interests:", "related to your courses:"):
+        if prefix in reason.lower():
+            tail = reason.split(":", 1)[-1]
+            cited_terms = [part.strip() for part in tail.split(",") if part.strip()]
+            break
+    verified = _profile_keyword_hits([term.lower() for term in cited_terms], text)
+    if len(verified) >= 2:
+        result["reason"] = f"Strong profile match: {', '.join(verified[:4])}."
+        return result
+    if len(verified) == 1:
+        result["label"] = "ambiguous"
+        result["reason"] = f"Possible match ({verified[0]}) — needs a quick review."
+        return result
+
+    result["label"] = "ambiguous"
+    result["reason"] = "Campus email without a verified match to your profile — review recommended."
+    return result
+
+
 def heuristic_classify(subject, body_preview, sender, profile=None):
     profile = profile or {}
     text = f"{subject} {body_preview} {sender}".lower()
@@ -114,8 +167,9 @@ def heuristic_classify(subject, body_preview, sender, profile=None):
 
     urgent_hits = [k for k in URGENT_TERMS if k in text]
     noise_hits = [k for k in NOISE_TERMS if k in text]
-    profile_hits = [k for k in profile_keywords if k in text]
-    broad_hits = [k for k in broad_keywords if k in text and k not in profile_hits]
+    profile_hits = _profile_keyword_hits(profile_keywords, text)
+    broad_hits = _profile_keyword_hits(broad_keywords, text)
+    broad_hits = [hit for hit in broad_hits if hit not in profile_hits]
 
     sender_lower = sender.lower()
     is_asso_forum = "asso_forum" in sender_lower or "asso_forum" in text
@@ -223,6 +277,8 @@ Routing targets (approximate):
 - Use ambiguous for HKU bulk mail, ASSO_FORUM posts, club mail, and generic campus updates
   unless there is a strong, specific match to the student's profile.
 - Use relevant only when the email clearly matches the student's major, courses, or interests.
+- In the reason, only mention interests/courses/keywords that literally appear in the subject or preview.
+- Never invent profile matches. If no explicit match appears in the email text, use ambiguous.
 - Use noise only for obvious external marketing/promo with no student relevance.
 - When unsure between relevant and ambiguous, choose ambiguous.
 - When unsure between ambiguous and noise for @hku.hk senders, choose ambiguous.
@@ -255,11 +311,21 @@ def classify_email(subject, body_preview, sender, profile=None):
 
     heuristic = heuristic_classify(subject, body_preview, sender, profile)
     if heuristic.get("decisive"):
-        return {"label": heuristic["label"], "reason": heuristic["reason"]}
+        return _post_validate_classification(
+            {"label": heuristic["label"], "reason": heuristic["reason"]},
+            subject,
+            body_preview,
+            profile,
+        )
 
     if HAS_LLM:
         try:
-            return _llm_classify(subject, body_preview, sender, profile, heuristic)
+            return _post_validate_classification(
+                _llm_classify(subject, body_preview, sender, profile, heuristic),
+                subject,
+                body_preview,
+                profile,
+            )
         except Exception:
             label = heuristic.get("label") or "ambiguous"
             if label not in {"urgent", "relevant", "noise", "ambiguous"}:
