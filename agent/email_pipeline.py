@@ -10,7 +10,6 @@ from agent.graph import (
     archive_email,
     get_unread_emails,
     is_protected_sender,
-    resolve_user_email,
 )
 from agent.classifier import classify_email
 from agent.profile import save_profile
@@ -18,19 +17,24 @@ from agent.profile import save_profile
 logger = logging.getLogger(__name__)
 
 
-def run_inbox_pipeline(student_id: str, profile: dict = None) -> dict:
+def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | None = None) -> dict:
     """
     Reads inbox, classifies emails, archives noise.
     Returns structured summary for digest.py.
     """
     profile = profile or {}
-    user_email = resolve_user_email(profile.get("email"))
+    if not user_token:
+        raise GraphApiError(
+            "Graph sign-in required",
+            hint="Sign in with Microsoft to access your inbox.",
+        )
+
     try:
-        emails = get_unread_emails(user_email)
+        emails = get_unread_emails(user_token)
     except GraphApiError as exc:
         logger.error(
-            "Inbox pipeline Graph failure for user_id=%s: %s",
-            user_email,
+            "Inbox pipeline Graph failure for student_id=%s: %s",
+            student_id,
             exc.to_log_dict(),
         )
         raise
@@ -84,7 +88,7 @@ def run_inbox_pipeline(student_id: str, profile: dict = None) -> dict:
         }
 
         if label == "noise":
-            result = archive_email(eid, user_email)
+            result = archive_email(eid, user_token)
             if result.get("success"):
                 item["email_id"] = result.get("new_id") or eid
                 item["original_id"] = eid

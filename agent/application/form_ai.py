@@ -481,15 +481,13 @@ def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
 
 def build_profile_suggestions_for_gaps(gaps: list, profile: dict) -> dict:
     suggestions = {}
-    for gap in sort_collection_gaps(gaps):
-        if gap.get("type") != "repeating_list":
-            continue
-        key = gap.get("key")
-        if not key:
+    for gap in consolidate_collection_gaps(gaps):
+        section_id = gap.get("section_id") or gap.get("key")
+        if not section_id:
             continue
         entries = suggest_profile_entries_for_gap(gap, profile)
         if entries:
-            suggestions[key] = entries
+            suggestions[section_id] = entries
     return suggestions
 
 
@@ -499,17 +497,25 @@ def build_profile_suggestions_overview(gaps: list, profile: dict, profile_sugges
         return ""
 
     lines = ["**From your profile, I may be able to pre-fill:**"]
-    for gap in sort_collection_gaps(gaps):
-        key = gap.get("key")
-        entries = profile_suggestions.get(key) or []
+    for gap in consolidate_collection_gaps(gaps):
+        section_id = gap.get("section_id") or gap.get("key")
+        entries = profile_suggestions.get(section_id) or []
         if not entries:
             continue
-        label = gap.get("label") or key.replace("_", " ").title()
-        preview = "; ".join(
-            entry.get("_source_text") or ", ".join(v for v in entry.values() if v and not str(v).startswith("_"))
-            for entry in entries[:2]
-        )
-        lines.append(f"- **{label}**: {preview}")
+        label = gap.get("label") or gap.get("key", "Section").replace("_", " ").title()
+        preview_parts = []
+        seen_previews = set()
+        for entry in entries[:3]:
+            preview = entry.get("_source_text") or ", ".join(
+                str(v) for k, v in entry.items() if v and not str(k).startswith("_")
+            )
+            preview = preview.strip()
+            if not preview or preview.lower() in seen_previews:
+                continue
+            seen_previews.add(preview.lower())
+            preview_parts.append(preview[:120] + ("..." if len(preview) > 120 else ""))
+        if preview_parts:
+            lines.append(f"- **{label}**: {'; '.join(preview_parts)}")
     lines.append("")
     lines.append("I'll ask you to confirm before using these in each matching section.")
     return "\n".join(lines)
@@ -621,7 +627,7 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
     if not gaps and not profile.get("activities"):
         logger.info("No structured list gaps detected")
 
-    return gaps
+    return consolidate_collection_gaps(gaps)
 
 
 COLLECTION_GAP_ORDER = {"repeating_list": 0, "free_field": 1, "long_text": 2}
@@ -630,6 +636,63 @@ COLLECTION_GAP_ORDER = {"repeating_list": 0, "free_field": 1, "long_text": 2}
 def sort_collection_gaps(gaps: list) -> list:
     items = [gap for gap in gaps or [] if gap.get("type") in COLLECTION_GAP_ORDER]
     return sorted(items, key=lambda gap: COLLECTION_GAP_ORDER[gap["type"]])
+
+
+def gap_section_id(gap: dict) -> str:
+    """Stable id for merging duplicate schema rows into one collection step."""
+    gap_type = gap.get("type", "")
+    label = normalize_text(gap.get("label") or gap.get("key") or "section")
+    if gap_type == "repeating_list":
+        schema = gap.get("schema") or {}
+        kind = schema.get("list_kind") or infer_list_kind(schema)
+        return f"{gap_type}:{kind}:{label}"
+    return f"{gap_type}:{label}"
+
+
+def consolidate_collection_gaps(gaps: list) -> list:
+    """
+    Merge duplicate gaps (same label/kind from multiple tables) into one collection step.
+    Preserves all schema variants for form filling via keys[] and schema_variants[].
+    """
+    consolidated: dict[str, dict] = {}
+    order: list[str] = []
+
+    for gap in sort_collection_gaps(gaps):
+        sid = gap_section_id(gap)
+        if sid not in consolidated:
+            entry = dict(gap)
+            entry["section_id"] = sid
+            entry["keys"] = [gap["key"]] if gap.get("key") else []
+            entry["schema_variants"] = [dict(gap.get("schema") or {})] if gap.get("schema") else []
+            consolidated[sid] = entry
+            order.append(sid)
+            continue
+
+        existing = consolidated[sid]
+        key = gap.get("key")
+        if key and key not in existing["keys"]:
+            existing["keys"].append(key)
+        schema = gap.get("schema")
+        if schema:
+            existing["schema_variants"].append(dict(schema))
+        if gap.get("type") == "repeating_list":
+            existing["schema"] = dict(existing.get("schema") or {})
+            existing["schema"]["max_rows"] = max(
+                safe_max_rows(existing.get("schema")),
+                safe_max_rows(schema or {}),
+            )
+            existing["prompt"] = build_list_section_prompt(existing)
+
+    return [consolidated[sid] for sid in order]
+
+
+def gap_data_keys(gap: dict) -> list[str]:
+    """All storage keys tied to this consolidated section."""
+    keys = list(gap.get("keys") or [])
+    primary = gap.get("key")
+    if primary and primary not in keys:
+        keys.insert(0, primary)
+    return [k for k in keys if k]
 
 
 def build_section_prompt(gap: dict) -> str:
@@ -658,7 +721,7 @@ def build_gap_overview(schema: dict, filled_data: dict, gaps: list) -> str:
             lines.append(f"- {label}")
         lines.append("")
 
-    collection_gaps = sort_collection_gaps(gaps)
+    collection_gaps = consolidate_collection_gaps(gaps)
     if collection_gaps:
         lines.append("**Still needed:**")
         for index, gap in enumerate(collection_gaps, start=1):
@@ -667,8 +730,11 @@ def build_gap_overview(schema: dict, filled_data: dict, gaps: list) -> str:
             if gap_type == "repeating_list":
                 max_rows = safe_max_rows(gap.get("schema"))
                 lines.append(f"{index}. {label} — up to {max_rows} entries (send all in one message)")
+            elif gap_type in ("long_text", "free_field"):
+                short_label = label if len(label) <= 100 else f"{label[:97]}..."
+                lines.append(f"{index}. {short_label} — essay/open answer (**draft** or **skip** ok)")
             else:
-                lines.append(f"{index}. {label} — essay/open answer (**draft** or **skip** ok)")
+                lines.append(f"{index}. {label}")
         lines.append("")
         lines.append(
             "Say **skip [section]** to skip, **review** to finish early, or **cancel application** to stop."

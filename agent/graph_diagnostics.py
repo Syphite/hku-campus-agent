@@ -281,9 +281,8 @@ def interpret_graph_failure(report: dict) -> list[str]:
         status = inbox_read.get("status")
         if status == 401 or "ErrorAccessDenied" in code or "Authorization" in code:
             hints.append(
-                "Inbox read denied with app-only auth. Personal/consumer Outlook mailboxes "
-                "(including Gmail-linked accounts) often cannot be accessed via client credentials. "
-                "Use an org mailbox in the same tenant, or switch to delegated OAuth for the signed-in user."
+                "Inbox read denied with delegated auth. Sign in again via the OAuth card, "
+                "or confirm Mail.Read delegated permission and user consent on the GraphOAuth connection."
             )
         elif status == 403:
             hints.append(
@@ -317,7 +316,7 @@ def compare_mailbox_identifiers(primary_user_id: str, profile_email: str | None)
         if primary.get("ok") and not comparison["profile_email"].get("ok"):
             comparison["mismatch_hint"] = (
                 "Inbox works with GRAPH_USER_ID but fails with profile email. "
-                "Ensure email_pipeline uses resolve_user_email(profile.get('email'))."
+                "Production inbox uses delegated /me with profile.graph_token after OAuth sign-in."
             )
         elif not primary.get("ok") and comparison["profile_email"].get("ok"):
             comparison["mismatch_hint"] = (

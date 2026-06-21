@@ -210,6 +210,31 @@ def stage2_reasoning(profile: dict, events: list) -> list[dict]:
         return _fallback_rank(profile, events)
 
 
+def _fallback_match_reason(event: dict, profile_keywords: set, profile: dict, blob: str) -> str:
+    matched = [
+        keyword for keyword in profile_keywords
+        if len(keyword) > 2 and keyword in blob
+    ]
+    matched = sorted(set(matched), key=len, reverse=True)[:4]
+    if matched:
+        labels = ", ".join(word.title() if word.islower() else word for word in matched)
+        return f"Matches your interests: {labels}."
+
+    student_faculty = _student_faculty(profile)
+    faculty_tags = event.get("faculty_relevant") or []
+    if _faculty_matches({"faculty_tags": faculty_tags}, student_faculty):
+        relevant = [
+            str(tag).strip()
+            for tag in faculty_tags
+            if str(tag).strip().lower() not in {"", "all"}
+        ]
+        if relevant:
+            return f"Relevant to {relevant[0]} students."
+        if student_faculty:
+            return f"Relevant to {student_faculty.title()} students."
+    return "Listed in this week's campus events."
+
+
 def _fallback_rank(profile: dict, events: list) -> list:
     """Heuristic fallback when LLM is unavailable."""
     profile_keywords = set(build_profile_keywords(profile or {}))
@@ -219,11 +244,15 @@ def _fallback_rank(profile: dict, events: list) -> list:
             str(event.get(key, "") or "")
             for key in ("title", "summary", "eligibility", "organiser", "type")
         ).lower()
-        hits = sum(1 for keyword in profile_keywords if keyword in blob)
-        if hits >= 1 or _faculty_matches({"faculty_tags": event.get("faculty_relevant") or ["all"]}, _student_faculty(profile)):
+        hits = sum(1 for keyword in profile_keywords if len(keyword) > 2 and keyword in blob)
+        faculty_match = _faculty_matches(
+            {"faculty_tags": event.get("faculty_relevant") or ["all"]},
+            _student_faculty(profile),
+        )
+        if hits >= 1 or faculty_match:
             copy = deepcopy(event)
             copy["match_strength"] = "strong"
-            copy["match_reason"] = f"Keyword overlap with your profile ({hits} signals)."
+            copy["match_reason"] = _fallback_match_reason(event, profile_keywords, profile, blob)
             ranked.append((hits, copy))
 
     ranked.sort(key=lambda item: item[0], reverse=True)

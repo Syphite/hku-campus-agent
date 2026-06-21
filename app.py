@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from flask import Flask, render_template_string, request, redirect, url_for, session
 
-from agent.graph      import get_unread_emails, archive_email, is_protected_sender, USER_EMAIL
+from agent.graph      import get_unread_emails, archive_email, is_protected_sender
 from agent.classifier import classify_email, suggested_course_keywords
 
 load_dotenv()
@@ -11,7 +11,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 
 USE_GRAPH = os.getenv("USE_GRAPH", "0") == "1"
-GRAPH_USER_EMAIL = os.getenv("GRAPH_USER_EMAIL", "")
+GRAPH_ACCESS_TOKEN = os.getenv("GRAPH_ACCESS_TOKEN", "")
 AUTO_ARCHIVE = os.getenv("AUTO_ARCHIVE", "0") == "1"
 
 DEMO_EMAILS = [
@@ -282,9 +282,9 @@ def normalize_email_body(email):
 
 
 def get_demo_or_graph_emails():
-    if USE_GRAPH and GRAPH_USER_EMAIL:
+    if USE_GRAPH and GRAPH_ACCESS_TOKEN:
         try:
-            return get_unread_emails(GRAPH_USER_EMAIL), "Microsoft Graph"
+            return get_unread_emails(GRAPH_ACCESS_TOKEN), "Microsoft Graph"
         except Exception:
             # Fallback to demo data if Graph fails
             return DEMO_EMAILS, "Demo fallback"
@@ -331,9 +331,9 @@ def index():
         if label == "noise":
             noise_emails.append(email_data)
 
-            if USE_GRAPH and AUTO_ARCHIVE and GRAPH_USER_EMAIL and email.get("id") and not is_protected_sender(sender):
+            if USE_GRAPH and AUTO_ARCHIVE and GRAPH_ACCESS_TOKEN and email.get("id") and not is_protected_sender(sender):
                 try:
-                    archive_email(email["id"], GRAPH_USER_EMAIL)
+                    archive_email(email["id"], GRAPH_ACCESS_TOKEN)
                 except Exception:
                     pass
         else:

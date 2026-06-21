@@ -1,20 +1,14 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 
 import requests
-from dotenv import load_dotenv
-
-from agent.graph_diagnostics import interpret_graph_failure, parse_graph_error_response
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-USER_EMAIL = os.getenv("GRAPH_USER_ID", "hku.demo.agent@outlook.com")
+ME_BASE = f"{GRAPH_BASE}/me"
 
 # Protected senders — never archive regardless of content
 PROTECTED_SENDERS = [
@@ -22,7 +16,7 @@ PROTECTED_SENDERS = [
     "financial-aid.hku.hk", "scholarships@hku.hk", "aaso@hku.hk"
 ]
 
-_token_roles_cache: list[str] | None = None
+SIGN_IN_HINT = "Complete Microsoft sign-in to access your mail and calendar."
 
 
 class GraphApiError(Exception):
@@ -70,72 +64,50 @@ class GraphApiError(Exception):
         }
 
 
-def get_access_token() -> str:
-    tenant_id     = os.getenv("GRAPH_TENANT_ID")
-    client_id     = os.getenv("GRAPH_CLIENT_ID")
-    client_secret = os.getenv("GRAPH_CLIENT_SECRET")
+def _require_user_token(user_token: str | None) -> str:
+    if not user_token or not str(user_token).strip():
+        raise GraphApiError(
+            "Graph sign-in required",
+            hint=SIGN_IN_HINT,
+        )
+    return str(user_token).strip()
 
-    if not all([tenant_id, client_id, client_secret]):
-        raise RuntimeError("Missing GRAPH_TENANT_ID, GRAPH_CLIENT_ID, or GRAPH_CLIENT_SECRET")
 
-    url  = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    data = {
-        "grant_type":    "client_credentials",
-        "client_id":     client_id,
-        "client_secret": client_secret,
-        "scope":         "https://graph.microsoft.com/.default"
+def _delegated_headers(user_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {_require_user_token(user_token)}",
+        "Content-Type": "application/json",
     }
-    resp = requests.post(url, data=data, timeout=30)
-    resp.raise_for_status()
-    token = resp.json().get("access_token")
-    if not token:
-        raise RuntimeError("Could not obtain access token")
-
-    global _token_roles_cache
-    try:
-        from agent.graph_diagnostics import decode_jwt_payload
-        payload = decode_jwt_payload(token)
-        roles = payload.get("roles") or []
-        _token_roles_cache = list(roles) if isinstance(roles, list) else []
-    except Exception:
-        _token_roles_cache = None
-
-    return token
 
 
-def _cached_token_roles() -> list[str]:
-    if _token_roles_cache is None:
-        return []
-    return list(_token_roles_cache)
-
-
-def _headers() -> dict:
-    return {"Authorization": f"Bearer {get_access_token()}",
-            "Content-Type": "application/json"}
-
-
-def _extract_user_id_from_url(url: str) -> str:
-    marker = "/users/"
-    if marker not in url:
-        return ""
-    remainder = url.split(marker, 1)[1]
-    return remainder.split("/", 1)[0]
+def _delegated_failure_hint(status: int, url: str) -> str:
+    if "/me/" in url and status == 401:
+        return "Your Microsoft sign-in may have expired — please sign in again."
+    if "/mailFolders/" in url and status == 401:
+        return SIGN_IN_HINT
+    if "/calendar/" in url and status == 401:
+        return SIGN_IN_HINT
+    if status == 403:
+        return "Graph returned forbidden — check Mail/Calendar delegated permissions and consent."
+    return "Graph request failed"
 
 
 def _graph_request(
     method: str,
     url: str,
     *,
+    user_token: str,
     params: dict | None = None,
     json_body: dict | None = None,
     timeout: int = 30,
-    user_id: str = "",
 ) -> requests.Response:
-    """Execute a Graph request; raise GraphApiError with structured details on failure."""
+    """Execute a delegated Graph /me request; raise GraphApiError on failure."""
+    from agent.graph_diagnostics import parse_graph_error_response
+
     resp = requests.request(
         method.upper(),
         url,
-        headers=_headers(),
+        headers=_delegated_headers(user_token),
         params=params,
         json=json_body,
         timeout=timeout,
@@ -144,17 +116,7 @@ def _graph_request(
         return resp
 
     parsed = parse_graph_error_response(resp)
-    resolved_user = user_id or _extract_user_id_from_url(url)
-    mini_report = {
-        "token": {"ok": True, "roles": _cached_token_roles()},
-        "user_lookup": {"ok": True} if "/mailFolders/" not in url else {"ok": True},
-        "inbox_read": parsed if "/mailFolders/" in url else {"ok": True},
-        "ok": False,
-    }
-    if "/users/" in url and "/mailFolders/" not in url and resp.status_code == 404:
-        mini_report["user_lookup"] = parsed
-    hints = interpret_graph_failure(mini_report)
-    hint = hints[0] if hints else parsed.get("error_message") or "Graph request failed"
+    hint = _delegated_failure_hint(parsed.get("status") or resp.status_code, url)
 
     err = GraphApiError(
         f"Graph request failed: {method.upper()} {url} ({resp.status_code})",
@@ -164,8 +126,7 @@ def _graph_request(
         error_code=parsed.get("error_code") or "",
         error_message=parsed.get("error_message") or resp.text[:300],
         request_id=parsed.get("request_id") or "",
-        user_id=resolved_user,
-        token_roles=_cached_token_roles(),
+        user_id="me",
         hint=hint,
         www_authenticate=parsed.get("www_authenticate") or "",
     )
@@ -175,8 +136,6 @@ def _graph_request(
         "  error_code=%s\n"
         "  error_message=%s\n"
         "  request_id=%s\n"
-        "  user_id=%s\n"
-        "  token_roles=%s\n"
         "  hint=%s",
         err.method,
         err.url,
@@ -184,50 +143,48 @@ def _graph_request(
         err.error_code,
         err.error_message,
         err.request_id,
-        err.user_id,
-        err.token_roles,
         err.hint,
     )
     raise err
 
 
-def get_unread_emails(user_email: str = USER_EMAIL) -> list:
-    url    = f"{GRAPH_BASE}/users/{user_email}/mailFolders/inbox/messages"
+def get_unread_emails(user_token: str) -> list:
+    url = f"{ME_BASE}/mailFolders/inbox/messages"
     params = {
         "$filter": "isRead eq false",
-        "$top":    25,
-        "$select": "id,subject,from,receivedDateTime,bodyPreview,body,conversationId"
+        "$top": 25,
+        "$select": "id,subject,from,receivedDateTime,bodyPreview,body,conversationId",
     }
-    resp = _graph_request("GET", url, params=params, user_id=user_email)
+    resp = _graph_request("GET", url, user_token=user_token, params=params)
     return resp.json().get("value", [])
 
 
-def get_or_create_archive_folder(user_email: str = USER_EMAIL) -> str:
+def get_or_create_archive_folder(user_token: str) -> str:
     """Get or create the Agent Archived folder. Returns folder ID."""
-    url  = f"{GRAPH_BASE}/users/{user_email}/mailFolders"
-    resp = _graph_request("GET", url, user_id=user_email)
+    url = f"{ME_BASE}/mailFolders"
+    resp = _graph_request("GET", url, user_token=user_token)
     for folder in resp.json().get("value", []):
         if folder.get("displayName") == "Agent Archived":
             return folder["id"]
     resp = _graph_request(
         "POST",
         url,
+        user_token=user_token,
         json_body={"displayName": "Agent Archived"},
-        user_id=user_email,
     )
     return resp.json()["id"]
 
 
-def archive_email(email_id: str, user_email: str = USER_EMAIL) -> dict:
+def archive_email(email_id: str, user_token: str) -> dict:
     """Move email to Agent Archived folder. Never deletes."""
     try:
-        folder_id = get_or_create_archive_folder(user_email)
-        url  = f"{GRAPH_BASE}/users/{user_email}/messages/{email_id}/move"
+        folder_id = get_or_create_archive_folder(user_token)
+        url = f"{ME_BASE}/messages/{email_id}/move"
         resp = _graph_request(
             "POST",
             url,
+            user_token=user_token,
             json_body={"destinationId": folder_id},
-            user_id=user_email,
         )
         return {"success": True, "new_id": resp.json().get("id", "")}
     except GraphApiError as exc:
@@ -235,15 +192,15 @@ def archive_email(email_id: str, user_email: str = USER_EMAIL) -> dict:
         return {"success": False, "new_id": ""}
 
 
-def restore_email(email_id: str, user_email: str = USER_EMAIL) -> bool:
+def restore_email(email_id: str, user_token: str) -> bool:
     """Move email back to inbox (undo archive)."""
-    url  = f"{GRAPH_BASE}/users/{user_email}/messages/{email_id}/move"
+    url = f"{ME_BASE}/messages/{email_id}/move"
     try:
         _graph_request(
             "POST",
             url,
+            user_token=user_token,
             json_body={"destinationId": "inbox"},
-            user_id=user_email,
         )
         return True
     except GraphApiError as exc:
@@ -257,13 +214,8 @@ def is_protected_sender(email_address: str) -> bool:
     return any(p in addr for p in PROTECTED_SENDERS)
 
 
-def resolve_user_email(profile_email: str | None = None) -> str:
-    """Resolve Graph user id/email; demo env override takes precedence."""
-    return os.getenv("GRAPH_USER_ID") or profile_email or USER_EMAIL
-
-
 def get_calendar_events(
-    user_email: str,
+    user_token: str,
     start_datetime: str,
     end_datetime: str,
 ) -> dict:
@@ -273,7 +225,7 @@ def get_calendar_events(
     Returns:
         {"success": True, "events": [...]} or {"success": False, "error": "...", "events": []}
     """
-    url = f"{GRAPH_BASE}/users/{user_email}/calendar/calendarView"
+    url = f"{ME_BASE}/calendar/calendarView"
     params = {
         "startDateTime": start_datetime,
         "endDateTime": end_datetime,
@@ -281,7 +233,7 @@ def get_calendar_events(
         "$top": 250,
     }
     try:
-        resp = _graph_request("GET", url, params=params, user_id=user_email)
+        resp = _graph_request("GET", url, user_token=user_token, params=params)
         return {"success": True, "events": resp.json().get("value", []), "error": ""}
     except GraphApiError as exc:
         logger.error("get_calendar_events failed: %s", exc.to_log_dict())
@@ -291,12 +243,12 @@ def get_calendar_events(
             "events": [],
         }
     except Exception as exc:
-        logger.error(f"get_calendar_events error: {exc}")
+        logger.error("get_calendar_events error: %s", exc)
         return {"success": False, "error": str(exc), "events": []}
 
 
 def create_calendar_event(
-    user_email: str,
+    user_token: str,
     title: str,
     start_iso: str,
     end_iso: str,
@@ -304,7 +256,7 @@ def create_calendar_event(
     timezone: str = "Asia/Hong_Kong",
 ) -> dict:
     """
-    Create an Outlook calendar event for the user.
+    Create an Outlook calendar event for the signed-in user.
 
     Returns:
         {"success": True, "event_id": "...", "web_link": "..."}
@@ -318,9 +270,9 @@ def create_calendar_event(
     if location:
         body["location"] = {"displayName": location}
 
-    url = f"{GRAPH_BASE}/users/{user_email}/calendar/events"
+    url = f"{ME_BASE}/calendar/events"
     try:
-        resp = _graph_request("POST", url, json_body=body, user_id=user_email)
+        resp = _graph_request("POST", url, user_token=user_token, json_body=body)
         data = resp.json()
         return {
             "success": True,
@@ -335,7 +287,7 @@ def create_calendar_event(
             "error": f"Could not create calendar event ({exc.status}): {exc.error_code or exc.error_message}",
         }
     except Exception as exc:
-        logger.error(f"create_calendar_event error: {exc}")
+        logger.error("create_calendar_event error: %s", exc)
         return {"success": False, "error": str(exc)}
 
 

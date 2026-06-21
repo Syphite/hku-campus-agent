@@ -70,6 +70,19 @@ def update_profile_fields(student_id: str, updates: dict) -> bool:
     return save_profile(profile)
 
 
+def get_graph_access_token(profile: dict | None) -> str | None:
+    """Return delegated Graph access token saved after OAuth sign-in."""
+    if not profile:
+        return None
+    token = profile.get("graph_token")
+    if isinstance(token, dict):
+        value = token.get("token")
+        return str(value).strip() if value else None
+    if token:
+        return str(token).strip()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # CV extraction
 # ---------------------------------------------------------------------------
