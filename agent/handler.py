@@ -1957,7 +1957,15 @@ def handle_get_inbox(student_id: str) -> list:
     processed = inbox_summary.get("processed", 0)
     archived = inbox_summary.get("archived", 0)
     kept = inbox_summary.get("kept", 0)
-    lines = [f"📬 **Inbox update:** {processed} email(s) processed, {archived} archived, {kept} kept."]
+    scan_mode = inbox_summary.get("scan_mode", "")
+    duplicates = inbox_summary.get("duplicates_archived", 0)
+    mode_label = "first-time unread scan" if scan_mode == "initial_unread_scan" else "today's mail (HKT)"
+    lines = [
+        f"📬 **Inbox update:** {processed} email(s) processed, {archived} archived, {kept} kept in inbox.",
+        f"Scan mode: **{mode_label}**.",
+    ]
+    if duplicates:
+        lines.append(f"Duplicates archived: **{duplicates}**.")
     if processed == 0:
         lines.append(
             "Nothing new was classified this run. Type **debug inbox** to see which account Graph is using, "

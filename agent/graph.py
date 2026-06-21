@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -9,6 +9,11 @@ logger = logging.getLogger(__name__)
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 ME_BASE = f"{GRAPH_BASE}/me"
+
+AGENT_FOLDER_NOISE = "Agent Archived"
+AGENT_FOLDER_AMBIGUOUS = "Agent Ambiguous"
+HK_TZ = timezone(timedelta(hours=8))
+MESSAGE_SELECT = "id,subject,from,isRead,receivedDateTime,bodyPreview,body,conversationId"
 
 # Protected senders — never archive regardless of content
 PROTECTED_SENDERS = [
@@ -149,7 +154,72 @@ def _graph_request(
 
 
 def get_unread_emails(user_token: str) -> list:
-    return get_inbox_messages(user_token, top=25, unread_only=True)
+    return get_all_unread_emails(user_token, max_messages=25)
+
+
+def hk_today_start_utc_iso() -> str:
+    start = datetime.now(HK_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _graph_get_paged(
+    user_token: str,
+    url: str,
+    *,
+    params: dict | None = None,
+    max_messages: int = 500,
+) -> list:
+    headers = _delegated_headers(user_token)
+    messages: list = []
+    next_url: str | None = url
+    next_params = params
+
+    while next_url and len(messages) < max_messages:
+        resp = requests.get(next_url, headers=headers, params=next_params, timeout=30)
+        if not resp.ok:
+            from agent.graph_diagnostics import parse_graph_error_response
+
+            parsed = parse_graph_error_response(resp)
+            hint = _delegated_failure_hint(parsed.get("status") or resp.status_code, next_url)
+            raise GraphApiError(
+                f"Graph paged request failed: GET {next_url} ({resp.status_code})",
+                method="GET",
+                url=next_url,
+                status=parsed.get("status") or resp.status_code,
+                error_code=parsed.get("error_code") or "",
+                error_message=parsed.get("error_message") or resp.text[:300],
+                request_id=parsed.get("request_id") or "",
+                user_id="me",
+                hint=hint,
+            )
+        data = resp.json()
+        messages.extend(data.get("value", []))
+        next_url = data.get("@odata.nextLink")
+        next_params = None
+
+    return messages[:max_messages]
+
+
+def get_all_unread_emails(user_token: str, *, max_messages: int = 500) -> list:
+    url = f"{ME_BASE}/mailFolders/inbox/messages"
+    params = {
+        "$filter": "isRead eq false",
+        "$top": 50,
+        "$select": MESSAGE_SELECT,
+        "$orderby": "receivedDateTime desc",
+    }
+    return _graph_get_paged(user_token, url, params=params, max_messages=max_messages)
+
+
+def get_inbox_messages_since(user_token: str, since_iso: str, *, max_messages: int = 100) -> list:
+    url = f"{ME_BASE}/mailFolders/inbox/messages"
+    params = {
+        "$filter": f"receivedDateTime ge {since_iso}",
+        "$top": 50,
+        "$select": MESSAGE_SELECT,
+        "$orderby": "receivedDateTime desc",
+    }
+    return _graph_get_paged(user_token, url, params=params, max_messages=max_messages)
 
 
 def get_me_profile(user_token: str) -> dict:
@@ -184,7 +254,7 @@ def get_inbox_messages(
     url = f"{ME_BASE}/mailFolders/inbox/messages"
     params = {
         "$top": top,
-        "$select": "id,subject,from,isRead,receivedDateTime,bodyPreview",
+        "$select": MESSAGE_SELECT,
         "$orderby": "receivedDateTime desc",
     }
     if unread_only:
@@ -193,26 +263,31 @@ def get_inbox_messages(
     return resp.json().get("value", [])
 
 
-def get_or_create_archive_folder(user_token: str) -> str:
-    """Get or create the Agent Archived folder. Returns folder ID."""
+def get_or_create_mail_folder(user_token: str, display_name: str) -> str:
     url = f"{ME_BASE}/mailFolders"
     resp = _graph_request("GET", url, user_token=user_token)
     for folder in resp.json().get("value", []):
-        if folder.get("displayName") == "Agent Archived":
+        if folder.get("displayName") == display_name:
             return folder["id"]
     resp = _graph_request(
         "POST",
         url,
         user_token=user_token,
-        json_body={"displayName": "Agent Archived"},
+        json_body={"displayName": display_name},
     )
     return resp.json()["id"]
 
 
-def archive_email(email_id: str, user_token: str) -> dict:
-    """Move email to Agent Archived folder. Never deletes."""
+def get_or_create_archive_folder(user_token: str) -> str:
+    return get_or_create_mail_folder(user_token, AGENT_FOLDER_NOISE)
+
+
+def get_or_create_ambiguous_folder(user_token: str) -> str:
+    return get_or_create_mail_folder(user_token, AGENT_FOLDER_AMBIGUOUS)
+
+
+def move_email_to_folder(email_id: str, folder_id: str, user_token: str) -> dict:
     try:
-        folder_id = get_or_create_archive_folder(user_token)
         url = f"{ME_BASE}/messages/{email_id}/move"
         resp = _graph_request(
             "POST",
@@ -222,8 +297,20 @@ def archive_email(email_id: str, user_token: str) -> dict:
         )
         return {"success": True, "new_id": resp.json().get("id", "")}
     except GraphApiError as exc:
-        logger.error("archive_email failed: %s", exc.to_log_dict())
+        logger.error("move_email_to_folder failed: %s", exc.to_log_dict())
         return {"success": False, "new_id": ""}
+
+
+def archive_email(email_id: str, user_token: str) -> dict:
+    """Move email to Agent Archived folder. Never deletes."""
+    folder_id = get_or_create_archive_folder(user_token)
+    return move_email_to_folder(email_id, folder_id, user_token)
+
+
+def move_to_ambiguous_folder(email_id: str, user_token: str) -> dict:
+    """Move email to Agent Ambiguous folder for human review."""
+    folder_id = get_or_create_ambiguous_folder(user_token)
+    return move_email_to_folder(email_id, folder_id, user_token)
 
 
 def restore_email(email_id: str, user_token: str) -> bool:

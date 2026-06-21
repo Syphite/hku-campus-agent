@@ -123,70 +123,67 @@ def heuristic_classify(subject, body_preview, sender, profile=None):
         if profile_hits:
             return {
                 "label": "relevant",
-                "reason": f"ASSO_FORUM post matches your profile keywords: {', '.join(profile_hits[:4])}."
+                "reason": f"ASSO_FORUM post matches your profile keywords: {', '.join(profile_hits[:4])}.",
+                "decisive": len(profile_hits) >= 2,
             }
         return {
             "label": "ambiguous",
-            "reason": "ASSO_FORUM post may be useful, but it does not clearly match your interests or major."
+            "reason": "ASSO_FORUM post may be useful, but it does not clearly match your interests or major.",
+            "decisive": False,
         }
 
     if urgent_hits:
-        if profile_hits or is_university_sender:
-            return {
-                "label": "urgent",
-                "reason": f"Urgent email with matches: {', '.join(profile_hits[:3]) or 'student/admin context'}."
-            }
         return {
             "label": "urgent",
-            "reason": f"Contains urgent terms: {', '.join(urgent_hits[:3])}."
+            "reason": (
+                f"Urgent email with matches: {', '.join(profile_hits[:3]) or 'student/admin context'}."
+                if profile_hits or is_university_sender
+                else f"Contains urgent terms: {', '.join(urgent_hits[:3])}."
+            ),
+            "decisive": True,
         }
 
     if noise_hits and not profile_hits:
         return {
             "label": "noise",
-            "reason": f"Promotional/noise language detected: {', '.join(noise_hits[:3])}."
+            "reason": f"Promotional/noise language detected: {', '.join(noise_hits[:3])}.",
+            "decisive": True,
         }
 
     if profile_hits:
         return {
             "label": "relevant",
-            "reason": f"Matches your interests/major/year keywords: {', '.join(profile_hits[:4])}."
+            "reason": f"Matches your interests/major/year keywords: {', '.join(profile_hits[:4])}.",
+            "decisive": len(profile_hits) >= 2,
         }
 
     if is_university_sender:
         return {
             "label": "ambiguous",
-            "reason": "University sender, but the content is not clearly important for your profile."
+            "reason": "University sender, but the content is not clearly important for your profile.",
+            "decisive": False,
         }
 
     return {
         "label": "noise",
-        "reason": "No strong match to your profile or student priorities."
+        "reason": "No strong match to your profile or student priorities.",
+        "decisive": bool(noise_hits),
     }
 
-def classify_email(subject, body_preview, sender, profile=None):
-    subject = subject or ""
-    body_preview = body_preview or ""
-    sender = sender or ""
-    profile = profile or {}
-    
-    if not subject and not body_preview:
-        return {"label": "noise", "reason": "Empty email, automatically ignored."}
 
-    # Try Azure OpenAI first, then fall back to rules.
-    if HAS_LLM:
-        academic = profile.get("academic", {})
-        major = str(profile.get("major") or academic.get("programme", "")).strip()
-        year = str(profile.get("year") or academic.get("year_of_study", "")).strip()
-        profile_text = {
-            "year": year,
-            "major": major,
-            "interests": _normalize_list(profile.get("interests", [])),
-            "courses": _normalize_list(profile.get("courses", [])),
-            "course_keywords": suggested_course_keywords(profile),
-        }
+def _llm_classify(subject: str, body_preview: str, sender: str, profile: dict, heuristic: dict) -> dict:
+    academic = profile.get("academic", {})
+    major = str(profile.get("major") or academic.get("programme", "")).strip()
+    year = str(profile.get("year") or academic.get("year_of_study", "")).strip()
+    profile_text = {
+        "year": year,
+        "major": major,
+        "interests": _normalize_list(profile.get("interests", [])),
+        "courses": _normalize_list(profile.get("courses", [])),
+        "course_keywords": suggested_course_keywords(profile),
+    }
 
-        prompt = f"""
+    prompt = f"""
 You are an email triage assistant for a university student.
 Classify this email into exactly one label:
 - urgent: requires immediate action
@@ -197,6 +194,9 @@ Classify this email into exactly one label:
 Student profile:
 {json.dumps(profile_text, ensure_ascii=False, indent=2)}
 
+Keyword pre-check (may be incomplete):
+{json.dumps({"label": heuristic.get("label"), "reason": heuristic.get("reason")}, ensure_ascii=False)}
+
 Email:
 From: {sender}
 Subject: {subject}
@@ -204,34 +204,42 @@ Preview: {body_preview}
 
 Rules:
 - Use the student profile strongly.
-- ASSO_FORUM posts are often useful, but only mark them relevant when they match the student's interests, major, year, or likely courses.
+- ASSO_FORUM posts are often useful, but only mark them relevant when they match interests, major, year, or likely courses.
 - If the email is marketing/promo and not relevant to the profile, mark it noise.
 - Return JSON only with keys: label, reason.
 """
-        
-        try:
-            response = openai_client.chat.completions.create(
-                model=DEPLOYMENT,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                max_tokens=200,
-                temperature=0.1
-            )
-            
-            result = json.loads(response.choices[0].message.content)
-            label = str(result.get("label", "ambiguous")).lower().strip()
-            
-            if label not in {"urgent", "relevant", "noise", "ambiguous"}:
-                return heuristic_classify(subject, body_preview, sender, profile)
-                
-            return {
-                "label": label,
-                "reason": str(result.get("reason", ""))
-            }
-            
-        except Exception:
-            # If OpenAI fails, fall back to heuristics
-            return heuristic_classify(subject, body_preview, sender, profile)
 
-    # Fallback to heuristics if LLM is not available
-    return heuristic_classify(subject, body_preview, sender, profile)
+    response = openai_client.chat.completions.create(
+        model=DEPLOYMENT,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_tokens=200,
+        temperature=0.1,
+    )
+    result = json.loads(response.choices[0].message.content)
+    label = str(result.get("label", "ambiguous")).lower().strip()
+    if label not in {"urgent", "relevant", "noise", "ambiguous"}:
+        raise ValueError(f"Invalid LLM label: {label}")
+    return {"label": label, "reason": str(result.get("reason", ""))}
+
+
+def classify_email(subject, body_preview, sender, profile=None):
+    subject = subject or ""
+    body_preview = body_preview or ""
+    sender = sender or ""
+    profile = profile or {}
+
+    if not subject and not body_preview:
+        return {"label": "noise", "reason": "Empty email, automatically ignored."}
+
+    heuristic = heuristic_classify(subject, body_preview, sender, profile)
+    if heuristic.get("decisive"):
+        return {"label": heuristic["label"], "reason": heuristic["reason"]}
+
+    if HAS_LLM:
+        try:
+            return _llm_classify(subject, body_preview, sender, profile, heuristic)
+        except Exception:
+            return {"label": heuristic["label"], "reason": heuristic["reason"]}
+
+    return {"label": heuristic["label"], "reason": heuristic["reason"]}

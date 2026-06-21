@@ -235,6 +235,8 @@ def build_profile_from_form(form_data: dict, cv_bytes: bytes = None, cv_filename
         "activities":       form_data.get("activities", []),
         "cv_text":          "",
         "processed_email_ids": [],
+        "inbox_initial_scan_complete": False,
+        "inbox_content_fingerprints": [],
         "preferences": {
             "modules_enabled": [
                 module
@@ -290,6 +292,8 @@ if __name__ == "__main__":
         "activities":      ["HKU Robotics Team", "Undergraduate research assistant", "Volunteer at Code4HK"],
         "cv_text":         "Local Mock Student — Engineering (Computer Science) Year 2. GPA 3.7. HKU Robotics Team. Hackathon participant.",
         "processed_email_ids": [],
+        "inbox_initial_scan_complete": False,
+        "inbox_content_fingerprints": [],
         "preferences": {
             "modules_enabled": ["scholarships", "events", "inbox"],
             "digest_frequency": {
