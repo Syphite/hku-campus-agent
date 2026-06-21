@@ -66,6 +66,7 @@ from agent.conflict_checker        import run_conflict_checks_batch
 from agent.datetime_utils import normalize_time_hhmm
 from agent.events.event_filters import filter_open_events
 from agent.email_pipeline import _dedupe_inbox_items, run_inbox_pipeline
+from agent.email_events import dedupe_events, inbox_items_to_events
 from agent.email_calendar import _normalize_action_step
 from agent.intent_router import route_message
 from agent.proactive import format_digest_with_proactive, update_agent_snapshot
@@ -2373,11 +2374,11 @@ def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
         save_profile(profile)
         return [
             cv_ack,
-            _oauth_login_required(
+            _text_response(
                 "Smart Inbox and calendar features need a one-time Microsoft sign-in "
-                "for email access.",
-                pending_command="signin",
+                "for email access."
             ),
+            _oauth_login_required("", pending_command="signin"),
         ]
 
     return [

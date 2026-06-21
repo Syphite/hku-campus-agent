@@ -134,9 +134,16 @@ async def messages(req: web.Request) -> web.Response:
                 )
                 return
 
-            # Copilot/Web Chat often cannot resolve ActionTypes.signin without a pre-fetched URL.
+            # Send explanation once as plain text; card carries only the button so Copilot
+            # does not duplicate the same paragraph above and inside the sign-in card.
+            if card_text:
+                await turn_context.send_activity(Activity(
+                    type=ActivityTypes.message,
+                    text=card_text,
+                ))
+
             sign_in_card = SigninCard(
-                text=card_text,
+                text="",
                 buttons=[
                     CardAction(
                         type=ActionTypes.open_url,
