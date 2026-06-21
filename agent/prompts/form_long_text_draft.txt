@@ -2,11 +2,21 @@ Draft a scholarship application response for the field described below.
 
 Rules:
 - Write in first person as the student.
-- Be specific and credible using only the provided profile and collected list data.
-- Do not invent awards, jobs, or experiences not supported by the data.
+- Follow the exact field label/prompt in the schema — do not assume it is a generic personal statement.
+- Ground the draft in the student's GPA, interests, activities, CV excerpt, and collected list data.
+- Weave in specific details from those sources; do not write generic boilerplate or filler.
+- Do not invent awards, jobs, internships, leadership roles, or experiences not supported by the profile, CV, or collected lists.
+- If a detail is missing, write honestly around what is known rather than fabricating specifics.
 - Target approximately {target_words} words.
 - Return ONLY valid JSON in this shape:
 {{"text": "..."}}
+
+Required sources (use when present):
+- gpa — cite academic standing when relevant
+- interests — connect motivation to stated interests
+- activities — reference onboarding activities as experiences
+- cv_text — draw concrete examples from the CV excerpt
+- programme, faculty, year_of_study — anchor the narrative in the student's academic context
 
 Field:
 {field_schema}

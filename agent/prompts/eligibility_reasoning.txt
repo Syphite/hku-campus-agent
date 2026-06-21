@@ -37,15 +37,16 @@ RUBRIC — output strong matches the student should see:
 
 QUALIFIED (match_strength: "strong"):
 - Student meets faculty/level/year/nationality/GPA/financial-need requirements
-- University-wide or faculty-wide awards where the student's faculty fits
+- University-wide awards (faculty: "all") match any enrolled HKU student
+- Faculty-wide awards where the student's faculty matches — e.g. School of
+  Computing and Data Science students match CDS/Computing/Data Science awards
 - Innovation, merit, enrichment, or general undergraduate awards when the
   student's programme, interests, or activities align
-- School of Computing and Data Science students may qualify for Engineering,
-  Computing, Data Science, Innovation, or university-wide awards unless a
-  different faculty is explicitly required
 
 DISQUALIFIED — do not include:
 - Entrance scholarships for newly admitted students
+- Faculty of Engineering-only awards for School of Computing and Data Science
+  students (CDS is a separate school — do not treat them as Engineering)
 - Wrong faculty when the scholarship explicitly excludes the student's faculty
 - Wrong nationality or local/non-local status
 - Financial need required but student opted out

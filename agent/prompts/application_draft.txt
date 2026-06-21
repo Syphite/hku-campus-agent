@@ -27,6 +27,8 @@ INSTRUCTIONS:
 
 2. Form fields: pre-fill every standard field you can from the profile.
    Leave fields as null if you genuinely cannot determine the value.
+   Do not invent essay or personal-statement text — leave those null unless the
+   student has already provided them in the profile.
 
 3. Checklist:
    - used: list everything from the profile you drew on
@@ -54,8 +56,7 @@ Return ONLY valid JSON — no preamble, no markdown:
     "cgpa": "",
     "email": "",
     "phone": "",
-    "nationality": "",
-    "personal_statement": ""
+    "nationality": ""
   }},
   "checklist": {{
     "used": ["list of profile elements used"],

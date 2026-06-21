@@ -168,6 +168,32 @@ def _profile_flat(profile: dict) -> dict[str, str]:
     }
 
 
+EMAIL_PROFILE_KEYS = frozenset({
+    "email",
+    "university_email",
+    "personal_email",
+    "email_address",
+})
+
+EMAIL_ANCHOR_KEYS = frozenset({
+    "email",
+    "university_email",
+    "personal_email",
+})
+
+
+def is_email_form_field(field_schema: dict) -> bool:
+    """True when a form field should not be auto-filled with email from profile."""
+    profile_key = str(field_schema.get("profile_key") or "").strip().lower()
+    if profile_key in EMAIL_PROFILE_KEYS:
+        return True
+    for part in (field_schema.get("key"), field_schema.get("anchor_label")):
+        normalized = normalize_text(str(part or ""))
+        if "email" in normalized or "e mail" in normalized:
+            return True
+    return False
+
+
 ANCHOR_RESOLVERS: list[tuple[tuple[str, ...], str]] = [
     (("name in english", "english on hkid"), "name_en"),
     (("name in chinese", "chinese on hkid"), "chinese_name"),
@@ -199,6 +225,8 @@ def resolve_by_anchor(anchor_label: str, profile: dict) -> str:
         return ""
     flat = _profile_flat(profile)
     for patterns, key in ANCHOR_RESOLVERS:
+        if key in EMAIL_ANCHOR_KEYS:
+            continue
         if any(pattern in anchor for pattern in patterns):
             value = flat.get(key, "")
             if value:
@@ -208,15 +236,19 @@ def resolve_by_anchor(anchor_label: str, profile: dict) -> str:
 
 def resolve_profile_field(profile: dict, field_schema: dict) -> str:
     """Resolve a simple form field value from profile data."""
+    if is_email_form_field(field_schema):
+        return ""
+
     profile_key = str(field_schema.get("profile_key") or field_schema.get("key") or "").strip()
     flat = _profile_flat(profile)
 
     if profile_key:
+        if profile_key in EMAIL_PROFILE_KEYS:
+            return ""
         if profile_key in flat and flat[profile_key]:
             return flat[profile_key]
         legacy = {
             "name": flat["name"],
-            "email": flat["email"],
             "phone": flat["phone"],
             "student_id": flat["student_id"],
             "faculty": flat["faculty"],
@@ -234,6 +266,8 @@ def resolve_profile_field(profile: dict, field_schema: dict) -> str:
         return anchor_value
 
     key = str(field_schema.get("key") or "")
+    if key.lower() in EMAIL_PROFILE_KEYS:
+        return ""
     if key in flat and flat[key]:
         return flat[key]
 

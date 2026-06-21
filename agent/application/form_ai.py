@@ -14,7 +14,12 @@ from openai import AzureOpenAI
 from agent.application.cell_utils import normalize_text, parse_llm_json, texts_match
 from agent.application.fill_geometry import infer_table_fill_location
 from agent.application.hku_programme_lookup import lookup_normative_duration
-from agent.application.profile_resolver import resolve_profile_field, truncate_to_words, expand_programme_name
+from agent.application.profile_resolver import (
+    resolve_profile_field,
+    truncate_to_words,
+    expand_programme_name,
+    is_email_form_field,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -454,6 +459,24 @@ def _compact_profile_for_mapping(profile: dict) -> dict:
     }
 
 
+def build_profile_context_for_long_text_draft(profile: dict) -> dict:
+    """Curated student context for long-text AI drafts (not the full profile blob)."""
+    academic = profile.get("academic") or {}
+    year = academic.get("year_of_study") or profile.get("year", "")
+    return {
+        "name": str(profile.get("name") or ""),
+        "gpa": str(academic.get("gpa") or ""),
+        "faculty": str(academic.get("faculty") or profile.get("faculty") or ""),
+        "programme": expand_programme_name(
+            academic.get("programme") or profile.get("programme") or ""
+        ),
+        "year_of_study": str(year or ""),
+        "interests": list(profile.get("interests") or []),
+        "activities": list(profile.get("activities") or []),
+        "cv_text": str(profile.get("cv_text") or "")[:3500],
+    }
+
+
 def suggest_profile_entries_for_gap(
     gap: dict,
     profile: dict,
@@ -638,6 +661,8 @@ def build_filled_data(schema: dict, profile: dict, free_fields: list | None = No
     for field in schema.get("simple_fields", []):
         key = field.get("key")
         if not key:
+            continue
+        if is_email_form_field(field):
             continue
         value = _apply_field_postprocess(field, resolve_profile_field(profile, field))
         if value:
@@ -908,9 +933,174 @@ def _normalize_batch_entry(item: dict, field_keys: list[str], list_schema: dict 
     return normalized
 
 
+DATE_RANGE_RE = re.compile(
+    r"(?:"
+    r"\d{1,2}/\d{4}\s*[-–—]\s*\d{1,2}/\d{4}"
+    r"|\d{1,2}/\d{4}\s*[-–—]\s*\d{4}"
+    r"|\d{4}\s*[-–—]\s*\d{4}"
+    r"|\d{4}/\d{4}"
+    r")",
+    re.IGNORECASE,
+)
+
+QUALIFICATION_RE = re.compile(
+    r"\b("
+    r"IBDP|IB\b|International Baccalaureate|"
+    r"A-?levels?|GCE|GCSE|IGCSE|"
+    r"DSE|HKDSE|Hong Kong Diploma|"
+    r"Higher Diploma|Associate Degree|Foundation Year|"
+    r"Bachelor(?:'s)?|Master(?:'s)?|Doctor(?:ate)?|PhD|"
+    r"B\.?\s?Sc|B\.?\s?A|B\.?\s?Eng|LLB|MBBS"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SCHOOL_HINT_RE = re.compile(
+    r"\b(College|School|University|Institute|Academy|Secondary|Primary|Polytechnic)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_date_range(text: str) -> str:
+    match = DATE_RANGE_RE.search(str(text or ""))
+    return match.group(0).strip() if match else ""
+
+
+def _extract_qualification(text: str) -> tuple[str, str]:
+    raw = str(text or "")
+    match = QUALIFICATION_RE.search(raw)
+    if not match:
+        return "", raw.strip()
+    qualification = match.group(0).strip()
+    remainder = (raw[: match.start()] + raw[match.end() :]).strip(" ,;")
+    return qualification, remainder
+
+
+def _classify_education_part(part: str) -> str:
+    cleaned = str(part or "").strip()
+    if not cleaned:
+        return "empty"
+    if _extract_date_range(cleaned):
+        return "dates"
+    qual, _remainder = _extract_qualification(cleaned)
+    if qual and len(cleaned.split()) <= 4:
+        return "qualification"
+    if SCHOOL_HINT_RE.search(cleaned):
+        return "institution"
+    if len(cleaned.split()) >= 2:
+        return "institution"
+    qual_only, remainder = _extract_qualification(cleaned)
+    if qual_only and not remainder:
+        return "qualification"
+    return "unknown"
+
+
+def _parse_education_line(line: str, field_keys: list[str]) -> dict:
+    cleaned = str(line or "").strip(" •-\t")
+    if not cleaned:
+        return {}
+
+    parts = [part.strip() for part in re.split(r"[,;]", cleaned) if part.strip()]
+    mapped: dict[str, str] = {}
+
+    if len(parts) >= 2:
+        for part in parts:
+            kind = _classify_education_part(part)
+            if kind == "dates" and "dates" in field_keys and not mapped.get("dates"):
+                mapped["dates"] = _extract_date_range(part) or part
+            elif kind == "qualification" and "qualification" in field_keys and not mapped.get("qualification"):
+                qual, _ = _extract_qualification(part)
+                mapped["qualification"] = qual or part
+            elif kind == "institution" and "institution" in field_keys and not mapped.get("institution"):
+                mapped["institution"] = part
+        if not mapped.get("dates"):
+            for part in parts:
+                dates = _extract_date_range(part)
+                if dates:
+                    mapped["dates"] = dates
+                    break
+        if not mapped.get("qualification"):
+            for part in parts:
+                qual, _ = _extract_qualification(part)
+                if qual:
+                    mapped["qualification"] = qual
+                    break
+        if not mapped.get("institution"):
+            for part in parts:
+                if _classify_education_part(part) == "institution":
+                    mapped["institution"] = part
+                    break
+    else:
+        dates = _extract_date_range(cleaned)
+        if dates:
+            mapped["dates"] = dates
+            cleaned = cleaned.replace(dates, "").strip(" ,;")
+        qualification, remainder = _extract_qualification(cleaned)
+        if qualification:
+            mapped["qualification"] = qualification
+            cleaned = remainder
+        institution = cleaned.strip(" ,;")
+        if institution and "institution" in field_keys:
+            mapped["institution"] = institution
+
+    normalized = _normalize_batch_entry(mapped, field_keys, {"list_kind": "education"})
+    if not any(normalized.values()):
+        return {}
+    if not normalized.get("institution") and not normalized.get("qualification"):
+        return {}
+    return normalized
+
+
+def parse_education_entries_heuristic(
+    user_text: str,
+    list_schema: dict,
+    max_rows: int | None = None,
+) -> list[dict]:
+    """Parse education list rows from free text without calling the LLM."""
+    max_rows = max_rows if max_rows is not None else safe_max_rows(list_schema)
+    field_keys = list_entry_field_keys(list_schema)
+    entries: list[dict] = []
+    for chunk in re.split(r"[\n\r]+|(?<=\.)\s+(?=[A-Z])", str(user_text or "")):
+        for line in chunk.split(";"):
+            parsed = _parse_education_line(line, field_keys)
+            if parsed:
+                entries.append(parsed)
+            if len(entries) >= max_rows:
+                return entries
+    return entries
+
+
+def format_list_entries_summary(entries: list[dict], list_schema: dict) -> str:
+    if not entries:
+        return ""
+    kind = (list_schema or {}).get("list_kind") or infer_list_kind(list_schema or {})
+    field_keys = list_entry_field_keys(list_schema or {})
+    lines = []
+    for entry in entries:
+        if kind == "education":
+            parts = [
+                entry.get("dates") or entry.get("period") or "",
+                entry.get("institution") or entry.get("organization") or entry.get("school") or "",
+                entry.get("qualification") or entry.get("role") or entry.get("degree") or "",
+            ]
+        else:
+            parts = [entry.get(key) or "" for key in field_keys]
+        summary = ", ".join(part for part in parts if part)
+        if summary:
+            lines.append(f"- {summary}")
+    return "\n".join(lines)
+
+
 def parse_list_entries_batch(user_text: str, list_schema: dict, max_rows: int | None = None) -> list[dict]:
     max_rows = max_rows if max_rows is not None else safe_max_rows(list_schema)
     field_keys = list_entry_field_keys(list_schema)
+    list_kind = list_schema.get("list_kind") or infer_list_kind(list_schema)
+
+    if list_kind == "education":
+        heuristic_entries = parse_education_entries_heuristic(user_text, list_schema, max_rows)
+        if heuristic_entries:
+            return heuristic_entries
+
     example_entry = {key: "..." for key in field_keys}
     prompt = _load_prompt("form_list_batch_parse.txt").format(
         list_schema=json.dumps(list_schema, ensure_ascii=False, indent=2),
@@ -919,17 +1109,22 @@ def parse_list_entries_batch(user_text: str, list_schema: dict, max_rows: int | 
         field_keys=", ".join(field_keys),
         example_entry=json.dumps(example_entry, ensure_ascii=False),
     )
-    client = _get_openai_client()
-    response = client.chat.completions.create(
-        model=_deployment(),
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        max_tokens=2000,
-        temperature=0.1,
-    )
-    parsed = parse_llm_json(response.choices[0].message.content or "{}")
+    try:
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=_deployment(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2000,
+            temperature=0.1,
+        )
+        parsed = parse_llm_json(response.choices[0].message.content or "{}")
+    except Exception as exc:
+        logger.warning("List batch parse failed: %s", exc)
+        parsed = {}
+
     if not isinstance(parsed, dict):
-        return []
+        parsed = {}
 
     entries = []
     for item in parsed.get("entries", []) or []:
@@ -940,6 +1135,9 @@ def parse_list_entries_batch(user_text: str, list_schema: dict, max_rows: int | 
             entries.append(normalized)
         if len(entries) >= max_rows:
             break
+
+    if not entries and list_kind == "education":
+        entries = parse_education_entries_heuristic(user_text, list_schema, max_rows)
     return entries
 
 
@@ -952,6 +1150,12 @@ def parse_application_collection(user_text: str, current_gap: dict, profile: dic
         "key": current_gap.get("key"),
         "prompt": build_section_prompt(current_gap),
     }, ensure_ascii=False, indent=2)
+
+    list_schema = current_gap.get("schema") or {}
+    list_kind = list_schema.get("list_kind") or infer_list_kind(list_schema)
+    education_entries = []
+    if section_type == "repeating_list" and list_kind == "education":
+        education_entries = parse_education_entries_heuristic(user_text, list_schema, max_rows=1)
 
     prompt = _load_prompt("form_collection_router.txt").format(
         current_section=current_section,
@@ -968,6 +1172,13 @@ def parse_application_collection(user_text: str, current_gap: dict, profile: dic
         )
         parsed = parse_llm_json(response.choices[0].message.content or "{}")
         if isinstance(parsed, dict):
+            intent = parsed.get("intent", "unknown")
+            if education_entries and intent in ("clarify", "unknown"):
+                return {
+                    "intent": "fill_section",
+                    "extracted_data": {"answer_text": user_text},
+                    "agent_response": "",
+                }
             return parsed
     except Exception as exc:
         logger.warning("Application collection router failed: %s", exc)
@@ -986,6 +1197,12 @@ def parse_application_collection(user_text: str, current_gap: dict, profile: dic
                 "extracted_data": {},
                 "agent_response": f"I'll draft **{section_label}** from your profile.",
             }
+    if education_entries:
+        return {
+            "intent": "fill_section",
+            "extracted_data": {"answer_text": user_text},
+            "agent_response": "",
+        }
     return {
         "intent": "fill_section",
         "extracted_data": {"answer_text": user_text},
@@ -994,28 +1211,34 @@ def parse_application_collection(user_text: str, current_gap: dict, profile: dic
 
 
 def parse_list_entry(user_text: str, list_schema: dict) -> dict:
+    list_kind = list_schema.get("list_kind") or infer_list_kind(list_schema)
+    field_keys = list_entry_field_keys(list_schema)
+    if list_kind == "education":
+        entries = parse_education_entries_heuristic(user_text, list_schema, max_rows=1)
+        return entries[0] if entries else {}
+
     prompt = _load_prompt("form_list_entry_parse.txt").format(
         list_schema=json.dumps(list_schema, ensure_ascii=False, indent=2),
         user_text=user_text,
+        field_keys=", ".join(field_keys),
     )
-    client = _get_openai_client()
-    response = client.chat.completions.create(
-        model=_deployment(),
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        max_tokens=800,
-        temperature=0.1,
-    )
-    parsed = parse_llm_json(response.choices[0].message.content or "{}")
+    try:
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=_deployment(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=800,
+            temperature=0.1,
+        )
+        parsed = parse_llm_json(response.choices[0].message.content or "{}")
+    except Exception as exc:
+        logger.warning("List entry parse failed: %s", exc)
+        parsed = {}
+
     if not isinstance(parsed, dict):
         return {}
-    return {
-        "organization": str(parsed.get("organization") or "").strip(),
-        "role": str(parsed.get("role") or "").strip(),
-        "dates": str(parsed.get("dates") or "").strip(),
-        "hours": str(parsed.get("hours") or "").strip(),
-        "description": str(parsed.get("description") or "").strip(),
-    }
+    return _normalize_batch_entry(parsed, field_keys, list_schema)
 
 
 def draft_list_description(
@@ -1093,10 +1316,11 @@ def enrich_list_descriptions(merged_data: dict, table_schema: dict, profile: dic
 
 def draft_long_text(field_schema: dict, profile: dict, collected_lists: dict) -> str:
     target_words = int(field_schema.get("target_words") or 800)
+    profile_context = build_profile_context_for_long_text_draft(profile)
     prompt = _load_prompt("form_long_text_draft.txt").format(
         target_words=target_words,
         field_schema=json.dumps(field_schema, ensure_ascii=False, indent=2),
-        profile_json=json.dumps(profile, ensure_ascii=False, indent=2),
+        profile_json=json.dumps(profile_context, ensure_ascii=False, indent=2),
         collected_lists_json=json.dumps(collected_lists, ensure_ascii=False, indent=2),
     )
     client = _get_openai_client()

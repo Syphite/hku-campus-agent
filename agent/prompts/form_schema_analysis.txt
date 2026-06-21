@@ -70,7 +70,7 @@ Rules:
     }}
   ],
   "long_text": [
-    {{"key": "personal_statement", "anchor_label": "Personal Statement", "fill_location": "below", "table_index": 0, "source": "table", "target_words": 800}}
+    {{"key": "<snake_case_key_from_label>", "anchor_label": "<exact label from form>", "fill_location": "below", "table_index": 0, "source": "table", "target_words": 800}}
   ],
   "booleans": [
     {{"key": "local_student", "anchor_label": "Local Student", "fill_location": "below", "table_index": 0, "source": "table"}}

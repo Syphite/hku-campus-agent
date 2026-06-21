@@ -19,6 +19,7 @@ logger     = logging.getLogger(__name__)
 ENDPOINT   = os.environ["AZURE_SEARCH_ENDPOINT"]
 API_KEY    = os.environ["AZURE_SEARCH_API_KEY"]
 INDEX_NAME = os.environ.get("SCHOLARSHIP_INDEX_NAME", "scholarships")
+INDEX_META_DOC_ID = "_index_meta"
 
 
 def get_index_schema() -> SearchIndex:
@@ -106,3 +107,23 @@ def get_existing_ids() -> set:
     client  = SearchClient(ENDPOINT, INDEX_NAME, AzureKeyCredential(API_KEY))
     results = client.search(search_text="*", select=["id"], top=1000)
     return {doc["id"] for doc in results}
+
+
+def touch_index_metadata(source: str = "scholarship_scrape") -> str:
+    """
+    Record that the search index was refreshed by a scraper run.
+    Matching reads this to invalidate stale per-student scholarship caches.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    client = SearchClient(ENDPOINT, INDEX_NAME, AzureKeyCredential(API_KEY))
+    client.merge_or_upload_documents([{
+        "id": INDEX_META_DOC_ID,
+        "name": "Scholarship index metadata",
+        "source": source,
+        "scraped_at": now,
+        "last_updated": now,
+        "level": ["all"],
+        "nationality": ["all"],
+    }])
+    logger.info("Index metadata touched (%s) at %s", source, now)
+    return now

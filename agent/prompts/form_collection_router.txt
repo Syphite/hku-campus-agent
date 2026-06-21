@@ -19,11 +19,15 @@ Return ONLY valid JSON:
 
 Rules:
 - Treat any message containing "skip", "next", "move on", "pass", "no more", "don't have", or "nothing to add" as skip_section unless the user is clearly providing form content.
+- For repeating_list sections (especially education), treat pasted entries as fill_section even when brief — e.g. comma-separated dates, school, and qualification, or "Sha Tin College IBDP 2023-2025".
+- Do NOT respond with clarify/unknown when the user pasted a concrete list entry; use fill_section instead.
 - For clarify, ask one short follow-up only — do NOT repeat the full section prompt (the UI already shows it).
 - For unknown, one brief sentence only — do NOT repeat the full section prompt.
 - Do not mention profile gaps unless the student explicitly asks.
 
 Examples:
+- User: "8/2023-5/2025, Sha Tin College, IBDP" on an education list section -> fill_section
+- User: "Sha Tin College IBDP 2023-2025" on an education list section -> fill_section
 - User: "Code4HK tutor Sep-May 40hrs; Robotics mentor Jan-Jun" on a volunteer list section -> fill_section
 - User: "draft it for me" on an essay section -> draft_section
 - User: "skip this" or "skip volunteer" -> skip_section

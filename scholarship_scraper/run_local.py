@@ -12,7 +12,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 logging.basicConfig(level=logging.INFO)
 
 from parser  import scrape_all
-from indexer import ensure_index_exists, upsert_scholarships, get_existing_ids
+from indexer import ensure_index_exists, upsert_scholarships, get_existing_ids, touch_index_metadata
 
 limit = None
 if "--limit" in sys.argv:
@@ -31,6 +31,8 @@ new_ids = {s["id"] for s in scholarships} - existing
 print(f"New since last run: {len(new_ids)}")
 
 succeeded, failed = upsert_scholarships(scholarships)
+if scholarships:
+    touch_index_metadata("scholarship_scrape_local")
 print(f"\nDone. Indexed: {succeeded} succeeded, {failed} failed")
 
 if scholarships:

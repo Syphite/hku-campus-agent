@@ -44,23 +44,31 @@ PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "eligibility_re
 with open(PROMPT_PATH) as f:
     PROMPT_TEMPLATE = f.read()
 
-SCHOLARSHIP_CACHE_VERSION = 4
+SCHOLARSHIP_CACHE_VERSION = 5
+INDEX_META_DOC_ID = "_index_meta"
 STAGE1_TOP_PER_QUERY = 35
 STAGE1_MAX_CANDIDATES = 60
 STAGE2_BATCH_SIZE = 20
 
-FACULTY_ALIAS_GROUPS = (
-    {
+# Faculty alias groups — CDS and Engineering are separate (CDS split from Engineering in 2024).
+FACULTY_GROUPS = {
+    "cds": {
         "school of computing and data science", "computing and data science", "cds",
-        "computer science", "computing", "data science", "faculty of engineering",
-        "engineering", "faculty of engineering and",
+        "computer science", "computing", "data science",
     },
-    {"faculty of business and economics", "business and economics", "business", "economics", "fba"},
-    {"faculty of science", "science", "faculty of science"},
-    {"faculty of arts", "arts", "humanities"},
-    {"faculty of medicine", "medicine", "li ka shing", "medical"},
-    {"faculty of law", "law"},
-)
+    "engineering": {
+        "faculty of engineering", "engineering", "faculty of engineering and",
+    },
+    "business": {
+        "faculty of business and economics", "business and economics", "business", "economics", "fba",
+    },
+    "science": {"faculty of science", "science"},
+    "arts": {"faculty of arts", "arts", "humanities"},
+    "medicine": {"faculty of medicine", "medicine", "li ka shing", "medical"},
+    "law": {"faculty of law", "law"},
+}
+
+FACULTY_ALIAS_GROUPS = tuple(FACULTY_GROUPS.values())
 
 _EXCLUSIVE_PROGRAMME_MARKERS = (
     "only for", " exclusively", "must be enrolled in", "restricted to",
@@ -116,9 +124,62 @@ def _is_entrance_scholarship(scholarship: dict) -> bool:
     return any(term in text for term in ENTRANCE_TEXT_TERMS)
 
 
-# ---------------------------------------------------------------------------
-# Stage 1 — Structured Azure AI Search filter
-# ---------------------------------------------------------------------------
+def _parse_cache_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_index_scraped_at() -> str | None:
+    """Return the latest scraper watermark from the search index, if present."""
+    try:
+        client = SearchClient(SEARCH_ENDPOINT, INDEX_NAME, AzureKeyCredential(SEARCH_API_KEY))
+        doc = client.get_document(key=INDEX_META_DOC_ID)
+        return str(doc.get("scraped_at") or doc.get("last_updated") or "") or None
+    except Exception as exc:
+        logger.debug("Index metadata unavailable: %s", exc)
+        return None
+
+
+def _scholarship_cache_valid(cache: dict) -> bool:
+    cached_result = cache.get("result")
+    cached_timestamp = cache.get("timestamp")
+    cached_version = cache.get("version", 1)
+    if not cached_result or not cached_timestamp:
+        return False
+    if cached_version < SCHOLARSHIP_CACHE_VERSION:
+        return False
+
+    cached_at = _parse_cache_timestamp(cached_timestamp)
+    if not cached_at:
+        return False
+    if datetime.now(timezone.utc) - cached_at >= timedelta(hours=1):
+        return False
+
+    index_scraped_at = _get_index_scraped_at()
+    cache_index_at = cache.get("index_scraped_at")
+    if index_scraped_at and cache_index_at:
+        index_at = _parse_cache_timestamp(index_scraped_at)
+        cached_index_at = _parse_cache_timestamp(cache_index_at)
+        if index_at and cached_index_at and index_at > cached_index_at:
+            return False
+    return True
+
+
+def _save_scholarship_cache(profile: dict, result: dict) -> None:
+    profile["scholarship_cache"] = {
+        "result": result,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": SCHOLARSHIP_CACHE_VERSION,
+        "index_scraped_at": _get_index_scraped_at(),
+    }
+    save_profile(profile)
 
 def _student_gpa(profile: dict) -> float:
     try:
@@ -127,17 +188,28 @@ def _student_gpa(profile: dict) -> float:
         return 0.0
 
 
+def _faculty_group_ids(faculty: str) -> set[str]:
+    text = str(faculty or "").strip().lower()
+    if not text:
+        return set()
+    matched = set()
+    for group_id, aliases in FACULTY_GROUPS.items():
+        if any(alias in text or text in alias for alias in aliases):
+            matched.add(group_id)
+    return matched
+
+
 def _faculty_alias_tokens(faculty: str) -> set[str]:
     text = str(faculty or "").strip().lower()
     tokens = {text} if text else set()
-    for group in FACULTY_ALIAS_GROUPS:
-        if any(alias in text or text in alias for alias in group):
-            tokens |= group
+    for aliases in FACULTY_ALIAS_GROUPS:
+        if any(alias in text or text in alias for alias in aliases):
+            tokens |= aliases
     return tokens
 
 
 def _faculty_matches(index_faculties, student_faculty: str) -> bool:
-    """Loose faculty match — handles CDS vs Engineering and university-wide awards."""
+    """Faculty match — university-wide (all) awards match everyone; CDS ≠ Engineering."""
     if not student_faculty:
         return True
     if index_faculties in (None, "", []):
@@ -146,14 +218,27 @@ def _faculty_matches(index_faculties, student_faculty: str) -> bool:
         index_faculties = [index_faculties]
     student = str(student_faculty).strip().lower()
     student_tokens = _faculty_alias_tokens(student)
+    student_groups = _faculty_group_ids(student)
+
+    matched_specific = False
+    index_groups: set[str] = set()
     for value in index_faculties:
         faculty = str(value).strip().lower()
         if not faculty or faculty == "all":
             return True
-        if student == faculty or student in faculty or faculty in student:
+        matched_specific = True
+        index_groups |= _faculty_group_ids(faculty)
+        if student == faculty:
             return True
         if student_tokens & _faculty_alias_tokens(faculty):
             return True
+
+    if not matched_specific:
+        return True
+
+    # CDS students must not match Engineering-only faculty scholarships.
+    if student_groups == {"cds"} and index_groups == {"engineering"}:
+        return False
     return False
 
 
@@ -227,8 +312,8 @@ def _student_programme_groups(programme: str, faculty: str) -> set[str]:
     groups = _programme_keyword_groups(programme)
     faculty_lower = str(faculty or "").lower()
     if any(term in faculty_lower for term in ("computing", "data science", "cds", "computer")):
-        groups.update({"computer science", "engineering"})
-    if "engineering" in faculty_lower:
+        groups.add("computer science")
+    elif "engineering" in faculty_lower:
         groups.add("engineering")
     return groups
 
@@ -602,7 +687,7 @@ def _stage1_search(profile: dict) -> list[dict]:
     def add_results(results) -> None:
         for candidate in results:
             candidate_id = str(candidate.get("id") or "")
-            if not candidate_id or candidate_id in seen_ids:
+            if not candidate_id or candidate_id == INDEX_META_DOC_ID or candidate_id in seen_ids:
                 continue
             if not _accept_stage1_candidate(candidate, profile):
                 continue
@@ -794,19 +879,9 @@ def run_matching(student_id: str) -> dict:
         return {"error": f"Profile not found: {student_id}"}
 
     cache = profile.get("scholarship_cache") or {}
-    cached_result = cache.get("result")
-    cached_timestamp = cache.get("timestamp")
-    cached_version = cache.get("version", 1)
-    if cached_result and cached_timestamp and cached_version >= SCHOLARSHIP_CACHE_VERSION:
-        try:
-            cached_at = datetime.fromisoformat(str(cached_timestamp).replace("Z", "+00:00"))
-            if cached_at.tzinfo is None:
-                cached_at = cached_at.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - cached_at < timedelta(hours=1):
-                logger.info(f"Using cached scholarship matches for {student_id}")
-                return cached_result
-        except (TypeError, ValueError):
-            logger.warning(f"Ignoring invalid scholarship cache timestamp for {student_id}")
+    if _scholarship_cache_valid(cache):
+        logger.info(f"Using cached scholarship matches for {student_id}")
+        return cache["result"]
 
     logger.info(f"Running matching for {profile.get('name', student_id)}...")
 
@@ -822,12 +897,7 @@ def run_matching(student_id: str) -> dict:
             "student_name": profile.get("name", "")
         }
         result = _inject_prototype_scholarship_472(result, profile)
-        profile["scholarship_cache"] = {
-            "result": result,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "version": SCHOLARSHIP_CACHE_VERSION,
-        }
-        save_profile(profile)
+        _save_scholarship_cache(profile, result)
         return result
 
     matches     = _stage2_reasoning(profile, candidates)
@@ -839,12 +909,7 @@ def run_matching(student_id: str) -> dict:
     result      = _inject_prototype_scholarship_472(result, profile)
     result["student_id"]   = student_id
     result["student_name"] = profile.get("name", "")
-    profile["scholarship_cache"] = {
-        "result": result,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": SCHOLARSHIP_CACHE_VERSION,
-    }
-    save_profile(profile)
+    _save_scholarship_cache(profile, result)
     return result
 
 

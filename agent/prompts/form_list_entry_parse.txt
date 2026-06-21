@@ -1,9 +1,9 @@
 Parse the user's message into one structured list entry for a scholarship application form.
 
-Return ONLY valid JSON in this shape:
-{{"organization": "...", "role": "...", "dates": "...", "hours": "...", "description": "..."}}
-
+Return ONLY valid JSON using these field keys: {field_keys}
 Use empty strings for missing values. Do not invent organizations or dates not implied by the user.
+
+For education sections, map schools/colleges/universities to institution, degrees/qualifications (IBDP, A-level, DSE, etc.) to qualification, and study periods to dates.
 
 List section schema:
 {list_schema}

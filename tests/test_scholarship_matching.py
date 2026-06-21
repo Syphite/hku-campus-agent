@@ -21,10 +21,22 @@ CDS_PROFILE = {
     "financial": {"financial_need_opt_in": False},
 }
 
+ENGINEERING_PROFILE = {
+    "academic": {
+        "faculty": "Faculty of Engineering",
+        "programme": "Bachelor of Engineering in Civil Engineering",
+        "year_of_study": "Year 2",
+        "level": "undergraduate",
+        "gpa": 3.5,
+        "nationality": {"local_status": "local"},
+    },
+    "financial": {"financial_need_opt_in": False},
+}
+
 
 class FacultyMatchingTests(unittest.TestCase):
-    def test_cds_matches_engineering_faculty_scholarship(self):
-        self.assertTrue(
+    def test_cds_does_not_match_engineering_faculty_scholarship(self):
+        self.assertFalse(
             _faculty_matches(
                 ["Faculty of Engineering"],
                 "School of Computing and Data Science",
@@ -36,9 +48,22 @@ class FacultyMatchingTests(unittest.TestCase):
             _faculty_matches(["CDS"], "School of Computing and Data Science")
         )
 
+    def test_cds_matches_full_school_name(self):
+        self.assertTrue(
+            _faculty_matches(
+                ["School of Computing and Data Science"],
+                "School of Computing and Data Science",
+            )
+        )
+
     def test_university_wide_matches_any_student(self):
         self.assertTrue(
             _faculty_matches(["all"], "School of Computing and Data Science")
+        )
+
+    def test_engineering_student_matches_engineering_scholarship(self):
+        self.assertTrue(
+            _faculty_matches(["Faculty of Engineering"], "Faculty of Engineering")
         )
 
 
@@ -51,20 +76,27 @@ class YearMatchingTests(unittest.TestCase):
 
 
 class ProgrammeMatchTests(unittest.TestCase):
-    def test_engineering_scholarship_is_faculty_only_for_cds_student(self):
+    def test_engineering_scholarship_is_mismatch_for_cds_student(self):
         item = {
             "name": "Faculty of Engineering Innovation Scholarship",
             "faculty": ["Faculty of Engineering"],
             "eligibility_raw": "Open to undergraduate students in the Faculty of Engineering.",
         }
-        match = _deterministic_program_match(item, CDS_PROFILE)
-        self.assertIn(match, {"exact", "faculty_only"})
+        self.assertEqual(_deterministic_program_match(item, CDS_PROFILE), "mismatch")
 
     def test_university_wide_award_is_faculty_only(self):
         item = {
             "name": "HKU Merit Scholarship",
             "faculty": ["all"],
             "eligibility_raw": "Open to all HKU undergraduate students with strong academic performance.",
+        }
+        self.assertEqual(_deterministic_program_match(item, CDS_PROFILE), "faculty_only")
+
+    def test_cds_faculty_award_matches_cds_student(self):
+        item = {
+            "name": "CDS Excellence Scholarship",
+            "faculty": ["School of Computing and Data Science"],
+            "eligibility_raw": "Open to undergraduate students in the School of Computing and Data Science.",
         }
         self.assertEqual(_deterministic_program_match(item, CDS_PROFILE), "faculty_only")
 
@@ -76,12 +108,19 @@ class ProgrammeMatchTests(unittest.TestCase):
         }
         self.assertEqual(_deterministic_program_match(item, CDS_PROFILE), "mismatch")
 
-    def test_cds_student_programme_groups_include_engineering(self):
+    def test_cds_student_programme_groups_exclude_engineering(self):
         groups = _student_programme_groups(
             CDS_PROFILE["academic"]["programme"],
             CDS_PROFILE["academic"]["faculty"],
         )
         self.assertIn("computer science", groups)
+        self.assertNotIn("engineering", groups)
+
+    def test_engineering_student_programme_groups_include_engineering(self):
+        groups = _student_programme_groups(
+            ENGINEERING_PROFILE["academic"]["programme"],
+            ENGINEERING_PROFILE["academic"]["faculty"],
+        )
         self.assertIn("engineering", groups)
 
 

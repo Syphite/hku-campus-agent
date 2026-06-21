@@ -37,6 +37,7 @@ from agent.application.form_ai import (
     draft_long_text,
     enrich_list_descriptions,
     filter_entries_by_used,
+    format_list_entries_summary,
     gap_data_keys,
     infer_list_kind,
     mark_entries_used,
@@ -2374,7 +2375,7 @@ def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
             cv_ack,
             _oauth_login_required(
                 "Smart Inbox and calendar features need a one-time Microsoft sign-in "
-                f"for email access.\n\n{_post_setup_commands_text(ready=True)}",
+                "for email access.",
                 pending_command="signin",
             ),
         ]
@@ -3371,7 +3372,13 @@ def _fill_current_section(profile: dict, state: dict, current_gap: dict, user_te
         )
         save_profile(profile)
         label = current_gap.get("label") or list_key.replace("_", " ")
-        responses = [_text_response(f"Got {len(entries)} {label} entr{'y' if len(entries) == 1 else 'ies'}.")]
+        summary = format_list_entries_summary(entries, list_schema)
+        if summary:
+            responses = [_text_response(
+                f"Added {len(entries)} {label} entr{'y' if len(entries) == 1 else 'ies'}:\n{summary}"
+            )]
+        else:
+            responses = [_text_response(f"Got {len(entries)} {label} entr{'y' if len(entries) == 1 else 'ies'}.")]
         if skipped:
             responses.append(_text_response(
                 f"Skipped {len(skipped)} duplicate entr{'y' if len(skipped) == 1 else 'ies'} already used elsewhere."
@@ -3417,8 +3424,11 @@ def _begin_application_review(profile: dict, state: dict) -> list:
             continue
         if any(long_text_drafts.get(key) for key in keys):
             continue
+        schema = dict(gap.get("schema") or {})
+        schema.setdefault("anchor_label", gap.get("label", gap.get("key")))
+        schema.setdefault("target_words", 800)
         draft = draft_long_text(
-            gap["schema"],
+            schema,
             profile,
             state.get("pending_list_data") or {},
         )

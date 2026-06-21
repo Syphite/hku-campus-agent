@@ -12,6 +12,29 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # PDF Filling Logic (AcroForm)
 # =============================================================================
+def _field_specific_answer(field_name: str, scholarship: dict) -> str:
+    """Return a field-specific long answer only when explicitly provided."""
+    normalized = str(field_name or "").lower().replace(" ", "_").replace("-", "_")
+    if not normalized:
+        return ""
+
+    form_fields = scholarship.get("form_fields") or {}
+    if isinstance(form_fields, dict):
+        for key, value in form_fields.items():
+            key_norm = str(key).lower().replace(" ", "_").replace("-", "_")
+            if value and (key_norm in normalized or normalized in key_norm):
+                return str(value)
+
+    long_text = scholarship.get("long_text") or {}
+    if isinstance(long_text, dict):
+        for key, value in long_text.items():
+            key_norm = str(key).lower().replace(" ", "_").replace("-", "_")
+            if value and (key_norm in normalized or normalized in key_norm):
+                return str(value)
+
+    return ""
+
+
 def _fill_pdf(input_path: str, output_path: str, profile: dict, scholarship: dict) -> bool:
     """Fills AcroForm text fields in a PDF."""
     try:
@@ -31,7 +54,6 @@ def _fill_pdf(input_path: str, output_path: str, profile: dict, scholarship: dic
             "name": profile.get("name", ""),
             "full_name": profile.get("name", ""),
             "student_name": profile.get("name", ""),
-            "email": profile.get("email", ""),
             "phone": profile.get("phone", ""),
             "student_id": profile.get("student_id", ""),
             "faculty": academic.get("faculty", ""),
@@ -44,15 +66,6 @@ def _fill_pdf(input_path: str, output_path: str, profile: dict, scholarship: dic
             "nationality": academic.get("nationality", {}).get("country_of_origin", ""),
             "scholarship_name": scholarship.get("name", ""),
         }
-        answers_text = (
-            scholarship.get("application_answers_text")
-            or scholarship.get("drafted_cover_letter")
-            or ""
-        )
-        essay_keywords = (
-            "essay", "statement", "reason", "experience", "leadership",
-            "answer", "description", "motivation", "personal", "comment",
-        )
 
         filled_count = 0
         for widget in doc.widgets():
@@ -70,10 +83,12 @@ def _fill_pdf(input_path: str, output_path: str, profile: dict, scholarship: dic
                     matched = True
                     break
 
-            if not matched and answers_text and any(key in field_name for key in essay_keywords):
-                widget.field_value = answers_text[:4000]
-                widget.update()
-                filled_count += 1
+            if not matched:
+                specific_answer = _field_specific_answer(field_name, scholarship)
+                if specific_answer:
+                    widget.field_value = specific_answer[:4000]
+                    widget.update()
+                    filled_count += 1
 
         doc.save(output_path)
         doc.close()
@@ -102,17 +117,12 @@ def _fill_docx(input_path: str, output_path: str, profile: dict, scholarship: di
         
         # Build replacement dictionary with {{placeholder}} syntax
         academic = profile.get("academic", {})
-        financial = profile.get("financial", {})
-        answers_text = (
-            scholarship.get("application_answers_text")
-            or scholarship.get("drafted_cover_letter")
-            or ""
-        )
+        form_fields = scholarship.get("form_fields") or {}
+        long_text = scholarship.get("long_text") or {}
 
         replacements = {
             "{{name}}": profile.get("name", ""),
             "{{full_name}}": profile.get("name", ""),
-            "{{email}}": profile.get("email", ""),
             "{{phone}}": profile.get("phone", ""),
             "{{student_id}}": profile.get("student_id", ""),
             "{{faculty}}": academic.get("faculty", ""),
@@ -124,8 +134,15 @@ def _fill_docx(input_path: str, output_path: str, profile: dict, scholarship: di
             "{{nationality}}": academic.get("nationality", {}).get("country_of_origin", ""),
             "{{scholarship_name}}": scholarship.get("name", ""),
             "{{cover_letter}}": scholarship.get("drafted_cover_letter", ""),
-            "{{application_answers}}": answers_text,
         }
+        if isinstance(form_fields, dict):
+            for key, value in form_fields.items():
+                if value:
+                    replacements[f"{{{{{key}}}}}"] = str(value)
+        if isinstance(long_text, dict):
+            for key, value in long_text.items():
+                if value:
+                    replacements[f"{{{{{key}}}}}"] = str(value)
 
         replaced_count = 0
 

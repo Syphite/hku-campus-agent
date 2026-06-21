@@ -147,7 +147,6 @@ async def messages(req: web.Request) -> web.Response:
             )
             await turn_context.send_activity(Activity(
                 type=ActivityTypes.message,
-                text=card_text,
                 attachments=[
                     Attachment(
                         content_type="application/vnd.microsoft.card.signin",
