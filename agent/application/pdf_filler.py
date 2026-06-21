@@ -24,12 +24,20 @@ def _insert_near_anchor(page, anchor_label: str, value: str, fill_location: str)
         return False
 
     rect = rects[0]
-    fill_location = (fill_location or "right").lower()
-    x = rect.x1 + 8
-    y = rect.y0 + 2
+    fill_location = (fill_location or "auto").lower()
+
     if fill_location == "below":
-        x = rect.x0
-        y = rect.y1 + 4
+        x, y = rect.x0, rect.y1 + 4
+    elif fill_location == "right":
+        x, y = rect.x1 + 8, rect.y0 + 2
+    else:
+        # auto: wide label blocks usually need below; narrow labels often have space to the right
+        label_width = rect.x1 - rect.x0
+        page_width = page.rect.width if page.rect else 600
+        if label_width > page_width * 0.35:
+            x, y = rect.x0, rect.y1 + 4
+        else:
+            x, y = rect.x1 + 8, rect.y0 + 2
 
     page.insert_text((x, y), str(value), fontsize=9)
     return True

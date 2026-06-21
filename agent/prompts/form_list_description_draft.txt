@@ -1,0 +1,19 @@
+Draft a scholarship application list-item description for the field below.
+
+Rules:
+- Write in first person as the student.
+- Target approximately {target_words} words — expand with relevant detail if the source snippet is shorter; do not truncate below the target unless facts run out.
+- Use stronger, confident language; rewrite rather than copy-paste from the CV.
+- Be specific and credible using only the provided profile and item data.
+- Do not invent awards, jobs, or experiences not supported by the data.
+- Return ONLY valid JSON in this shape:
+{{"text": "..."}}
+
+List section:
+{list_schema}
+
+Item data:
+{item_json}
+
+Student profile (summary):
+{profile_json}

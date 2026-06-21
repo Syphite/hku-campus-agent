@@ -10,8 +10,10 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 
-from agent.application.cell_utils import normalize_text, parse_llm_json
-from agent.application.profile_resolver import resolve_profile_field, truncate_to_words
+from agent.application.cell_utils import normalize_text, parse_llm_json, texts_match
+from agent.application.fill_geometry import infer_table_fill_location
+from agent.application.hku_programme_lookup import lookup_normative_duration
+from agent.application.profile_resolver import resolve_profile_field, truncate_to_words, expand_programme_name
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -61,6 +63,45 @@ def _field_has_location(field: dict, table_count: int, paragraph_count: int) -> 
     return 0 <= index < table_count
 
 
+def _find_anchor_row_col(tables: list, table_index: int, anchor_label: str) -> tuple[int, int] | None:
+    if table_index < 0 or table_index >= len(tables):
+        return None
+    target = normalize_text(anchor_label)
+    if not target:
+        return None
+    rows = tables[table_index].get("rows") or []
+    for row_index, row in enumerate(rows):
+        cells = row.get("cells") or []
+        for col_index, cell in enumerate(cells):
+            cell_text = normalize_text(str(cell or ""))
+            if texts_match(anchor_label, str(cell or "")) or target in cell_text or cell_text in target:
+                return row_index, col_index
+    return None
+
+
+def _infer_fill_location(form_payload: dict, field: dict) -> dict:
+    """Infer table fill direction: right if empty, else below when right is occupied."""
+    source = (field.get("source") or "table").lower()
+    if source != "table":
+        return field
+
+    tables = form_payload.get("tables") or []
+    try:
+        table_index = int(field.get("table_index", 0))
+    except (TypeError, ValueError):
+        return field
+
+    anchor_label = field.get("anchor_label", "")
+    loc = _find_anchor_row_col(tables, table_index, anchor_label)
+    if not loc:
+        return field
+
+    row_index, col_index = loc
+    rows = tables[table_index].get("rows") or []
+    field["fill_location"] = infer_table_fill_location(rows, row_index, col_index)
+    return field
+
+
 def _validate_schema(schema: dict, form_payload: dict) -> dict:
     tables = form_payload.get("tables") or []
     paragraphs = form_payload.get("paragraphs") or []
@@ -76,7 +117,7 @@ def _validate_schema(schema: dict, form_payload: dict) -> dict:
 
     for field in schema.get("simple_fields", []) or []:
         if field.get("anchor_label") and field.get("key") and _field_has_location(field, table_count, paragraph_count):
-            cleaned["simple_fields"].append(field)
+            cleaned["simple_fields"].append(_infer_fill_location(form_payload, field))
 
     for field in schema.get("repeating_lists", []) or []:
         headers = field.get("column_headers") or []
@@ -92,11 +133,11 @@ def _validate_schema(schema: dict, form_payload: dict) -> dict:
 
     for field in schema.get("long_text", []) or []:
         if field.get("anchor_label") and field.get("key") and _field_has_location(field, table_count, paragraph_count):
-            cleaned["long_text"].append(field)
+            cleaned["long_text"].append(_infer_fill_location(form_payload, field))
 
     for field in schema.get("booleans", []) or []:
         if field.get("anchor_label") and field.get("key") and _field_has_location(field, table_count, paragraph_count):
-            cleaned["booleans"].append(field)
+            cleaned["booleans"].append(_infer_fill_location(form_payload, field))
 
     return cleaned
 
@@ -455,9 +496,24 @@ def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
             entry = {key: str(mapped.get(key) or "").strip() for key in field_keys}
             if not any(entry.values()):
                 continue
+            for prog_key in field_keys:
+                if "programme" in prog_key.lower() or "qualification" in prog_key.lower():
+                    if entry.get(prog_key):
+                        entry[prog_key] = expand_programme_name(entry[prog_key])
+            list_kind = schema.get("list_kind") or infer_list_kind(schema)
+            if list_kind == "education":
+                programme = (
+                    academic.get("programme") if (academic := profile.get("academic") or {}) else ""
+                ) or profile.get("programme", "")
+                normative = lookup_normative_duration(programme)
+                for norm_key in field_keys:
+                    norm_anchor = norm_key.lower()
+                    if "normative" in norm_anchor or "duration" in norm_anchor:
+                        if normative and not entry.get(norm_key):
+                            entry[norm_key] = normative
             desc_limit = int(schema.get("description_target_words") or 0)
             if desc_limit and entry.get("description"):
-                entry["description"] = truncate_to_words(entry["description"], desc_limit)
+                entry["description"] = draft_list_description(entry, profile, schema, desc_limit)
             entry["_source_text"] = str(item.get("source_text") or "").strip()
             entry["_confidence"] = str(item.get("confidence") or "").strip()
             suggestions.append(entry)
@@ -511,13 +567,26 @@ def build_profile_suggestions_overview(gaps: list, profile: dict, profile_sugges
     return "\n".join(lines)
 
 
+def _apply_field_postprocess(field: dict, value: str) -> str:
+    if not value:
+        return value
+    combined = " ".join([
+        str(field.get("key") or ""),
+        str(field.get("profile_key") or ""),
+        str(field.get("anchor_label") or ""),
+    ]).lower()
+    if "programme" in combined or "major" in combined or "qualification" in combined:
+        return expand_programme_name(value)
+    return value
+
+
 def build_filled_data(schema: dict, profile: dict, free_fields: list | None = None) -> dict:
     simple_values = {}
     for field in schema.get("simple_fields", []):
         key = field.get("key")
         if not key:
             continue
-        value = resolve_profile_field(profile, field)
+        value = _apply_field_postprocess(field, resolve_profile_field(profile, field))
         if value:
             simple_values[key] = value
 
@@ -899,6 +968,79 @@ def parse_list_entry(user_text: str, list_schema: dict) -> dict:
         "hours": str(parsed.get("hours") or "").strip(),
         "description": str(parsed.get("description") or "").strip(),
     }
+
+
+def draft_list_description(
+    item: dict,
+    profile: dict,
+    list_schema: dict,
+    target_words: int,
+) -> str:
+    """Expand or rewrite a list-item description to the target word count."""
+    source = str(item.get("description") or "").strip()
+    if not source and not any(str(item.get(k) or "").strip() for k in ("role", "organization", "dates")):
+        return source
+    try:
+        prompt = _load_prompt("form_list_description_draft.txt").format(
+            target_words=target_words,
+            list_schema=json.dumps(list_schema, ensure_ascii=False, indent=2),
+            item_json=json.dumps(item, ensure_ascii=False, indent=2),
+            profile_json=json.dumps(_compact_profile_for_mapping(profile), ensure_ascii=False, indent=2),
+        )
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=_deployment(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=600,
+            temperature=0.35,
+        )
+        parsed = parse_llm_json(response.choices[0].message.content or "{}")
+        if isinstance(parsed, dict):
+            drafted = str(parsed.get("text") or "").strip()
+            if drafted:
+                return drafted
+    except Exception as exc:
+        logger.warning("List description draft failed: %s", exc)
+    return truncate_to_words(source, target_words) if source else ""
+
+
+def enrich_list_descriptions(merged_data: dict, table_schema: dict, profile: dict) -> dict:
+    """Draft descriptions and normalize field values before form fill."""
+    simple = merged_data.get("simple_fields") or {}
+    schema_fields = {
+        field.get("key"): field
+        for field in (table_schema.get("simple_fields") or [])
+        if field.get("key")
+    }
+    for key, value in list(simple.items()):
+        field = schema_fields.get(key) or {"key": key}
+        simple[key] = _apply_field_postprocess(field, str(value or ""))
+    merged_data["simple_fields"] = simple
+
+    repeating = merged_data.get("repeating_lists") or {}
+    schema_by_key = {
+        field.get("key"): field
+        for field in (table_schema.get("repeating_lists") or [])
+        if field.get("key")
+    }
+    for list_key, items in repeating.items():
+        list_schema = schema_by_key.get(list_key) or {}
+        target_words = int(list_schema.get("description_target_words") or 0)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for prog_key in ("programme", "qualification", "degree", "role"):
+                if item.get(prog_key):
+                    item[prog_key] = expand_programme_name(str(item[prog_key]))
+            if not target_words:
+                continue
+            if item.get("description") or item.get("role") or item.get("organization"):
+                item["description"] = draft_list_description(
+                    item, profile, list_schema, target_words
+                )
+    merged_data["repeating_lists"] = repeating
+    return merged_data
 
 
 def draft_long_text(field_schema: dict, profile: dict, collected_lists: dict) -> str:

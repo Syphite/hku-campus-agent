@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from agent.application.hku_programme_lookup import lookup_normative_duration
 from agent.application.cell_utils import normalize_text
 
 HKU_FULL_NAME = "The University of Hong Kong"
@@ -12,6 +13,8 @@ HKU_FULL_NAME = "The University of Hong Kong"
 PROGRAMME_EXPANSIONS = {
     "beng(cs)": "Bachelor of Engineering in Computer Science",
     "beng (cs)": "Bachelor of Engineering in Computer Science",
+    "beng cs": "Bachelor of Engineering in Computer Science",
+    "bengcs": "Bachelor of Engineering in Computer Science",
     "bengcse": "Bachelor of Engineering in Computer Science",
     "bsc(cs)": "Bachelor of Science in Computer Science",
     "bba": "Bachelor of Business Administration",
@@ -31,15 +34,27 @@ def truncate_to_words(text: str, max_words: int) -> str:
 
 
 def expand_programme_name(programme: str) -> str:
+    """Expand common HKU programme abbreviations to full degree titles."""
     raw = str(programme or "").strip()
     if not raw:
         return ""
     lowered = raw.lower()
     if any(term in lowered for term in ("bachelor", "master", "doctor", "diploma")):
         return raw
-    expanded = PROGRAMME_EXPANSIONS.get(lowered)
-    if expanded:
-        return expanded
+    candidates = [
+        lowered,
+        re.sub(r"\s+", "", lowered),
+        re.sub(r"\s+", " ", lowered).strip(),
+    ]
+    for candidate in candidates:
+        expanded = PROGRAMME_EXPANSIONS.get(candidate)
+        if expanded:
+            return expanded
+    paren = re.match(r"^([a-z]+)\(([a-z]+)\)$", re.sub(r"\s+", "", lowered))
+    if paren:
+        expanded = PROGRAMME_EXPANSIONS.get(f"{paren.group(1)}({paren.group(2)})")
+        if expanded:
+            return expanded
     return raw
 
 
@@ -144,6 +159,12 @@ def _profile_flat(profile: dict) -> dict[str, str]:
         "mobile": str(profile.get("phone") or contact.get("mobile") or ""),
         "home_phone": str(profile.get("home_phone") or contact.get("home_phone") or ""),
         "country_of_origin": str(nationality.get("country_of_origin") or ""),
+        "normative_study": lookup_normative_duration(
+            academic.get("programme") or profile.get("programme") or ""
+        ),
+        "normative_duration": lookup_normative_duration(
+            academic.get("programme") or profile.get("programme") or ""
+        ),
     }
 
 
@@ -155,6 +176,7 @@ ANCHOR_RESOLVERS: list[tuple[tuple[str, ...], str]] = [
     (("university",), "university"),
     (("student number", "student no"), "student_number"),
     (("year gpa", "gpa"), "gpa"),
+    (("normative", "duration of study", "normal duration"), "normative_study"),
     (("programme in full", "programme"), "programme_full"),
     (("expected graduation", "graduation year"), "graduation_year"),
     (("current year of study", "year of study"), "current_year_of_study"),

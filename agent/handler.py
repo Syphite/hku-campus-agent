@@ -35,6 +35,7 @@ from agent.application.form_ai import (
     consolidate_collection_gaps,
     detect_gaps,
     draft_long_text,
+    enrich_list_descriptions,
     gap_data_keys,
     merge_filled_data,
     parse_application_collection,
@@ -741,6 +742,15 @@ def _graph_signin_gate(profile: dict, pending_command: str) -> dict | None:
         "I'll continue with your request right after.",
         pending_command=pending_command,
     )
+
+
+def _onboarding_cv_gate(profile: dict) -> list | None:
+    """Block digest/inbox until the student uploads a CV after onboarding."""
+    if profile.get("pending_onboarding_step") == "await_cv":
+        return [_text_response(
+            "Please upload your CV first — attach your PDF to this chat and type **CV**."
+        )]
+    return None
 
 
 def _run_inbox_pipeline_for_profile(student_id: str, profile: dict) -> tuple[dict | None, str | None]:
@@ -1563,7 +1573,7 @@ def _append_event_digest_sections(responses: list, events_dict: dict, limit: int
                 "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}],
             })
     if not urgent and not upcoming:
-        responses.append(_text_response("No external events matched your profile right now."))
+        responses.append(_text_response("No events matched your profile right now."))
 
 
 def _append_scholarship_cards(responses: list, scholarships: list, tier: str, offset: int = 0, limit: int = 3) -> None:
@@ -2135,7 +2145,6 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         "calendar": consent_calendar,
     }
 
-    modules = profile.get("preferences", {}).get("modules_enabled", [])
     user_token = get_graph_access_token(profile)
 
     if consent_calendar and user_token:
@@ -2143,32 +2152,17 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
     elif consent_calendar and not user_token:
         profile["pending_schedule_calendar_sync"] = True
 
+    profile["pending_onboarding_step"] = "await_cv"
     save_profile(profile)
 
     welcome = _text_response(
         f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences."
     )
-
-    needs_signin = (
-        not user_token
-        and ("inbox" in modules or consent_calendar)
+    cv_prompt = _text_response(
+        "📄 **Next step:** attach your PDF CV to this chat and type **CV**. "
+        "I'll use it to improve scholarship and event matching."
     )
-    if needs_signin:
-        profile["pending_graph_command"] = "first_digest"
-        save_profile(profile)
-        return [
-            welcome,
-            _oauth_login_required(
-                "Smart Inbox and calendar features need a one-time Microsoft sign-in. "
-                "I'll run your first digest right after.",
-                pending_command="first_digest",
-            ),
-        ]
-
-    digest_responses = handle_get_digest(student_id)
-    if isinstance(digest_responses, dict):
-        return [welcome, digest_responses]
-    return [welcome] + list(digest_responses)
+    return [welcome, cv_prompt]
 
 def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
     """Extract CV text from an uploaded PDF and save it to the student profile."""
@@ -2178,11 +2172,35 @@ def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
         return [_text_response("I couldn't find your profile yet. Please complete onboarding before uploading your CV.")]
 
     profile["cv_text"] = cv_text
+    profile.pop("pending_onboarding_step", None)
     save_profile(profile)
-    return [_text_response(
+
+    modules = _enabled_modules(profile)
+    consent = profile.get("consent") or {}
+    user_token = get_graph_access_token(profile)
+    needs_signin = not user_token and ("inbox" in modules or consent.get("calendar"))
+
+    cv_ack = _text_response(
         f"✅ CV uploaded! Extracted {len(cv_text)} characters. "
         "I'll use this to improve your matches."
-    )]
+    )
+
+    if needs_signin:
+        profile["pending_graph_command"] = "first_digest"
+        save_profile(profile)
+        return [
+            cv_ack,
+            _oauth_login_required(
+                "Smart Inbox and calendar features need a one-time Microsoft sign-in "
+                "for email access. I'll run your first digest right after.",
+                pending_command="first_digest",
+            ),
+        ]
+
+    digest_responses = handle_get_digest(student_id)
+    if isinstance(digest_responses, dict):
+        return [cv_ack, digest_responses]
+    return [cv_ack] + list(digest_responses)
 
 def handle_graph_debug(student_id: str, scope: str) -> list:
     """Show what delegated Graph actually returns for inbox and/or calendar."""
@@ -2236,6 +2254,10 @@ def handle_get_inbox(student_id: str) -> list:
     if not profile:
         return [_card_response("I don't have your profile yet. Let's get you set up:", _build_onboarding_card())]
 
+    cv_gate = _onboarding_cv_gate(profile)
+    if cv_gate:
+        return cv_gate
+
     auth_required = _graph_signin_gate(profile, pending_command="inbox")
     if auth_required:
         profile["pending_graph_command"] = "inbox"
@@ -2285,7 +2307,7 @@ def handle_get_inbox(student_id: str) -> list:
 
 
 def handle_get_digest(student_id: str) -> list:
-    """Run full matching pipeline and return digest as staged Copilot messages."""
+    """Run matching pipeline and return digest as staged Copilot messages (inbox → events → scholarships)."""
     profile = get_profile(student_id)
     if not profile:
         card = _build_onboarding_card()
@@ -2293,6 +2315,10 @@ def handle_get_digest(student_id: str) -> list:
             "I don't have your profile yet. Let's get you set up:",
             card
         )]
+
+    cv_gate = _onboarding_cv_gate(profile)
+    if cv_gate:
+        return cv_gate
 
     modules = _enabled_modules(profile)
 
@@ -2306,11 +2332,36 @@ def handle_get_digest(student_id: str) -> list:
     inbox_error_note = None
     scholarship_result = {"apply_now": [], "prepare": []}
     checked_events = []
+    section_responses: list = []
 
-    if "inbox" in modules and get_graph_access_token(profile):
-        inbox_summary, inbox_error_note = _run_inbox_pipeline_for_profile(student_id, profile)
+    # Stage 1: inbox — process then send
+    if "inbox" in modules:
+        section_responses.append(_text_response("**1. Inbox** — Processing your emails…"))
+        if get_graph_access_token(profile):
+            inbox_summary, inbox_error_note = _run_inbox_pipeline_for_profile(student_id, profile)
+            if inbox_error_note:
+                section_responses.append(_text_response(f"⚠️ {inbox_error_note}"))
+            elif inbox_summary and inbox_summary.get("processed", 0) == 0:
+                section_responses.append(_text_response("Inbox scan complete — no new emails to classify."))
+            _append_inbox_calendar_sections(section_responses, inbox_summary)
+            if inbox_summary and inbox_summary.get("archived_items"):
+                review_item = inbox_summary["archived_items"][0]
+                section_responses.append({
+                    "type": "message",
+                    "text": "Archive review",
+                    "attachments": [{
+                        "contentType": "application/vnd.microsoft.card.adaptive",
+                        "content": _archive_review_card(review_item),
+                    }],
+                })
+        else:
+            section_responses.append(_text_response(
+                "Inbox processing skipped — sign in with Microsoft to enable email triage."
+            ))
 
+    # Stage 2: events — process then send (after inbox stage)
     if "events" in modules:
+        section_responses.append(_text_response("**2. Events** — Scanning event feeds…"))
         try:
             raw_events = extract_events_for_student(student_id)
             email_events = []
@@ -2327,12 +2378,23 @@ def handle_get_digest(student_id: str) -> list:
             logger.error(f"Event pipeline error: {e}")
             checked_events = []
 
+        events_digest = assemble_digest(
+            student_id=student_id,
+            scholarship_result={"apply_now": [], "prepare": []},
+            events=checked_events,
+            inbox_summary={"processed": 0, "archived": 0, "kept": 0},
+        )
+        _append_event_digest_sections(section_responses, events_digest["events"])
+
+    # Stage 3: scholarships — process then send (after events stage)
     if "scholarships" in modules:
+        section_responses.append(_text_response("**3. Scholarships** — Checking open awards…"))
         try:
             scholarship_result = run_matching(student_id)
         except Exception as e:
             logger.error(f"Scholarship matching error: {e}")
             scholarship_result = {"apply_now": [], "prepare": []}
+        _append_scholarship_sections(section_responses, scholarship_result)
 
     digest = assemble_digest(
         student_id=student_id,
@@ -2344,41 +2406,10 @@ def handle_get_digest(student_id: str) -> list:
     update_agent_snapshot(profile, digest)
     save_profile(profile)
 
-    responses = [
-        _text_response(format_digest_with_proactive(profile, digest, format_digest_message(digest)))
-    ]
-
-    if "inbox" in modules:
-        responses.append(_text_response("**1. Inbox** — Processing your emails…"))
-        if inbox_error_note:
-            responses.append(_text_response(f"⚠️ {inbox_error_note}"))
-        elif inbox_summary and inbox_summary.get("processed", 0) == 0 and get_graph_access_token(profile):
-            responses.append(_text_response("Inbox scan complete — no new emails to classify."))
-        elif not get_graph_access_token(profile):
-            responses.append(_text_response(
-                "Inbox processing skipped — sign in with Microsoft to enable email triage."
-            ))
-        _append_inbox_calendar_sections(responses, inbox_summary)
-        if inbox_summary and inbox_summary.get("archived_items"):
-            review_item = inbox_summary["archived_items"][0]
-            responses.append({
-                "type": "message",
-                "text": "Archive review",
-                "attachments": [{
-                    "contentType": "application/vnd.microsoft.card.adaptive",
-                    "content": _archive_review_card(review_item),
-                }],
-            })
-
-    if "events" in modules:
-        responses.append(_text_response("**2. External events** — Scanning event feeds…"))
-        _append_event_digest_sections(responses, digest["events"])
-
-    if "scholarships" in modules:
-        responses.append(_text_response("**3. Scholarships** — Checking open awards…"))
-        _append_scholarship_sections(responses, digest["scholarships"])
-
-    return responses
+    intro = _text_response(
+        format_digest_with_proactive(profile, digest, format_digest_message(digest))
+    )
+    return [intro] + section_responses
 
 def handle_get_events(student_id: str) -> list:
     """Run event extraction and render only event sections."""
@@ -3405,6 +3436,9 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
         "table_schema": state.get("schema") or {},
         "free_fields": [],
     }
+    table_schema = form_plan.get("table_schema") or state.get("schema") or {}
+    merged_data = enrich_list_descriptions(merged_data, table_schema, profile)
+
     try:
         fill_application(form_plan, input_path, output_path, merged_data, content_type)
     except Exception as exc:

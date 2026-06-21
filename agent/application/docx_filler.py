@@ -7,7 +7,7 @@ import os
 import shutil
 
 from agent.application.cell_utils import is_empty_cell, normalize_text, texts_match
-from agent.application.profile_resolver import truncate_to_words
+from agent.application.fill_geometry import resolve_description_target, resolve_docx_table_target
 
 logger = logging.getLogger(__name__)
 
@@ -43,26 +43,31 @@ def _find_anchor(table, anchor_label: str):
 
 
 def _fill_at_location(table, row_index: int, col_index: int, cells, fill_location: str, value: str) -> bool:
+    """Fill a table cell using layout heuristics (right if empty, else below)."""
     if not value:
         return False
 
-    fill_location = (fill_location or "right").lower()
-    if fill_location == "below":
-        if row_index + 1 >= len(table.rows):
-            return False
-        below_cells = _row_cells(table, row_index + 1)
-        target = below_cells[min(col_index, len(below_cells) - 1)]
-        _set_cell_text(target, value)
-        return True
+    fill_location = (fill_location or "auto").lower()
 
-    if fill_location in ("right", "table_row"):
-        if col_index + 1 < len(cells):
+    if fill_location == "right" and col_index + 1 < len(cells):
+        if is_empty_cell(cells[col_index + 1].text):
             _set_cell_text(cells[col_index + 1], value)
             return True
-        if row_index + 1 < len(table.rows):
-            below_cells = _row_cells(table, row_index + 1)
-            _set_cell_text(below_cells[0], value)
+
+    if fill_location == "below" and row_index + 1 < len(table.rows):
+        below_cells = _row_cells(table, row_index + 1)
+        if col_index < len(below_cells) and is_empty_cell(below_cells[col_index].text):
+            _set_cell_text(below_cells[col_index], value)
             return True
+        for cell in below_cells:
+            if is_empty_cell(cell.text):
+                _set_cell_text(cell, value)
+                return True
+
+    target = resolve_docx_table_target(table, row_index, col_index, cells)
+    if target is not None:
+        _set_cell_text(target, value)
+        return True
     return False
 
 
@@ -107,20 +112,10 @@ def _next_empty_data_row(table, start_row: int, column_map: dict, max_rows: int,
     return None
 
 
-def _description_target_cell(table, data_row_index: int):
-    desc_row_index = data_row_index + 1
-    if desc_row_index >= len(table.rows):
-        return None
-    cells = _row_cells(table, desc_row_index)
-    if not _is_description_row(cells):
-        return None
-    for cell in reversed(cells):
-        text = normalize_text(cell.text)
-        if "description" in text or "in 50 words" in text:
-            continue
-        if is_empty_cell(cell.text) or len(cells) == 1:
-            return cell
-    return cells[-1] if cells else None
+def _description_target_cell(table, data_row_index: int, list_schema: dict | None = None):
+    """Find the cell for a list-item description using table layout heuristics."""
+    del list_schema  # table geometry is resolved from structure, not form-specific rules
+    return resolve_description_target(table, data_row_index, is_description_row=_is_description_row)
 
 
 def _fill_repeating_list(table, list_schema: dict, items: list[dict]) -> int:
@@ -138,7 +133,6 @@ def _fill_repeating_list(table, list_schema: dict, items: list[dict]) -> int:
         logger.warning("Could not map columns for repeating list %s", list_schema.get("key"))
         return 0
 
-    desc_limit = int(list_schema.get("description_target_words") or 0)
     use_description_row = bool(list_schema.get("description_row"))
     filled = 0
     for item in items[:max_rows]:
@@ -153,17 +147,15 @@ def _fill_repeating_list(table, list_schema: dict, items: list[dict]) -> int:
             break
         row_index, cells = target
         for logical_key, col_index in column_map.items():
+            if use_description_row and logical_key == "description":
+                continue
             if col_index < len(cells):
                 value = item.get(logical_key, "")
-                if logical_key == "description" and desc_limit:
-                    value = truncate_to_words(value, desc_limit)
                 _set_cell_text(cells[col_index], value)
         if use_description_row:
             description = item.get("description") or ""
-            if description and desc_limit:
-                description = truncate_to_words(description, desc_limit)
             if description:
-                target_cell = _description_target_cell(table, row_index)
+                target_cell = _description_target_cell(table, row_index, list_schema)
                 if target_cell is not None:
                     _set_cell_text(target_cell, description)
         filled += 1
@@ -198,7 +190,7 @@ def fill_docx_form(original_path: str, filled_data: dict, schema: dict, output_p
             row_index,
             col_index,
             cells,
-            field.get("fill_location", "right"),
+            field.get("fill_location", "auto"),
             value,
         )
 
@@ -219,7 +211,7 @@ def fill_docx_form(original_path: str, filled_data: dict, schema: dict, output_p
             row_index,
             col_index,
             cells,
-            field.get("fill_location", "right"),
+            field.get("fill_location", "auto"),
             value,
         )
 
@@ -237,7 +229,7 @@ def fill_docx_form(original_path: str, filled_data: dict, schema: dict, output_p
                     row_index,
                     col_index,
                     cells,
-                    field.get("fill_location", "below"),
+                    field.get("fill_location", "auto"),
                     value,
                 )
                 continue

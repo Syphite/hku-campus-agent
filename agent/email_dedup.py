@@ -46,7 +46,7 @@ def check_duplicate(
     sig = preview_signature(preview)
     if prior_preview and sig and prior_preview == sig:
         return True, "Duplicate in this run (same sender, subject, and preview)."
-    return False
+    return False, ""
 
 
 def load_archived_fingerprints(profile: dict) -> set[str]:

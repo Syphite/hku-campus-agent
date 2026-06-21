@@ -1,9 +1,22 @@
 Analyze this application form structure. Return a JSON object mapping every fillable field to its anchor label (the exact text in the cell or paragraph that labels the field) and its fill_location.
 
-Allowed fill_location values:
-- "right": fill the next cell in the same row
-- "below": fill the cell in the next row under the anchor
+Allowed fill_location values (table-backed fields only):
+- "auto": let the filler inspect the table — preferred default for table fields
+- "right": fill the next cell in the same row when it is empty
+- "below": fill the cell in the next row under the anchor in the same column
 - "table_row": fill within the same row after the anchor cell
+
+Layout rules for table fields (source: "table"):
+- Inspect the parsed table JSON row/column layout for each anchor.
+- If the cell to the right of the label is empty, use fill_location "right" (or "auto").
+- If the cell to the right already contains text (another label or value), and the cell below in the same column is empty, use "below" (or "auto").
+- Do not assume all forms use the same layout — derive from the parsed cells for each field.
+
+Paragraph / non-table fields (source: "paragraph"):
+- Do not use table fill heuristics.
+- For long text under a heading, use fill_location "below" or omit table_index.
+
+For repeating lists with description rows, set description_row to true when a description label row appears below each data row. The filler will locate the description cell from table structure.
 
 Categorize fields into:
 1. "simple_fields": Standard key-value pairs such as Name, Email, Student ID, Faculty, Programme, GPA, Phone. Include ALL personal particulars in section A (name, university, student number, programme, graduation year, year of study, email, phone, permanent resident, etc.). Set profile_key when obvious (e.g. name, programme, gpa, email, phone).
@@ -19,13 +32,12 @@ Rules:
 - For repeating lists, set description_row to true when a description row appears below each data row.
 - For Awards sections with columns Year, Name of the Award, Awarding Unit, map item_fields as: dates → Year, role → Name of the Award, organization → Awarding Unit.
 - For Work Experience with Part Time/Full Time/Internship column, map employment_type to that header.
+- For Education History, map normative or duration columns to a logical key such as normative_study when present in the form.
 - Return ONLY valid JSON in this shape:
 {{
   "simple_fields": [
-    {{"key": "name_en", "anchor_label": "Name in English on HKID", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "name"}},
-    {{"key": "university", "anchor_label": "University", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "university"}},
-    {{"key": "programme_full", "anchor_label": "Programme in Full Name", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "programme"}},
-    {{"key": "graduation_year", "anchor_label": "Expected Graduation Year", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "expected_graduation_year"}}
+    {{"key": "name", "anchor_label": "<exact label from form>", "fill_location": "auto", "table_index": 0, "source": "table", "profile_key": "name"}},
+    {{"key": "email", "anchor_label": "<exact label from form>", "fill_location": "auto", "table_index": 0, "source": "table", "profile_key": "email"}}
   ],
   "repeating_lists": [
     {{
@@ -61,7 +73,7 @@ Rules:
     {{"key": "personal_statement", "anchor_label": "Personal Statement", "fill_location": "below", "table_index": 0, "source": "table", "target_words": 800}}
   ],
   "booleans": [
-    {{"key": "local_student", "anchor_label": "Local Student", "fill_location": "right", "table_index": 0, "source": "table"}}
+    {{"key": "local_student", "anchor_label": "Local Student", "fill_location": "below", "table_index": 0, "source": "table"}}
   ]
 }}
 
