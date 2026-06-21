@@ -77,7 +77,7 @@ Students interact via chat (`digest`, `inbox`, `events`, `scholarships`) and Ada
 | **Function app** | `function_app.py` | Weekly/daily timer triggers for scrapers |
 | **Application pipeline** | `agent/application/` | DOCX/PDF parse → schema analysis → conversational gap-fill → filled form output |
 | **Legacy drafter** | `agent/drafter.py`, `agent/form_filler.py` | Question extraction + essay draft flow for older “Start Draft” cards |
-| **Blob storage** | `agent/storage/blob_storage.py` | Upload filled application forms; return time-limited SAS download URL |
+| **Blob storage** | `agent/storage/blob_storage.py` | Production download host for filled application forms (1-hour SAS URLs via Azure Blob) |
 | **Digest assembler** | `agent/digest.py` | Merges scholarships, events, and inbox into one structured digest |
 | **Flask demo** | `app.py` | Standalone email-classifier web UI (dev/demo; not the Teams bot) |
 
@@ -192,7 +192,24 @@ hku-campus-agent/
 ├── copilot/                      # Teams app manifest & Adaptive Card JSON
 ├── tests/
 └── scripts/
+    ├── test_connections.py     # Verify Azure Search, OpenAI, Cosmos connectivity
+    └── diagnose_graph.py       # Graph OAuth and mail folder diagnostics
 ```
+
+Profiles are created only through the Teams onboarding card (Cosmos `profiles` container). There is no static profile seeding script.
+
+---
+
+## Known legacy paths
+
+Two application flows coexist in the codebase:
+
+| Flow | Modules | When used |
+|------|---------|-----------|
+| **Table-aware form fill** | `agent/application/` | **Start Application** on D.H. Chen (`ss_472`) — parse tables, interview for gaps, fill DOCX/PDF, download via blob |
+| **Essay / question draft** | `agent/drafter.py`, `agent/question_extractor.py`, `agent/form_filler.py` | **Start Draft** on other scholarship cards — extract questions, GPT draft answers (no table fill) |
+
+The production Teams bot entry point is **`bot_adapter.py`**. **`app.py`** is a separate Flask demo for testing the email classifier in a browser; it is not deployed as the bot.
 
 ---
 
@@ -249,6 +266,16 @@ python run_local.py
 
 # Validate scraper without Azure
 python validate_test.py
+```
+
+### Utility scripts
+
+```bash
+# Verify Azure Search, OpenAI, and Cosmos are reachable
+python scripts/test_connections.py
+
+# Diagnose Graph OAuth, inbox access, and agent mail folders
+python scripts/diagnose_graph.py
 ```
 
 ### Tests

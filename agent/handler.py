@@ -24,8 +24,7 @@ openai_client = AzureOpenAI(
 from agent.profile  import get_profile, save_profile, build_profile_from_form, update_profile_fields, extract_cv_text, get_graph_access_token, save_graph_token, clear_pending_graph_command
 from agent.matching import run_matching, find_scholarship_by_query
 from agent.drafter  import extract_application_questions, generate_draft_answers
-from agent.question_extractor import extract_questions_from_file, extract_text_from_application_file
-from agent.form_filler import fill_application_form
+from agent.question_extractor import extract_questions_from_file
 from agent.application.form_ai import (
     build_filled_data,
     build_gap_overview,
