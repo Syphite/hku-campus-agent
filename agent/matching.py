@@ -43,6 +43,47 @@ PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "eligibility_re
 with open(PROMPT_PATH) as f:
     PROMPT_TEMPLATE = f.read()
 
+SCHOLARSHIP_CACHE_VERSION = 3
+
+ENTRANCE_TEXT_TERMS = (
+    "entrance scholarship",
+    "entrance award",
+    "entrance fellow",
+    "for new students admitted",
+    "upon admission to hku",
+    "upon admission to the university",
+    "at the time of admission",
+    "jupas applicant",
+    "non-jupas applicant",
+    "first-year admission",
+    "admitted to hku",
+)
+
+
+def _is_entrance_scholarship(scholarship: dict) -> bool:
+    """Entrance awards are for prospective admits, not current HKU students."""
+    if scholarship.get("is_entrance") is True:
+        return True
+
+    years = scholarship.get("year_of_study")
+    if years in (None, "", []):
+        normalized_years: set[str] = set()
+    elif isinstance(years, list):
+        normalized_years = {str(value).strip().lower() for value in years if str(value).strip()}
+    else:
+        normalized_years = {str(years).strip().lower()}
+
+    if normalized_years == {"new_student"}:
+        return True
+
+    text = " ".join(
+        str(scholarship.get(field) or "")
+        for field in ("name", "eligibility_raw", "application_method")
+    ).lower()
+    if "entrance" in text and any(term in text for term in ("scholarship", "award", "fellowship", "bursary")):
+        return True
+    return any(term in text for term in ENTRANCE_TEXT_TERMS)
+
 
 # ---------------------------------------------------------------------------
 # Stage 1 — Structured Azure AI Search filter
@@ -83,8 +124,6 @@ def _year_matches(index_years, student_year: str) -> bool:
     if not normalized or "all" in normalized:
         return True
     if student_year in normalized:
-        return True
-    if student_year == "1" and "new_student" in normalized:
         return True
     return False
 
@@ -155,6 +194,9 @@ def _stage1_search(profile: dict) -> list[dict]:
     else:
         filters.append("(nationality/any(n: n eq 'non-local') or nationality/any(n: n eq 'all'))")
 
+    # Current HKU students only — exclude entrance scholarships for prospective admits.
+    filters.append("not (is_entrance eq true)")
+
     filter_str = " and ".join(filters) if filters else None
 
     client  = SearchClient(SEARCH_ENDPOINT, INDEX_NAME, AzureKeyCredential(SEARCH_API_KEY))
@@ -177,6 +219,8 @@ def _stage1_search(profile: dict) -> list[dict]:
 
     candidates = []
     for candidate in results:
+        if _is_entrance_scholarship(candidate):
+            continue
         if not _faculty_matches(candidate.get("faculty"), faculty):
             continue
         if not _year_matches(candidate.get("year_of_study"), year):
@@ -371,6 +415,9 @@ def _stage2_reasoning(profile: dict, candidates: list[dict]) -> list[dict]:
         strict_results = []
         for result in results:
             scholarship_id = scholarship_identifier(result)
+            if _is_entrance_scholarship(result):
+                logger.info(f"Filtered out {scholarship_id}: entrance scholarship (out of scope for enrolled students)")
+                continue
             if result.get("qualifies") is not True:
                 continue
             if str(result.get("match_strength", "")).lower() != "strong":
@@ -573,7 +620,7 @@ def run_matching(student_id: str) -> dict:
     cached_result = cache.get("result")
     cached_timestamp = cache.get("timestamp")
     cached_version = cache.get("version", 1)
-    if cached_result and cached_timestamp and cached_version >= 2:
+    if cached_result and cached_timestamp and cached_version >= SCHOLARSHIP_CACHE_VERSION:
         try:
             cached_at = datetime.fromisoformat(str(cached_timestamp).replace("Z", "+00:00"))
             if cached_at.tzinfo is None:
@@ -601,7 +648,7 @@ def run_matching(student_id: str) -> dict:
         profile["scholarship_cache"] = {
             "result": result,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "version": 2,
+            "version": SCHOLARSHIP_CACHE_VERSION,
         }
         save_profile(profile)
         return result
@@ -618,7 +665,7 @@ def run_matching(student_id: str) -> dict:
     profile["scholarship_cache"] = {
         "result": result,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": 2,
+        "version": SCHOLARSHIP_CACHE_VERSION,
     }
     save_profile(profile)
     return result

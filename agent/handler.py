@@ -57,6 +57,7 @@ from agent.conflict_checker        import run_conflict_checks_batch
 
 # Import email pipeline
 from agent.email_pipeline import run_inbox_pipeline
+from agent.storage.blob_storage import upload_filled_application
 from agent.graph import (
     GraphApiError,
     calendar_events_to_blocked_slots,
@@ -3117,20 +3118,52 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
     if not os.path.exists(output_path):
         return [_text_response("The filled form could not be generated. Please try again.")]
 
+    if os.path.getsize(output_path) == 0:
+        return [_text_response("The filled form is empty. Please review your answers and try again.")]
+
+    download_name = os.path.basename(output_path) or "filled_application_form.docx"
+    download_type = content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    download_url = upload_filled_application(output_path, download_name)
+
+    _clear_application_review_state(profile)
+    save_profile(profile)
+
+    if download_url:
+        card = {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.4",
+            "body": [
+                {
+                    "type": "TextBlock",
+                    "text": "✅ Your filled application is ready!",
+                    "weight": "Bolder",
+                    "size": "Large",
+                },
+                {
+                    "type": "TextBlock",
+                    "text": "Click the button below to download your completed form.",
+                    "wrap": True,
+                },
+            ],
+            "actions": [
+                {
+                    "type": "Action.OpenUrl",
+                    "title": "📥 Download Filled Application",
+                    "url": download_url,
+                }
+            ],
+        }
+        return [_card_response("Your filled application is ready!", card)]
+
+    logger.warning("Blob upload failed, falling back to in-memory download")
     try:
         with open(output_path, "rb") as handle:
             file_bytes = handle.read()
     except OSError as exc:
         logger.error("Could not read filled form at %s: %s", output_path, exc)
         return [_text_response("The filled form was created but could not be read for download. Please try again.")]
-
-    if not file_bytes:
-        return [_text_response("The filled form is empty. Please review your answers and try again.")]
-
-    download_name = os.path.basename(output_path) or "filled_application_form.docx"
-    download_type = content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    _clear_application_review_state(profile)
-    save_profile(profile)
 
     return [
         _file_download_response(

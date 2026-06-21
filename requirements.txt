@@ -9,6 +9,7 @@ azure-core==1.32.0
 azure-cosmos==4.7.0
 azure-identity==1.17.1
 azure-functions==1.21.3
+azure-storage-blob>=12.19.0
 
 # Microsoft Graph
 msgraph-sdk==1.5.4
