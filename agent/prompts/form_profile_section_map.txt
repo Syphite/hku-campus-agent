@@ -15,6 +15,8 @@ Return ONLY valid JSON:
 Rules:
 - Only suggest entries that clearly fit this section's list_kind and column headers.
 - Use mapped_fields keys from this list only: {field_keys}
+- For awards: dates = year (MM/YY), role = award name, organization = awarding unit.
+- For work: dates = period, organization = employer, role = position, employment_type = Part Time/Full Time/Internship, description = brief summary (max 50 words).
 - Do not invent achievements not present in the student profile.
 - Return an empty suggestions array if nothing fits.
 - Prefer high-confidence matches only.

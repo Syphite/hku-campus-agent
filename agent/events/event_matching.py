@@ -9,6 +9,7 @@ Two-stage event personalization (mirrors scholarship matching):
 import json
 import logging
 import os
+import re
 from copy import deepcopy
 
 from dotenv import load_dotenv
@@ -34,6 +35,11 @@ with open(PROMPT_PATH) as handle:
 
 STAGE1_LIMIT = 15
 MAX_RESULTS = 8
+
+GENERIC_EVENT_TERMS = frozenset({
+    "workshop", "seminar", "talk", "career fair", "networking", "opportunity",
+    "event", "lecture", "webinar", "info session", "briefing",
+})
 
 
 def _student_faculty(profile: dict) -> str:
@@ -79,6 +85,44 @@ def _post_search_text(post: dict) -> str:
     return " ".join(parts).lower()
 
 
+def _profile_match_terms(profile: dict) -> list[str]:
+    """Terms derived from explicit profile fields (not generic student vocabulary)."""
+    terms = []
+    for interest in profile.get("interests") or []:
+        token = str(interest).strip().lower()
+        if token and token not in GENERIC_EVENT_TERMS:
+            terms.append(token)
+    for activity in profile.get("activities") or []:
+        token = str(activity).strip().lower()
+        if token and len(token) > 3:
+            terms.append(token)
+    cv_text = str(profile.get("cv_text") or "").lower()
+    if cv_text:
+        for chunk in re.split(r"[,;\n•\-]+", cv_text):
+            token = chunk.strip()
+            if len(token) > 4 and token not in GENERIC_EVENT_TERMS:
+                terms.append(token[:80])
+    academic = profile.get("academic") or {}
+    programme = str(academic.get("programme") or profile.get("programme") or "").strip().lower()
+    if programme:
+        terms.append(programme)
+    faculty = _student_faculty(profile)
+    if faculty:
+        terms.append(faculty)
+    keywords = build_profile_keywords(profile or {}, include_generic=False)
+    for keyword in keywords:
+        key = keyword.lower()
+        if key not in GENERIC_EVENT_TERMS and len(key) > 2:
+            terms.append(key)
+    seen = set()
+    unique = []
+    for term in terms:
+        if term not in seen:
+            seen.add(term)
+            unique.append(term)
+    return unique[:30]
+
+
 def _score_post(post: dict, profile: dict, profile_keywords: list[str]) -> int:
     if post.get("is_noise"):
         return -1
@@ -90,13 +134,15 @@ def _score_post(post: dict, profile: dict, profile_keywords: list[str]) -> int:
     hits = []
     for keyword in profile_keywords:
         key = keyword.lower()
+        if key in GENERIC_EVENT_TERMS:
+            continue
         if key in text or key in post_keywords:
             hits.append(key)
     score += min(len(set(hits)) * 2, 12)
 
     for interest in profile.get("interests") or []:
         token = str(interest).strip().lower()
-        if token and token in text:
+        if token and token not in GENERIC_EVENT_TERMS and token in text:
             score += 3
 
     if _faculty_matches(post, _student_faculty(profile)):
@@ -114,7 +160,7 @@ def _score_post(post: dict, profile: dict, profile_keywords: list[str]) -> int:
 
 def stage1_filter_posts(profile: dict, posts: list, limit: int = STAGE1_LIMIT) -> list:
     """Keyword and profile pre-filter — returns top candidate raw posts."""
-    profile_keywords = build_profile_keywords(profile or {})
+    profile_keywords = build_profile_keywords(profile or {}, include_generic=False)
     scored = []
     for post in posts or []:
         score = _score_post(post, profile or {}, profile_keywords)
@@ -132,13 +178,16 @@ def stage1_filter_posts(profile: dict, posts: list, limit: int = STAGE1_LIMIT) -
 
 def _compact_profile(profile: dict) -> dict:
     academic = profile.get("academic") or {}
+    cv_text = str(profile.get("cv_text") or "").strip()
     return {
         "name": profile.get("name", ""),
         "faculty": academic.get("faculty") or profile.get("faculty", ""),
         "programme": academic.get("programme") or profile.get("programme", ""),
         "year_of_study": academic.get("year_of_study") or profile.get("year", ""),
         "interests": profile.get("interests") or [],
+        "activities": profile.get("activities") or [],
         "courses": profile.get("courses") or [],
+        "cv_excerpt": cv_text[:1200] if cv_text else "",
     }
 
 
@@ -210,15 +259,33 @@ def stage2_reasoning(profile: dict, events: list) -> list[dict]:
         return _fallback_rank(profile, events)
 
 
-def _fallback_match_reason(event: dict, profile_keywords: set, profile: dict, blob: str) -> str:
-    matched = [
-        keyword for keyword in profile_keywords
-        if len(keyword) > 2 and keyword in blob
-    ]
-    matched = sorted(set(matched), key=len, reverse=True)[:4]
-    if matched:
-        labels = ", ".join(word.title() if word.islower() else word for word in matched)
-        return f"Matches your interests: {labels}."
+def _meaningful_term_hits(terms: list[str], blob: str) -> list[str]:
+    hits = []
+    for term in terms:
+        key = term.lower().strip()
+        if len(key) < 3 or key in GENERIC_EVENT_TERMS:
+            continue
+        if key in blob:
+            hits.append(term)
+    return sorted(set(hits), key=len, reverse=True)[:3]
+
+
+def _fallback_match_reason(event: dict, profile: dict, blob: str) -> str:
+    interests = [str(i).strip() for i in (profile.get("interests") or []) if str(i).strip()]
+    interest_hits = _meaningful_term_hits(interests, blob)
+    if interest_hits:
+        return f"Matches your interests: {', '.join(interest_hits[:3])}."
+
+    activity_hits = _meaningful_term_hits(
+        [str(a) for a in (profile.get("activities") or [])],
+        blob,
+    )
+    if activity_hits:
+        return f"Related to your activity: {activity_hits[0][:80]}."
+
+    cv_hits = _meaningful_term_hits(_profile_match_terms(profile), blob)
+    if cv_hits and not interests:
+        return f"Related to your CV/experience: {cv_hits[0][:80]}."
 
     student_faculty = _student_faculty(profile)
     faculty_tags = event.get("faculty_relevant") or []
@@ -231,20 +298,20 @@ def _fallback_match_reason(event: dict, profile_keywords: set, profile: dict, bl
         if relevant:
             return f"Relevant to {relevant[0]} students."
         if student_faculty:
-            return f"Relevant to {student_faculty.title()} students."
+            return f"Open to HKU students in {student_faculty.title()}."
     return "Listed in this week's campus events."
 
 
 def _fallback_rank(profile: dict, events: list) -> list:
     """Heuristic fallback when LLM is unavailable."""
-    profile_keywords = set(build_profile_keywords(profile or {}))
+    match_terms = _profile_match_terms(profile)
     ranked = []
     for event in events:
         blob = " ".join(
             str(event.get(key, "") or "")
             for key in ("title", "summary", "eligibility", "organiser", "type")
         ).lower()
-        hits = sum(1 for keyword in profile_keywords if len(keyword) > 2 and keyword in blob)
+        hits = sum(1 for term in match_terms if term.lower() in blob and term.lower() not in GENERIC_EVENT_TERMS)
         faculty_match = _faculty_matches(
             {"faculty_tags": event.get("faculty_relevant") or ["all"]},
             _student_faculty(profile),
@@ -252,7 +319,7 @@ def _fallback_rank(profile: dict, events: list) -> list:
         if hits >= 1 or faculty_match:
             copy = deepcopy(event)
             copy["match_strength"] = "strong"
-            copy["match_reason"] = _fallback_match_reason(event, profile_keywords, profile, blob)
+            copy["match_reason"] = _fallback_match_reason(event, profile, blob)
             ranked.append((hits, copy))
 
     ranked.sort(key=lambda item: item[0], reverse=True)

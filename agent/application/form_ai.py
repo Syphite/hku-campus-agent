@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from openai import AzureOpenAI
 
 from agent.application.cell_utils import normalize_text, parse_llm_json
+from agent.application.profile_resolver import resolve_profile_field, truncate_to_words
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -38,21 +39,7 @@ def _deployment() -> str:
 
 
 def _profile_value(profile: dict, profile_key: str) -> str:
-    academic = profile.get("academic", {})
-    mapping = {
-        "name": profile.get("name", ""),
-        "email": profile.get("email", ""),
-        "phone": profile.get("phone", ""),
-        "student_id": profile.get("student_id", ""),
-        "faculty": academic.get("faculty", ""),
-        "programme": academic.get("programme", ""),
-        "gpa": str(academic.get("gpa", "")),
-        "year_of_study": str(academic.get("year_of_study", "")),
-        "level": academic.get("level", ""),
-        "country_of_origin": academic.get("nationality", {}).get("country_of_origin", ""),
-        "local_status": academic.get("nationality", {}).get("local_status", ""),
-    }
-    return str(mapping.get(profile_key, "") or "")
+    return resolve_profile_field(profile, {"profile_key": profile_key, "key": profile_key})
 
 
 def _valid_paragraph_index(value, paragraph_count: int) -> bool:
@@ -335,9 +322,9 @@ def list_entry_field_keys(list_schema: dict) -> list[str]:
     if kind == "education":
         return ["institution", "qualification", "dates", "description"]
     if kind == "award":
-        return ["organization", "role", "dates", "description"]
+        return ["dates", "role", "organization", "description"]
     if kind == "work":
-        return ["organization", "role", "dates", "description"]
+        return ["dates", "organization", "role", "employment_type", "description"]
     return ["organization", "role", "dates", "hours", "description"]
 
 
@@ -468,6 +455,9 @@ def suggest_profile_entries_for_gap(gap: dict, profile: dict) -> list[dict]:
             entry = {key: str(mapped.get(key) or "").strip() for key in field_keys}
             if not any(entry.values()):
                 continue
+            desc_limit = int(schema.get("description_target_words") or 0)
+            if desc_limit and entry.get("description"):
+                entry["description"] = truncate_to_words(entry["description"], desc_limit)
             entry["_source_text"] = str(item.get("source_text") or "").strip()
             entry["_confidence"] = str(item.get("confidence") or "").strip()
             suggestions.append(entry)
@@ -527,8 +517,9 @@ def build_filled_data(schema: dict, profile: dict, free_fields: list | None = No
         key = field.get("key")
         if not key:
             continue
-        profile_key = field.get("profile_key") or key
-        simple_values[key] = _profile_value(profile, profile_key)
+        value = resolve_profile_field(profile, field)
+        if value:
+            simple_values[key] = value
 
     repeating_values = {}
     structured_lists = profile.get("structured_lists") or {}
@@ -774,7 +765,7 @@ def build_gap_overview(schema: dict, filled_data: dict, gaps: list) -> str:
     return "\n".join(lines)
 
 
-def _normalize_batch_entry(item: dict, field_keys: list[str]) -> dict:
+def _normalize_batch_entry(item: dict, field_keys: list[str], list_schema: dict | None = None) -> dict:
     normalized = {key: str(item.get(key) or "").strip() for key in field_keys}
     if "institution" in field_keys and not normalized.get("institution"):
         normalized["institution"] = str(item.get("organization") or item.get("school") or "").strip()
@@ -790,6 +781,13 @@ def _normalize_batch_entry(item: dict, field_keys: list[str]) -> dict:
         normalized["description"] = str(item.get("details") or item.get("summary") or "").strip()
     if "hours" in field_keys and not normalized.get("hours"):
         normalized["hours"] = str(item.get("hours") or "").strip()
+    if "employment_type" in field_keys and not normalized.get("employment_type"):
+        normalized["employment_type"] = str(
+            item.get("employment_type") or item.get("hours") or item.get("type") or ""
+        ).strip()
+    desc_limit = int((list_schema or {}).get("description_target_words") or 0) if list_schema else 0
+    if desc_limit and normalized.get("description"):
+        normalized["description"] = truncate_to_words(normalized["description"], desc_limit)
     return normalized
 
 
@@ -820,7 +818,7 @@ def parse_list_entries_batch(user_text: str, list_schema: dict, max_rows: int | 
     for item in parsed.get("entries", []) or []:
         if not isinstance(item, dict):
             continue
-        normalized = _normalize_batch_entry(item, field_keys)
+        normalized = _normalize_batch_entry(item, field_keys, list_schema)
         if any(normalized.values()):
             entries.append(normalized)
         if len(entries) >= max_rows:

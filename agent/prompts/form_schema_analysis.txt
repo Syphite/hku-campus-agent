@@ -6,9 +6,9 @@ Allowed fill_location values:
 - "table_row": fill within the same row after the anchor cell
 
 Categorize fields into:
-1. "simple_fields": Standard key-value pairs such as Name, Email, Student ID, Faculty, Programme, GPA, Phone.
-2. "repeating_lists": Tables with repeating rows such as Awards, Volunteer Experience, Work Experience, Education History, Social Good Engagement. Include max_rows as a positive integer when visible (for example 5), or omit the field if unknown — never use null. Include column_headers exactly as they appear in the table header row. Include item_fields mapping logical keys to the matching column header text. Include list_kind as one of: education, volunteer, award, work, social_good, generic. Include instructions when the form has an instruction row above the table (verbatim text such as education guidance).
-3. "long_text": Large text areas such as Personal Statement or essay prompts.
+1. "simple_fields": Standard key-value pairs such as Name, Email, Student ID, Faculty, Programme, GPA, Phone. Include ALL personal particulars in section A (name, university, student number, programme, graduation year, year of study, email, phone, permanent resident, etc.). Set profile_key when obvious (e.g. name, programme, gpa, email, phone).
+2. "repeating_lists": Tables with repeating rows such as Awards, Volunteer Experience, Work Experience, Education History, Social Good Engagement. Include max_rows as a positive integer when visible (for example 5), or omit the field if unknown — never use null. Include column_headers exactly as they appear in the table header row. Include item_fields mapping logical keys to the matching column header text. Include list_kind as one of: education, volunteer, award, work, social_good, generic. Include instructions when the form has an instruction row above the table (verbatim text such as education guidance). Set description_target_words to 50 when a description row says "in 50 words".
+3. "long_text": Large text areas such as Personal Statement or essay prompts. Set target_words from the form (e.g. 800).
 4. "booleans": Yes/No or checkbox style fields.
 
 Rules:
@@ -17,23 +17,44 @@ Rules:
 - For paragraph-backed fields outside tables, set source to "paragraph", omit table_index, and include paragraph_index from the paragraphs list.
 - Do not invent fields that are not present.
 - For repeating lists, set description_row to true when a description row appears below each data row.
+- For Awards sections with columns Year, Name of the Award, Awarding Unit, map item_fields as: dates → Year, role → Name of the Award, organization → Awarding Unit.
+- For Work Experience with Part Time/Full Time/Internship column, map employment_type to that header.
 - Return ONLY valid JSON in this shape:
 {{
   "simple_fields": [
-    {{"key": "name_en", "anchor_label": "Name in English on HKID", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "name"}}
+    {{"key": "name_en", "anchor_label": "Name in English on HKID", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "name"}},
+    {{"key": "university", "anchor_label": "University", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "university"}},
+    {{"key": "programme_full", "anchor_label": "Programme in Full Name", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "programme"}},
+    {{"key": "graduation_year", "anchor_label": "Expected Graduation Year", "fill_location": "right", "table_index": 0, "source": "table", "profile_key": "expected_graduation_year"}}
   ],
   "repeating_lists": [
     {{
-      "key": "volunteer_exp",
-      "label": "Volunteer Experience",
-      "table_index": 3,
+      "key": "awards",
+      "label": "Awards / Achievements",
+      "table_index": 2,
       "source": "table",
       "max_rows": 5,
-      "list_kind": "volunteer",
-      "instructions": "",
-      "column_headers": ["Period", "Name of the Unit", "Role"],
+      "list_kind": "award",
+      "column_headers": ["Year (MM/YY)", "Name of the Award", "Awarding Unit"],
+      "item_fields": {{"dates": "Year (MM/YY)", "role": "Name of the Award", "organization": "Awarding Unit"}}
+    }},
+    {{
+      "key": "work_exp",
+      "label": "Work Experience",
+      "table_index": 5,
+      "source": "table",
+      "max_rows": 5,
+      "list_kind": "work",
+      "column_headers": ["Period (MM/YY-MM/YY)", "Name of the Unit", "Position Held", "Part Time/ Full Time/ Internship"],
       "description_row": true,
-      "item_fields": {{"dates": "Period", "organization": "Name of the Unit", "role": "Role", "description": "Description"}}
+      "description_target_words": 50,
+      "item_fields": {{
+        "dates": "Period (MM/YY-MM/YY)",
+        "organization": "Name of the Unit",
+        "role": "Position Held",
+        "employment_type": "Part Time/ Full Time/ Internship",
+        "description": "Description"
+      }}
     }}
   ],
   "long_text": [

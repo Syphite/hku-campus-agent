@@ -282,7 +282,7 @@
     },
     {
       "type": "TextBlock",
-      "text": "Grant calendar access below to import your schedule automatically.",
+      "text": "Optional — used for conflict checking. If calendar access is enabled below, class blocks are added to Outlook as recurring events for the next 3 weeks.",
       "wrap": true,
       "size": "Small",
       "isSubtle": true,

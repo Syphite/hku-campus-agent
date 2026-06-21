@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+from agent.datetime_utils import validate_iso_datetime
+
 logger = logging.getLogger(__name__)
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -13,7 +15,7 @@ ME_BASE = f"{GRAPH_BASE}/me"
 AGENT_FOLDER_NOISE = "Agent Archived"
 AGENT_FOLDER_AMBIGUOUS = "Agent Ambiguous"
 HK_TZ = timezone(timedelta(hours=8))
-MESSAGE_SELECT = "id,subject,from,isRead,receivedDateTime,bodyPreview,body,conversationId"
+MESSAGE_SELECT = "id,subject,from,isRead,receivedDateTime,bodyPreview,body,conversationId,webLink"
 
 # Protected senders — never archive regardless of content
 PROTECTED_SENDERS = [
@@ -460,6 +462,8 @@ def create_calendar_event(
         "start": {"dateTime": start_iso, "timeZone": timezone},
         "end": {"dateTime": end_iso, "timeZone": timezone},
     }
+    if not validate_iso_datetime(start_iso) or not validate_iso_datetime(end_iso):
+        return {"success": False, "error": f"Invalid event datetime: start={start_iso!r} end={end_iso!r}"}
     if location:
         body["location"] = {"displayName": location}
 
@@ -481,6 +485,62 @@ def create_calendar_event(
         }
     except Exception as exc:
         logger.error("create_calendar_event error: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+def create_recurring_calendar_event(
+    user_token: str,
+    title: str,
+    day_of_week: str,
+    start_iso: str,
+    end_iso: str,
+    range_start: str,
+    range_end: str,
+    timezone: str = "Asia/Hong_Kong",
+) -> dict:
+    """
+    Create a weekly recurring Outlook event spanning range_start..range_end (YYYY-MM-DD).
+    """
+    if not validate_iso_datetime(start_iso) or not validate_iso_datetime(end_iso):
+        return {
+            "success": False,
+            "error": f"Invalid recurring event datetime: start={start_iso!r} end={end_iso!r}",
+        }
+    body = {
+        "subject": title,
+        "start": {"dateTime": start_iso, "timeZone": timezone},
+        "end": {"dateTime": end_iso, "timeZone": timezone},
+        "recurrence": {
+            "pattern": {
+                "type": "weekly",
+                "interval": 1,
+                "daysOfWeek": [day_of_week.lower()],
+            },
+            "range": {
+                "type": "endDate",
+                "startDate": range_start,
+                "endDate": range_end,
+            },
+        },
+    }
+    url = f"{ME_BASE}/calendar/events"
+    try:
+        resp = _graph_request("POST", url, user_token=user_token, json_body=body)
+        data = resp.json()
+        return {
+            "success": True,
+            "event_id": data.get("id", ""),
+            "web_link": data.get("webLink", ""),
+            "error": "",
+        }
+    except GraphApiError as exc:
+        logger.error("create_recurring_calendar_event failed: %s", exc.to_log_dict())
+        return {
+            "success": False,
+            "error": f"Could not create recurring event ({exc.status}): {exc.error_code or exc.error_message}",
+        }
+    except Exception as exc:
+        logger.error("create_recurring_calendar_event error: %s", exc)
         return {"success": False, "error": str(exc)}
 
 

@@ -102,6 +102,7 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
             "from": sender,
             "reason": "",
             "body_preview": preview,
+            "web_link": email.get("webLink") or "",
         }
 
         if is_protected_email(sender, subject, preview):

@@ -51,6 +51,8 @@ def assemble_digest(
     # ── Scholarships ────────────────────────────────────────────────────────
     apply_now = list(scholarship_result.get("apply_now", []))
     prepare   = list(scholarship_result.get("prepare", []))
+    apply_now.sort(key=lambda s: s.get("deadline") or "9999-12-31")
+    prepare.sort(key=lambda s: s.get("deadline") or "9999-12-31")
 
     # ── Events ──────────────────────────────────────────────────────────────
     # Split into: apply now (has deadline within 30 days or no deadline)
@@ -153,25 +155,6 @@ def format_digest_message(digest: dict) -> str:
     s  = digest["summary"]
     lines = ["Here's your update:\n"]
 
-    if s["scholarships_open"] > 0:
-        lines.append(
-            f"📋 **{s['scholarships_open']} scholarship(s) open now** — "
-            f"deadline approaching. Tap to start a draft."
-        )
-    if s["scholarships_prepare"] > 0:
-        lines.append(
-            f"📅 **{s['scholarships_prepare']} scholarship(s) to prepare for** — "
-            f"not yet open but worth getting ready."
-        )
-    if s["events_urgent"] > 0:
-        lines.append(
-            f"🏆 **{s['events_urgent']} event(s) with upcoming deadlines** — "
-            f"competitions and events closing soon."
-        )
-    if s["events_upcoming"] > 0:
-        lines.append(
-            f"📌 **{s['events_upcoming']} upcoming event(s)** worth bookmarking."
-        )
     if s.get("inbox_urgent", 0) > 0:
         lines.append(
             f"🚨 **{s['inbox_urgent']} urgent email(s)** — deadlines auto-added to your calendar; see action steps below."
@@ -184,6 +167,25 @@ def format_digest_message(digest: dict) -> str:
         lines.append(
             f"📬 **Inbox:** {s['emails_processed']} emails processed, "
             f"{s['emails_archived']} archived."
+        )
+    if s["events_urgent"] > 0:
+        lines.append(
+            f"🏆 **{s['events_urgent']} event(s) with upcoming deadlines** — "
+            f"competitions and events closing soon."
+        )
+    if s["events_upcoming"] > 0:
+        lines.append(
+            f"📌 **{s['events_upcoming']} upcoming event(s)** worth bookmarking."
+        )
+    if s["scholarships_open"] > 0:
+        lines.append(
+            f"📋 **{s['scholarships_open']} scholarship(s) open now** — "
+            f"deadline approaching. Tap to start a draft."
+        )
+    if s["scholarships_prepare"] > 0:
+        lines.append(
+            f"📅 **{s['scholarships_prepare']} scholarship(s) to prepare for** — "
+            f"not yet open but worth getting ready."
         )
     if len(lines) == 1:
         lines.append("Nothing new to report today — check back soon.")

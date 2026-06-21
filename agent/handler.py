@@ -56,6 +56,8 @@ from agent.events.event_extractor  import extract_events_for_student
 from agent.conflict_checker        import run_conflict_checks_batch
 
 # Import email pipeline
+from agent.datetime_utils import normalize_time_hhmm
+from agent.email_events import inbox_items_to_events
 from agent.email_pipeline import run_inbox_pipeline
 from agent.intent_router import route_message
 from agent.proactive import format_digest_with_proactive, update_agent_snapshot
@@ -71,6 +73,11 @@ from agent.graph_user_diagnostics import (
     format_inbox_diagnostics_report,
     run_calendar_diagnostics,
     run_inbox_diagnostics,
+)
+from agent.timetable_sync import (
+    default_schedule_slots,
+    parse_onboarding_schedule_slots,
+    sync_schedule_to_calendar,
 )
 
 APPLICATION_FORM_PDF = "/tmp/application_form.pdf"
@@ -686,9 +693,48 @@ def _require_graph_token(profile: dict, *, needs_inbox: bool = False, needs_cale
     )
 
 
+def _enabled_modules(profile: dict) -> list:
+    return profile.get("preferences", {}).get(
+        "modules_enabled",
+        ["scholarships", "events", "inbox"],
+    )
+
+
+def _needs_graph_signin(profile: dict) -> bool:
+    """True when digest/onboarding requires Microsoft sign-in."""
+    modules = _enabled_modules(profile)
+    consent = profile.get("consent") or {}
+    if "inbox" in modules:
+        return True
+    if consent.get("calendar"):
+        return True
+    return bool(profile.get("pending_schedule_calendar_sync"))
+
+
+def _maybe_sync_schedule_to_calendar(profile: dict, user_token: str | None) -> str | None:
+    """Write recurring schedule blocks to Outlook when calendar consent is granted."""
+    if not user_token or not _has_calendar_consent(profile):
+        return None
+    timetable = profile.get("timetable") or {}
+    if timetable.get("calendar_event_ids") and not profile.get("pending_schedule_calendar_sync"):
+        return None
+    if not timetable.get("blocked_slots"):
+        profile.setdefault("timetable", {})["blocked_slots"] = default_schedule_slots()
+    result = sync_schedule_to_calendar(profile, user_token)
+    save_profile(profile)
+    synced = int(result.get("synced") or 0)
+    if synced:
+        return f"Added {synced} recurring class block(s) to your Outlook calendar for the next 3 weeks."
+    if result.get("errors"):
+        logger.warning("Schedule calendar sync errors: %s", result["errors"])
+    return None
+
+
 def _graph_signin_gate(profile: dict, pending_command: str) -> dict | None:
-    """Prompt Microsoft sign-in the first time inbox/digest needs Graph access."""
+    """Prompt Microsoft sign-in when inbox or calendar sync needs Graph access."""
     if get_graph_access_token(profile):
+        return None
+    if not _needs_graph_signin(profile):
         return None
     return _oauth_login_required(
         "To connect your Microsoft account, please sign in once. "
@@ -729,8 +775,16 @@ def handle_graph_token_response(student_id: str, token_payload) -> list:
         return [_text_response("Sign-in did not complete — no token was received. Please try again.")]
 
     pending = clear_pending_graph_command(student_id)
+    profile = get_profile(student_id)
+    schedule_note = None
+    if profile:
+        schedule_note = _maybe_sync_schedule_to_calendar(profile, get_graph_access_token(profile))
+
     responses = [_text_response("Successfully signed in! I now have access to your emails and calendar.")]
-    if pending == "digest":
+    if schedule_note:
+        responses.append(_text_response(schedule_note))
+
+    if pending in ("digest", "first_digest"):
         digest_result = handle_get_digest(student_id)
         if isinstance(digest_result, dict):
             responses.append(_text_response(digest_result.get("text", "Please try **digest** again.")))
@@ -788,7 +842,7 @@ def _prefill_timetable_from_calendar(profile: dict, manual_slots: list, consent_
 
     now = _hk_now()
     start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    end_dt = (now + timedelta(days=120)).replace(hour=23, minute=59, second=59).isoformat()
+    end_dt = (now + timedelta(days=21)).replace(hour=23, minute=59, second=59).isoformat()
     result = get_calendar_events(user_token, start_dt, end_dt)
     if not result.get("success"):
         logger.warning(f"Calendar prefill failed: {result.get('error')}")
@@ -1472,6 +1526,46 @@ def _strong_scholarships(scholarships: list) -> list:
         )
     )
 
+def _append_event_digest_sections(responses: list, events_dict: dict, limit: int = 3) -> None:
+    urgent = events_dict.get("urgent") or []
+    upcoming = events_dict.get("upcoming") or []
+    email_urgent = [e for e in urgent if e.get("source") == "email"]
+    email_upcoming = [e for e in upcoming if e.get("source") == "email"]
+    external_urgent = [e for e in urgent if e.get("source") != "email"]
+    external_upcoming = [e for e in upcoming if e.get("source") != "email"]
+
+    if email_urgent or email_upcoming:
+        responses.append(_text_response("**From your inbox:**"))
+        for event in (email_urgent + email_upcoming)[:limit]:
+            card = _event_card(event)
+            responses.append({
+                "type": "message",
+                "text": "Inbox event",
+                "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}],
+            })
+
+    if external_urgent:
+        responses.append(_text_response("**Closing soon:**"))
+        for event in external_urgent[:limit]:
+            card = _event_card(event)
+            responses.append({
+                "type": "message",
+                "text": "Event opportunity",
+                "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}],
+            })
+    if external_upcoming:
+        responses.append(_text_response("**Worth bookmarking:**"))
+        for event in external_upcoming[:limit]:
+            card = _event_card(event)
+            responses.append({
+                "type": "message",
+                "text": "Upcoming event",
+                "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}],
+            })
+    if not urgent and not upcoming:
+        responses.append(_text_response("No external events matched your profile right now."))
+
+
 def _append_scholarship_cards(responses: list, scholarships: list, tier: str, offset: int = 0, limit: int = 3) -> None:
     strict_scholarships = _strong_scholarships(scholarships)
     for card in _scholarship_cards(strict_scholarships[offset:offset + limit], tier):
@@ -1617,6 +1711,7 @@ def _event_card(event: dict) -> dict:
         "career_fair": "👔", "recruitment": "📢", "research": "🔬"
     }.get(event.get("type", "other"), "")
 
+    deadline_value = event.get("deadline_display") or event.get("deadline") or "See event page"
     body = [
         {
             "type": "TextBlock",
@@ -1629,7 +1724,7 @@ def _event_card(event: dict) -> dict:
             "facts": [
                 {"title": "Type",       "value": event.get("type", " ").replace("_", " ").capitalize()},
                 {"title": "Organiser",  "value": event.get("organiser", " ")},
-                {"title": "Deadline",   "value": event.get("deadline") or "See event page"},
+                {"title": "Deadline",   "value": deadline_value},
                 {"title": "Location",   "value": event.get("location", " ")},
             ]
         },
@@ -1661,14 +1756,15 @@ def _event_card(event: dict) -> dict:
 
     actions = []
     if event.get("source_url"):
+        link_label = "Open Email" if event.get("source") == "email" else "View Event"
         actions.append({
             "type": "Action.OpenUrl",
-            "title": "View Event",
+            "title": link_label,
             "url": event["source_url"]
         })
 
     cal_times = _event_to_calendar_times(event)
-    if cal_times:
+    if cal_times and event.get("source") != "email":
         actions.append({
             "type": "Action.Submit",
             "title": "Register",
@@ -2017,59 +2113,62 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         "expected_graduation_year": 2028,
     })
 
-    # Parse any submitted timetable rows, up to the demo limit of 3.
-    blocked_slots = []
-    for i in range(1, 4):
-        row_keys = [f"class{i}_code", f"class{i}_day", f"class{i}_start", f"class{i}_end"]
-        if not any(key in form_data for key in row_keys):
-            continue
+    # Parse schedule rows or apply defaults for conflict checking / calendar sync.
+    blocked_slots = parse_onboarding_schedule_slots(form_data)
+    if not blocked_slots:
+        blocked_slots = default_schedule_slots()
+    for slot in blocked_slots:
+        start = normalize_time_hhmm(slot.get("start", ""))
+        end = normalize_time_hhmm(slot.get("end", ""))
+        if start:
+            slot["start"] = start
+        if end:
+            slot["end"] = end
 
-        code  = str(form_data.get(f"class{i}_code", "") or "").strip()
-        day   = str(form_data.get(f"class{i}_day", "") or "").strip()
-        start = str(form_data.get(f"class{i}_start", "") or "").strip()
-        end   = str(form_data.get(f"class{i}_end", "") or "").strip()
-
-        if code and day and start and end:
-            blocked_slots.append({
-                "day": day,
-                "start": start,
-                "end": end,
-                "label": code
-            })
-
-    blocked_slots, imported_count = _prefill_timetable_from_calendar(
-        {"email": form_data.get("email", f"{student_id}@connect.hku.hk")},
-        blocked_slots,
-        consent_calendar,
-    )
-
-    # Inject timetable into profile before saving
+    profile["id"] = student_id
     profile["timetable"] = {
         "blocked_slots": blocked_slots,
-        "upcoming_deadlines": []
+        "upcoming_deadlines": [],
     }
     profile["consent"] = {
         "inbox": consent_inbox,
         "calendar": consent_calendar,
     }
 
-    profile["id"] = student_id
+    modules = profile.get("preferences", {}).get("modules_enabled", [])
+    user_token = get_graph_access_token(profile)
+
+    if consent_calendar and user_token:
+        _maybe_sync_schedule_to_calendar(profile, user_token)
+    elif consent_calendar and not user_token:
+        profile["pending_schedule_calendar_sync"] = True
+
     save_profile(profile)
 
-    calendar_note = ""
-    if imported_count:
-        calendar_note = f"\n\nImported {imported_count} class(es) from your Outlook calendar."
+    welcome = _text_response(
+        f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences."
+    )
 
-    responses = [_text_response(
-        f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences.{calendar_note} "
-        "What would you like to do now?\n\n"
-        "• Type 'digest' for your daily update\n"
-        "• Type 'scholarships' to browse matches\n"
-        "• Type 'events' to see upcoming competitions and events\n"
-        "• Type 'inbox' to review your archived emails\n"
-        "• Type 'help' anytime to see all commands"
-    )]
-    return responses
+    needs_signin = (
+        not user_token
+        and ("inbox" in modules or consent_calendar)
+    )
+    if needs_signin:
+        profile["pending_graph_command"] = "first_digest"
+        save_profile(profile)
+        return [
+            welcome,
+            _oauth_login_required(
+                "Smart Inbox and calendar features need a one-time Microsoft sign-in. "
+                "I'll run your first digest right after.",
+                pending_command="first_digest",
+            ),
+        ]
+
+    digest_responses = handle_get_digest(student_id)
+    if isinstance(digest_responses, dict):
+        return [welcome, digest_responses]
+    return [welcome] + list(digest_responses)
 
 def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
     """Extract CV text from an uploaded PDF and save it to the student profile."""
@@ -2186,7 +2285,7 @@ def handle_get_inbox(student_id: str) -> list:
 
 
 def handle_get_digest(student_id: str) -> list:
-    """Run full matching pipeline and return digest as Adaptive Cards."""
+    """Run full matching pipeline and return digest as staged Copilot messages."""
     profile = get_profile(student_id)
     if not profile:
         card = _build_onboarding_card()
@@ -2195,26 +2294,39 @@ def handle_get_digest(student_id: str) -> list:
             card
         )]
 
-    modules = profile.get("preferences", {}).get(
-        "modules_enabled",
-        ["scholarships", "events", "inbox"]
-    )
+    modules = _enabled_modules(profile)
 
-    responses = []
     auth_required = _graph_signin_gate(profile, pending_command="digest")
     if auth_required:
         profile["pending_graph_command"] = "digest"
         save_profile(profile)
-        responses.append(auth_required)
+        return [auth_required]
 
-    # 1. Run email inbox pipeline when enabled and signed in
     inbox_summary = None
     inbox_error_note = None
+    scholarship_result = {"apply_now": [], "prepare": []}
+    checked_events = []
+
     if "inbox" in modules and get_graph_access_token(profile):
         inbox_summary, inbox_error_note = _run_inbox_pipeline_for_profile(student_id, profile)
 
-    # 2. Run scholarship matching
-    scholarship_result = {"apply_now": [], "prepare": []}
+    if "events" in modules:
+        try:
+            raw_events = extract_events_for_student(student_id)
+            email_events = []
+            if inbox_summary:
+                email_events = inbox_items_to_events(
+                    inbox_summary.get("urgent_items") or [],
+                    inbox_summary.get("relevant_items") or [],
+                )
+            combined = list(raw_events) + email_events
+            checked_events = run_conflict_checks_batch(combined, profile)
+            _store_shown_events(profile, checked_events)
+            save_profile(profile)
+        except Exception as e:
+            logger.error(f"Event pipeline error: {e}")
+            checked_events = []
+
     if "scholarships" in modules:
         try:
             scholarship_result = run_matching(student_id)
@@ -2222,63 +2334,49 @@ def handle_get_digest(student_id: str) -> list:
             logger.error(f"Scholarship matching error: {e}")
             scholarship_result = {"apply_now": [], "prepare": []}
 
-    # 3. Run event extraction and conflict checking
-    checked_events = []
-    if "events" in modules:
-        try:
-            raw_events = extract_events_for_student(student_id)
-            checked_events = run_conflict_checks_batch(raw_events, profile)
-            _store_shown_events(profile, checked_events)
-            save_profile(profile)
-        except Exception as e:
-            logger.error(f"Event pipeline error: {e}")
-            checked_events = []
-
-    # 4. Assemble digest
     digest = assemble_digest(
         student_id=student_id,
         scholarship_result=scholarship_result,
         events=checked_events,
-        inbox_summary=inbox_summary  # Pass the real inbox summary here
+        inbox_summary=inbox_summary,
     )
 
     update_agent_snapshot(profile, digest)
     save_profile(profile)
 
-    opening = format_digest_with_proactive(profile, digest, format_digest_message(digest))
-    responses.append(_text_response(opening))
+    responses = [
+        _text_response(format_digest_with_proactive(profile, digest, format_digest_message(digest)))
+    ]
 
-    if inbox_error_note:
-        responses.append(_text_response(f"📬 **Inbox:** {inbox_error_note}"))
-
-    if "scholarships" in modules:
-        _append_scholarship_sections(responses, digest["scholarships"])
-
-    _append_inbox_calendar_sections(responses, inbox_summary)
-
-    # Event cards — urgent
-    if digest["events"]["urgent"]:
-        responses.append(_text_response("**🏆 Events — Closing Soon:**"))
-        for event in digest["events"]["urgent"][:3]:
-            card = _event_card(event)
+    if "inbox" in modules:
+        responses.append(_text_response("**1. Inbox** — Processing your emails…"))
+        if inbox_error_note:
+            responses.append(_text_response(f"⚠️ {inbox_error_note}"))
+        elif inbox_summary and inbox_summary.get("processed", 0) == 0 and get_graph_access_token(profile):
+            responses.append(_text_response("Inbox scan complete — no new emails to classify."))
+        elif not get_graph_access_token(profile):
+            responses.append(_text_response(
+                "Inbox processing skipped — sign in with Microsoft to enable email triage."
+            ))
+        _append_inbox_calendar_sections(responses, inbox_summary)
+        if inbox_summary and inbox_summary.get("archived_items"):
+            review_item = inbox_summary["archived_items"][0]
             responses.append({
                 "type": "message",
-                "text": "Event opportunity",
-                "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
+                "text": "Archive review",
+                "attachments": [{
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": _archive_review_card(review_item),
+                }],
             })
 
-    if inbox_summary and inbox_summary.get("archived_items"):
-        review_item = inbox_summary["archived_items"][0]
-        responses.append({
-            "type": "message",
-            "text": "Archive review",
-            "attachments": [
-                {
-                    "contentType": "application/vnd.microsoft.card.adaptive",
-                    "content": _archive_review_card(review_item)
-                }
-            ]
-        })
+    if "events" in modules:
+        responses.append(_text_response("**2. External events** — Scanning event feeds…"))
+        _append_event_digest_sections(responses, digest["events"])
+
+    if "scholarships" in modules:
+        responses.append(_text_response("**3. Scholarships** — Checking open awards…"))
+        _append_scholarship_sections(responses, digest["scholarships"])
 
     return responses
 
@@ -3355,7 +3453,7 @@ def handle_approve_application(student_id: str, form_data: dict | None = None) -
                 }
             ],
         }
-        return [_card_response("Your filled application is ready!", card)]
+        return [_card_response("", card)]
 
     logger.warning("Blob upload failed, falling back to in-memory download")
     try:

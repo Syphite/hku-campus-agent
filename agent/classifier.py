@@ -86,7 +86,7 @@ def suggested_course_keywords(profile):
 
     return result[:12]
 
-def build_profile_keywords(profile):
+def build_profile_keywords(profile, include_generic=True):
     academic = profile.get("academic", {})
     interests = _normalize_list(profile.get("interests", []))
     courses = _normalize_list(profile.get("courses", []))
@@ -101,7 +101,8 @@ def build_profile_keywords(profile):
             keywords.update(values)
 
     keywords.update(suggested_course_keywords(profile))
-    keywords.update(GENERAL_STUDENT_TERMS)
+    if include_generic:
+        keywords.update(GENERAL_STUDENT_TERMS)
 
     return sorted(keywords)
 

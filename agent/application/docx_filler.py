@@ -7,6 +7,7 @@ import os
 import shutil
 
 from agent.application.cell_utils import is_empty_cell, normalize_text, texts_match
+from agent.application.profile_resolver import truncate_to_words
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +88,39 @@ def _header_column_map(cells, headers: list[str], item_fields: dict) -> dict:
     return mapping
 
 
-def _next_empty_data_row(table, start_row: int, column_map: dict, max_rows: int):
-    for offset in range(1, max_rows + 1):
-        row_index = start_row + offset
-        if row_index >= len(table.rows):
-            return None
+def _is_description_row(cells) -> bool:
+    row_text = " ".join(normalize_text(cell.text) for cell in cells)
+    return "description" in row_text or "in 50 words" in row_text
+
+
+def _next_empty_data_row(table, start_row: int, column_map: dict, max_rows: int, *, description_row: bool = False):
+    for row_index in range(start_row + 1, len(table.rows)):
         cells = _row_cells(table, row_index)
+        if description_row and _is_description_row(cells):
+            continue
         values = []
         for col_index in column_map.values():
             if col_index < len(cells):
                 values.append(cells[col_index].text)
-        if all(is_empty_cell(value) for value in values):
+        if values and all(is_empty_cell(value) for value in values):
             return row_index, cells
     return None
+
+
+def _description_target_cell(table, data_row_index: int):
+    desc_row_index = data_row_index + 1
+    if desc_row_index >= len(table.rows):
+        return None
+    cells = _row_cells(table, desc_row_index)
+    if not _is_description_row(cells):
+        return None
+    for cell in reversed(cells):
+        text = normalize_text(cell.text)
+        if "description" in text or "in 50 words" in text:
+            continue
+        if is_empty_cell(cell.text) or len(cells) == 1:
+            return cell
+    return cells[-1] if cells else None
 
 
 def _fill_repeating_list(table, list_schema: dict, items: list[dict]) -> int:
@@ -117,20 +138,34 @@ def _fill_repeating_list(table, list_schema: dict, items: list[dict]) -> int:
         logger.warning("Could not map columns for repeating list %s", list_schema.get("key"))
         return 0
 
+    desc_limit = int(list_schema.get("description_target_words") or 0)
+    use_description_row = bool(list_schema.get("description_row"))
     filled = 0
     for item in items[:max_rows]:
-        target = _next_empty_data_row(table, header_row_index, column_map, max_rows)
+        target = _next_empty_data_row(
+            table,
+            header_row_index,
+            column_map,
+            max_rows,
+            description_row=use_description_row,
+        )
         if not target:
             break
         row_index, cells = target
         for logical_key, col_index in column_map.items():
             if col_index < len(cells):
-                _set_cell_text(cells[col_index], item.get(logical_key, ""))
-        if list_schema.get("description_row") and row_index + 1 < len(table.rows):
-            description = item.get("description") or item.get("hours") or ""
+                value = item.get(logical_key, "")
+                if logical_key == "description" and desc_limit:
+                    value = truncate_to_words(value, desc_limit)
+                _set_cell_text(cells[col_index], value)
+        if use_description_row:
+            description = item.get("description") or ""
+            if description and desc_limit:
+                description = truncate_to_words(description, desc_limit)
             if description:
-                below_cells = _row_cells(table, row_index + 1)
-                _set_cell_text(below_cells[0], description)
+                target_cell = _description_target_cell(table, row_index)
+                if target_cell is not None:
+                    _set_cell_text(target_cell, description)
         filled += 1
     return filled
 

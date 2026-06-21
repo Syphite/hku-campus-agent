@@ -9,6 +9,7 @@ Rules:
 - Use the field keys: {field_keys}
 - Use empty strings for missing fields. Do not invent organizations or dates.
 - Preserve the user's wording in description fields when provided.
+- When description_target_words is set in the list schema, rephrase each description to at most that many words while keeping facts accurate.
 - For education sections, map schools/degrees/dates to institution/qualification/dates fields as appropriate.
 
 List section schema:
