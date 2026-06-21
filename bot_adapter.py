@@ -1,9 +1,15 @@
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
-from botbuilder.schema import Activity, Attachment
+from botbuilder.schema import Activity, ActivityTypes, Attachment, OAuthCard, ActionTypes, CardAction
 from aiohttp import ClientSession, web
 import os
 import secrets
-from agent.handler import handle_application_form_upload, handle_cv_upload, handle_form_uploaded, handle_message
+from agent.handler import (
+    handle_application_form_upload,
+    handle_cv_upload,
+    handle_form_uploaded,
+    handle_graph_token_response,
+    handle_message,
+)
 from agent.profile import get_profile
 from dotenv import load_dotenv
 
@@ -36,7 +42,20 @@ def _register_download(file_bytes: bytes, filename: str, content_type: str) -> s
 
 
 def _public_base_url() -> str:
-    return os.environ.get("BOT_PUBLIC_URL", f"http://localhost:{os.environ.get('PORT', 3978)}").rstrip("/")
+    explicit = os.environ.get("BOT_PUBLIC_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    port = os.environ.get("PORT", "3978")
+    return f"http://localhost:{port}".rstrip("/")
+
+
+def _download_url_warning(url: str) -> str:
+    if "localhost" in url or "127.0.0.1" in url:
+        return (
+            "\n\n_Note: downloads use a local URL and will not work from Copilot unless "
+            "BOT_PUBLIC_URL is set to your deployed bot HTTPS address._"
+        )
+    return ""
 
 
 async def download_file(req: web.Request) -> web.Response:
@@ -63,21 +82,6 @@ async def messages(req: web.Request) -> web.Response:
     auth = req.headers.get("Authorization", "")
 
     async def turn_handler(turn_context: TurnContext):
-        if turn_context.activity.type != "message":
-            return
-
-        channel_data = turn_context.activity.channel_data or {}
-        if not isinstance(channel_data, dict):
-            channel_data = {}
-        event_type = str(channel_data.get("eventType") or channel_data.get("event_type") or "").lower()
-        activity_name = str(getattr(turn_context.activity, "name", "") or "").lower()
-        is_edit = (
-            "edit" in event_type
-            or "update" in event_type
-            or "edit" in activity_name
-            or "update" in activity_name
-        )
-
         from_property = turn_context.activity.from_property
         student_id = from_property.id if from_property and from_property.id else None
 
@@ -85,36 +89,97 @@ async def messages(req: web.Request) -> web.Response:
             await turn_context.send_activity("I couldn't identify your user ID.")
             return
 
-        async def send_agent_responses(responses):
-            for r in responses:
-                attachments = []
-                if r.get("attachments"):
-                    for att in r["attachments"]:
-                        attachments.append(Attachment(
-                            content_type=att.get("contentType"),
-                            content=att.get("content")
-                        ))
-
-                file_download = r.get("file_download")
-                if file_download:
-                    # Serve filled forms and other generated files via the bot download endpoint.
-                    token = _register_download(
-                        file_download["bytes"],
-                        file_download["filename"],
-                        file_download["content_type"],
+        async def send_oauth_card(oauth_payload: dict):
+            card_text = oauth_payload.get(
+                "text",
+                "Please sign in with your Microsoft account to continue.",
+            )
+            card = OAuthCard(
+                text=card_text,
+                connection_name=oauth_payload.get("connection_name", "GraphOAuth"),
+                buttons=[
+                    CardAction(
+                        type=ActionTypes.signin,
+                        title="Sign In",
+                        value="signin",
                     )
-                    download_url = f"{_public_base_url()}/download/{token}"
+                ],
+            )
+            attachment = Attachment(
+                content_type="application/vnd.microsoft.card.oauth",
+                content=card,
+            )
+            await turn_context.send_activity(Activity(
+                type=ActivityTypes.message,
+                text=card_text,
+                attachments=[attachment],
+            ))
+
+        async def send_single_response(response: dict):
+            attachments = []
+            if response.get("attachments"):
+                for att in response["attachments"]:
                     attachments.append(Attachment(
-                        content_type=file_download["content_type"],
-                        content_url=download_url,
-                        name=file_download["filename"],
+                        content_type=att.get("contentType"),
+                        content=att.get("content")
                     ))
 
-                await turn_context.send_activity(Activity(
-                    type="message",
-                    text=r.get("text", ""),
-                    attachments=attachments if attachments else None
+            file_download = response.get("file_download")
+            message_text = response.get("text", "") or ""
+            if file_download:
+                token = _register_download(
+                    file_download["bytes"],
+                    file_download["filename"],
+                    file_download["content_type"],
+                )
+                download_url = f"{_public_base_url()}/download/{token}"
+                message_text = f"{message_text}\n\n**Download:** {download_url}{_download_url_warning(download_url)}".strip()
+                attachments.append(Attachment(
+                    content_type=file_download["content_type"],
+                    content_url=download_url,
+                    name=file_download["filename"],
                 ))
+
+            await turn_context.send_activity(Activity(
+                type="message",
+                text=message_text,
+                attachments=attachments if attachments else None
+            ))
+
+        async def send_agent_responses(responses):
+            if isinstance(responses, dict):
+                if responses.get("type") == "oauth_login_required":
+                    await send_oauth_card(responses)
+                return
+
+            for response in responses or []:
+                if isinstance(response, dict) and response.get("type") == "oauth_login_required":
+                    await send_oauth_card(response)
+                    continue
+                await send_single_response(response)
+
+        activity_type = turn_context.activity.type
+        activity_name = getattr(turn_context.activity, "name", "") or ""
+
+        if activity_type == ActivityTypes.event and activity_name in ("tokens/response", "token/response"):
+            token_payload = turn_context.activity.value or {}
+            await send_agent_responses(handle_graph_token_response(student_id, token_payload))
+            return
+
+        if activity_type != ActivityTypes.message:
+            return
+
+        channel_data = turn_context.activity.channel_data or {}
+        if not isinstance(channel_data, dict):
+            channel_data = {}
+        event_type = str(channel_data.get("eventType") or channel_data.get("event_type") or "").lower()
+        activity_name_lower = activity_name.lower()
+        is_edit = (
+            "edit" in event_type
+            or "update" in event_type
+            or "edit" in activity_name_lower
+            or "update" in activity_name_lower
+        )
 
         def is_supported_document(att) -> bool:
             content_type = (getattr(att, "content_type", "") or "").lower()
@@ -182,7 +247,7 @@ async def messages(req: web.Request) -> web.Response:
             "value": turn_context.activity.value or {},
             "is_edit": is_edit,
             "event_type": event_type,
-            "activity_name": activity_name
+            "activity_name": activity_name_lower
         }
 
         responses = handle_message(student_id, message)

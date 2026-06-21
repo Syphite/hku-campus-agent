@@ -596,6 +596,8 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
         if current.strip():
             continue
         label = field.get("anchor_label") or key.replace("_", " ").title()
+        if is_declaration_field_label(label):
+            continue
         gaps.append({
             "type": "long_text",
             "key": key,
@@ -613,6 +615,8 @@ def detect_gaps(schema: dict, filled_data: dict, profile: dict, free_field_defs:
         if current.strip():
             continue
         label = field.get("question_text") or key.replace("_", " ").title()
+        if is_declaration_field_label(label):
+            continue
         gaps.append({
             "type": "free_field",
             "key": key,
@@ -695,6 +699,22 @@ def gap_data_keys(gap: dict) -> list[str]:
     return [k for k in keys if k]
 
 
+def is_declaration_field_label(label: str) -> bool:
+    """Fields the student should complete directly in the DOCX (Yes/No follow-ups, declarations)."""
+    normalized = normalize_text(label or "")
+    if not normalized:
+        return False
+    if "declaration" in normalized:
+        return True
+    if "questions above" in normalized:
+        return True
+    if "provide details" in normalized and "yes" in normalized:
+        return True
+    if "answered" in normalized and "yes" in normalized:
+        return True
+    return False
+
+
 def build_section_prompt(gap: dict) -> str:
     if not gap:
         return "Please share the information for the next section."
@@ -710,6 +730,12 @@ def build_section_prompt(gap: dict) -> str:
     )
 
 
+DECLARATIONS_DOCX_NOTE = (
+    "**Complete in the form document:** Declaration sections and any "
+    "\"If you answered Yes…\" follow-ups should be filled in directly in the downloaded DOCX."
+)
+
+
 def build_gap_overview(schema: dict, filled_data: dict, gaps: list) -> str:
     lines = ["I analyzed your form.", ""]
 
@@ -720,6 +746,9 @@ def build_gap_overview(schema: dict, filled_data: dict, gaps: list) -> str:
         for label in filled_simple[:12]:
             lines.append(f"- {label}")
         lines.append("")
+
+    lines.append(DECLARATIONS_DOCX_NOTE)
+    lines.append("")
 
     collection_gaps = consolidate_collection_gaps(gaps)
     if collection_gaps:

@@ -83,6 +83,42 @@ def get_graph_access_token(profile: dict | None) -> str | None:
     return None
 
 
+def save_graph_token(student_id: str, token_payload) -> bool:
+    """Persist delegated Graph token from Bot Framework OAuth sign-in."""
+    profile = get_profile(student_id)
+    if not profile:
+        logger.error("Cannot save graph token — profile not found: %s", student_id)
+        return False
+
+    access_token = ""
+    expiration = None
+    if isinstance(token_payload, str):
+        access_token = token_payload.strip()
+    elif isinstance(token_payload, dict):
+        access_token = str(token_payload.get("token") or "").strip()
+        expiration = token_payload.get("expiration")
+
+    if not access_token:
+        logger.error("OAuth token response missing access token for %s", student_id)
+        return False
+
+    profile["graph_token"] = access_token
+    if expiration:
+        profile["graph_token_expires_at"] = expiration
+    profile["graph_token_saved_at"] = datetime.now(timezone.utc).isoformat()
+    return save_profile(profile)
+
+
+def clear_pending_graph_command(student_id: str) -> str | None:
+    profile = get_profile(student_id)
+    if not profile:
+        return None
+    pending = profile.pop("pending_graph_command", None)
+    if pending:
+        save_profile(profile)
+    return pending
+
+
 # ---------------------------------------------------------------------------
 # CV extraction
 # ---------------------------------------------------------------------------

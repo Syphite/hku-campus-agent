@@ -9,12 +9,13 @@ Called after email classification (relevant emails only) and after
 social media mock/real scraping.
 """
 
-import os
 import json
 import logging
+import os
 from datetime import datetime, timezone
-from openai import AzureOpenAI
+
 from dotenv import load_dotenv
+from openai import AzureOpenAI
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -26,11 +27,14 @@ openai_client = AzureOpenAI(
 )
 DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
+EXTRACT_BATCH_SIZE = 4
+
 EXTRACT_PROMPT = """
-You are an event extraction assistant for HKU students. 
+You are an event extraction assistant for HKU students.
 Extract structured event information from the provided text (which may be from an email, LinkedIn, or Xiaohongshu).
 
 For each item, extract the following fields. If a field is not mentioned, use null or an empty list.
+Keep eligibility and summary under 120 characters each.
 
 - is_relevant: true only if this is a genuine student event or opportunity such as a competition, hackathon, internship with a specific application deadline, workshop, talk, cultural programme, volunteering opportunity, career fair, recruitment event, or research opportunity. false if it is noise (food reviews, generic job ads for non-students, unrelated content).
 - Set is_relevant: false for posts primarily about scholarship applications. Scholarship matching comes from the Azure AI Search scholarship index, not social media scraping.
@@ -40,42 +44,177 @@ For each item, extract the following fields. If a field is not mentioned, use nu
 - organiser: who is running it
 - deadline: application/registration deadline as ISO date YYYY-MM-DD (or null)
 - event_sessions: list of recurring session times if mentioned (e.g., [{{"day": "Tuesday", "start": "14:00", "end": "17:00", "label": "Team sessions"}}])
-- eligibility: plain English description of who can apply
+- eligibility: plain English description of who can apply (max 120 chars)
 - faculty_relevant: list of relevant faculties (e.g., ["Engineering", "all"])
 - year_relevant: list of eligible years (e.g., ["1", "2", "3", "4", "all"])
 - skills_required: list of skills or []
 - benefits: list of prizes, stipends, certificates, or networking benefits
 - location: "online" | city/venue name | "hybrid"
 - language: "english" | "mandarin" | "cantonese" | "bilingual"
-- summary: one sentence in English summarising the opportunity and why it matters
+- summary: one sentence in English summarising the opportunity (max 120 chars)
 - source_id: the exact "id" field from the input item
 
-Return ONLY a valid JSON array. No preamble, no markdown fences.
+Return ONLY a JSON object with key "events" containing an array of extracted items.
+No preamble, no markdown fences.
 
 Example output:
-[
-  {{
-    "source_id": "li_001",
-    "is_relevant": true,
-    "type": "hackathon",
-    "title": "Microsoft Imagine Cup 2026",
-    "organiser": "Microsoft Hong Kong",
-    "deadline": "2026-07-15",
-    "event_sessions": [],
-    "eligibility": "All university students in Hong Kong, team of 1-4",
-    "faculty_relevant": ["all"],
-    "year_relevant": ["all"],
-    "skills_required": ["AI/ML", "cloud computing"],
-    "benefits": ["HK$50,000 prize", "trip to global finals"],
-    "location": "Hong Kong",
-    "language": "english",
-    "summary": "Microsoft global student innovation competition open to all HK university students, deadline July 15."
-  }}
-]
+{{
+  "events": [
+    {{
+      "source_id": "li_001",
+      "is_relevant": true,
+      "type": "hackathon",
+      "title": "Microsoft Imagine Cup 2026",
+      "organiser": "Microsoft Hong Kong",
+      "deadline": "2026-07-15",
+      "event_sessions": [],
+      "eligibility": "All HK university students, teams of 1-4",
+      "faculty_relevant": ["all"],
+      "year_relevant": ["all"],
+      "skills_required": ["AI/ML", "cloud computing"],
+      "benefits": ["HK$50,000 prize", "trip to global finals"],
+      "location": "Hong Kong",
+      "language": "english",
+      "summary": "Microsoft student innovation competition; deadline July 15."
+    }}
+  ]
+}}
 
 Items to process:
 {items}
 """
+
+
+def _strip_json_fences(raw: str) -> str:
+    text = (raw or "").strip()
+    if "```" in text:
+        parts = text.split("```")
+        text = parts[1] if len(parts) > 1 else text
+        if text.startswith("json"):
+            text = text[4:]
+    return text.strip()
+
+
+def _parse_event_payload(raw: str) -> list:
+    """Parse LLM JSON; salvage complete objects from truncated arrays if needed."""
+    text = _strip_json_fences(raw)
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        salvaged = _salvage_json_objects(text)
+        if salvaged:
+            logger.warning("Salvaged %s complete event object(s) from truncated JSON", len(salvaged))
+            return salvaged
+        raise
+
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for value in parsed.values():
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _salvage_json_objects(text: str) -> list:
+    """Extract complete top-level JSON objects from a truncated array response."""
+    objects = []
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    chunk = text[start:index + 1]
+                    try:
+                        item = json.loads(chunk)
+                        if isinstance(item, dict):
+                            objects.append(item)
+                    except json.JSONDecodeError:
+                        pass
+                    start = None
+
+    return objects
+
+
+def _compact_items(raw_items: list) -> list:
+    return [
+        {
+            "id": item.get("id"),
+            "source": item.get("source"),
+            "raw_text": item.get("raw_text", "")[:900],
+            "date": item.get("posted_date") or item.get("received_date", ""),
+            "from": item.get("poster") or item.get("sender", ""),
+        }
+        for item in raw_items
+    ]
+
+
+def _extract_events_batch(batch: list) -> list:
+    if not batch:
+        return []
+
+    prompt = EXTRACT_PROMPT.format(
+        items=json.dumps(_compact_items(batch), indent=2, ensure_ascii=False)
+    )
+
+    response = openai_client.chat.completions.create(
+        model=DEPLOYMENT,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_tokens=3500,
+        temperature=0.1,
+    )
+    choice = response.choices[0]
+    raw = choice.message.content or "{}"
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason == "length":
+        logger.warning("Event extraction batch hit token limit; attempting salvage")
+
+    return _parse_event_payload(raw)
+
+
+def _enrich_events(extracted: list, source_map: dict) -> list:
+    results = []
+    for event in extracted:
+        if not isinstance(event, dict):
+            continue
+        if not event.get("is_relevant", True):
+            continue
+        sid = event.get("source_id")
+        if sid and sid in source_map:
+            orig = source_map[sid]
+            event["source"] = orig.get("source")
+            event["source_url"] = orig.get("source_url", "")
+            event["found_for"] = orig.get("found_for", "all")
+            event["posted_date"] = orig.get("posted_date") or orig.get("received_date", "")
+        event["extracted_at"] = datetime.now(timezone.utc).isoformat()
+        results.append(event)
+    return results
 
 
 def extract_events(raw_items: list) -> list:
@@ -96,73 +235,22 @@ def extract_events(raw_items: list) -> list:
     if not raw_items:
         return []
 
-    # Build compact input — cap text to save tokens
-    compact = [
-        {
-            "id":       item.get("id"),
-            "source":   item.get("source"),
-            "raw_text": item.get("raw_text", "")[:1200],
-            "date":     item.get("posted_date") or item.get("received_date", ""),
-            "from":     item.get("poster") or item.get("sender", ""),
-        }
-        for item in raw_items
-    ]
+    source_map = {item["id"]: item for item in raw_items if item.get("id")}
+    all_extracted = []
 
-    prompt = EXTRACT_PROMPT.format(
-        items=json.dumps(compact, indent=2, ensure_ascii=False)
-    )
+    for offset in range(0, len(raw_items), EXTRACT_BATCH_SIZE):
+        batch = raw_items[offset:offset + EXTRACT_BATCH_SIZE]
+        try:
+            batch_results = _extract_events_batch(batch)
+            all_extracted.extend(batch_results)
+        except json.JSONDecodeError as exc:
+            logger.error("Event extraction JSON error for batch %s-%s: %s", offset, offset + len(batch), exc)
+        except Exception as exc:
+            logger.error("Event extraction error for batch %s-%s: %s", offset, offset + len(batch), exc)
 
-    try:
-        response = openai_client.chat.completions.create(
-            model=DEPLOYMENT,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=4000,
-            temperature=0.1
-        )
-        raw = response.choices[0].message.content.strip()
-
-        # Strip markdown fences if present
-        if "```" in raw:
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) > 1 else raw
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        extracted = json.loads(raw)
-        if isinstance(extracted, dict):
-            # GPT wrapped in object — extract the list
-            extracted = next(
-                (v for v in extracted.values() if isinstance(v, list)), []
-            )
-
-        # Build source lookup for enrichment
-        source_map = {item["id"]: item for item in raw_items}
-
-        results = []
-        for event in extracted:
-            if not event.get("is_relevant", True):
-                continue
-            sid = event.get("source_id")
-            if sid and sid in source_map:
-                orig = source_map[sid]
-                event["source"]       = orig.get("source")
-                event["source_url"]   = orig.get("source_url", "")
-                event["found_for"]    = orig.get("found_for", "all")
-                event["posted_date"]  = orig.get("posted_date") or orig.get("received_date", "")
-            event["extracted_at"] = datetime.now(timezone.utc).isoformat()
-            results.append(event)
-
-        logger.info(f"Extracted {len(results)} relevant events from {len(raw_items)} items")
-        return results
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Event extraction JSON error: {e}")
-        logger.error(f"Raw response: {raw[:300]}")
-        return []
-    except Exception as e:
-        logger.error(f"Event extraction error: {e}")
-        return []
+    results = _enrich_events(all_extracted, source_map)
+    logger.info("Extracted %s relevant events from %s items", len(results), len(raw_items))
+    return results
 
 
 def extract_events_for_student(student_id: str) -> list:

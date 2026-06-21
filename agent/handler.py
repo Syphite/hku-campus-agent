@@ -21,7 +21,7 @@ openai_client = AzureOpenAI(
 )
 
 # Import agent modules using absolute paths from project root
-from agent.profile  import get_profile, save_profile, build_profile_from_form, update_profile_fields, extract_cv_text, get_graph_access_token
+from agent.profile  import get_profile, save_profile, build_profile_from_form, update_profile_fields, extract_cv_text, get_graph_access_token, save_graph_token, clear_pending_graph_command
 from agent.matching import run_matching
 from agent.drafter  import extract_application_questions, generate_draft_answers
 from agent.question_extractor import extract_questions_from_file, extract_text_from_application_file
@@ -648,6 +648,52 @@ def _has_calendar_consent(profile: dict | None) -> bool:
 def _has_inbox_consent(profile: dict | None) -> bool:
     return bool((profile or {}).get("consent", {}).get("inbox"))
 
+GRAPH_OAUTH_CONNECTION = os.getenv("GRAPH_OAUTH_CONNECTION", "GraphOAuth")
+
+
+def _oauth_login_required(text: str, pending_command: str | None = None) -> dict:
+    return {
+        "type": "oauth_login_required",
+        "connection_name": GRAPH_OAUTH_CONNECTION,
+        "text": text,
+        "pending_command": pending_command,
+    }
+
+
+def _require_graph_token(profile: dict, *, needs_inbox: bool = False, needs_calendar: bool = False) -> dict | None:
+    if not needs_inbox and not needs_calendar:
+        return None
+    if get_graph_access_token(profile):
+        return None
+    parts = []
+    if needs_inbox:
+        parts.append("emails")
+    if needs_calendar:
+        parts.append("calendar")
+    scope = " and ".join(parts)
+    return _oauth_login_required(
+        f"To access your {scope}, I need your permission. Please sign in with your Microsoft account.",
+        pending_command="digest" if needs_inbox else None,
+    )
+
+
+def handle_graph_token_response(student_id: str, token_payload) -> list:
+    """Save OAuth token and optionally replay the command that triggered sign-in."""
+    if not save_graph_token(student_id, token_payload):
+        return [_text_response("Sign-in did not complete — no token was received. Please try again.")]
+
+    pending = clear_pending_graph_command(student_id)
+    responses = [_text_response("Successfully signed in! I now have access to your emails and calendar.")]
+    if pending == "digest":
+        digest_result = handle_get_digest(student_id)
+        if isinstance(digest_result, dict):
+            responses.append(_text_response(digest_result.get("text", "Please try **digest** again.")))
+        else:
+            responses.extend(digest_result)
+    else:
+        responses.append(_text_response("Type **digest** when you're ready for your update."))
+    return responses
+
 _WEEKDAY_NAMES = (
     "Monday", "Tuesday", "Wednesday", "Thursday",
     "Friday", "Saturday", "Sunday",
@@ -1039,13 +1085,12 @@ def handle_confirm_event_registration(student_id: str, value: dict) -> list:
             "Registration noted. Enable calendar access in your profile settings to auto-add events."
         )]
 
-    user_token = get_graph_access_token(profile)
-    if not user_token:
+    auth_required = _require_graph_token(profile, needs_calendar=True)
+    if auth_required:
         save_profile(profile)
-        return [_text_response(
-            "Registration noted. Sign in with Microsoft to add events to your calendar."
-        )]
+        return [auth_required]
 
+    user_token = get_graph_access_token(profile)
     result = create_calendar_event(user_token, title, start_iso, end_iso, location)
     save_profile(profile)
     if result.get("success"):
@@ -1071,12 +1116,11 @@ def handle_confirm_calendar_add(student_id: str, value: dict) -> list:
     start_iso, end_iso = iso_times
     title = value.get("title", "Event")
     location = value.get("location", "")
-    user_token = get_graph_access_token(profile)
-    if not user_token:
-        return [_text_response(
-            "Please sign in with Microsoft to add events to your calendar."
-        )]
+    auth_required = _require_graph_token(profile, needs_calendar=True)
+    if auth_required:
+        return [auth_required]
 
+    user_token = get_graph_access_token(profile)
     result = create_calendar_event(user_token, title, start_iso, end_iso, location)
     if result.get("success"):
         display = _format_event_datetime_display(start_iso, end_iso)
@@ -1776,6 +1820,11 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
         "• Type 'inbox' to review your archived emails\n"
         "• Type 'help' anytime to see all commands"
     )]
+    if (consent_inbox or consent_calendar) and not get_graph_access_token(profile):
+        responses.append(_oauth_login_required(
+            "To connect your email and calendar, please sign in with your Microsoft account once during registration.",
+            pending_command=None,
+        ))
     return responses
 
 def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
@@ -1807,10 +1856,19 @@ def handle_get_digest(student_id: str) -> list:
         ["scholarships", "events", "inbox"]
     )
 
-    # 1. Run email inbox pipeline only when enabled
+    auth_required = _require_graph_token(
+        profile,
+        needs_inbox="inbox" in modules and _has_inbox_consent(profile),
+    )
+    if auth_required:
+        profile["pending_graph_command"] = auth_required.get("pending_command") or "digest"
+        save_profile(profile)
+        return auth_required
+
+    # 1. Run email inbox pipeline only when enabled and consented
     inbox_summary = None
     inbox_error_note = None
-    if "inbox" in modules:
+    if "inbox" in modules and _has_inbox_consent(profile):
         try:
             inbox_summary = run_inbox_pipeline(
                 student_id,
@@ -1895,6 +1953,68 @@ def handle_get_digest(student_id: str) -> list:
                 }
             ]
         })
+
+    return responses
+
+def handle_get_events(student_id: str) -> list:
+    """Run event extraction and render only event sections."""
+    profile = get_profile(student_id)
+    if not profile:
+        return [_card_response("I don't have your profile yet. Let's get you set up:", _build_onboarding_card())]
+
+    modules = profile.get("preferences", {}).get("modules_enabled", ["scholarships", "events", "inbox"])
+    if "events" not in modules:
+        return [_text_response("Event matching is currently turned off in your profile settings.")]
+
+    try:
+        raw_events = extract_events_for_student(student_id)
+        checked_events = run_conflict_checks_batch(raw_events, profile)
+        _store_shown_events(profile, checked_events)
+        save_profile(profile)
+    except Exception as e:
+        logger.error(f"Event pipeline error: {e}")
+        checked_events = []
+
+    digest = assemble_digest(
+        student_id=student_id,
+        scholarship_result={"apply_now": [], "prepare": []},
+        events=checked_events,
+        inbox_summary={"processed": 0, "archived": 0, "kept": 0, "archived_items": [], "relevant_items": []},
+    )
+    urgent = digest["events"]["urgent"]
+    upcoming = digest["events"]["upcoming"]
+
+    if not urgent and not upcoming:
+        return [_text_response(
+            "No matching events right now — check back after the next feed refresh, or type **digest** for your full update."
+        )]
+
+    lines = ["Here are your event matches:\n"]
+    if urgent:
+        lines.append(f"🏆 **{len(urgent)} event(s) with upcoming deadlines**")
+    if upcoming:
+        lines.append(f"📌 **{len(upcoming)} upcoming event(s)** worth bookmarking")
+    responses = [_text_response("\n".join(lines))]
+
+    if urgent:
+        responses.append(_text_response("**🏆 Events — Closing Soon:**"))
+        for event in urgent[:10]:
+            card = _event_card(event)
+            responses.append({
+                "type": "message",
+                "text": "Event opportunity",
+                "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
+            })
+
+    if upcoming:
+        responses.append(_text_response("**📌 Upcoming Events:**"))
+        for event in upcoming[:10]:
+            card = _event_card(event)
+            responses.append({
+                "type": "message",
+                "text": "Event opportunity",
+                "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]
+            })
 
     return responses
 
@@ -2434,9 +2554,7 @@ def _section_prompt_response(profile: dict, gap: dict, state: dict | None = None
     if gap.get("type") == "repeating_list" and suggestions and section_id not in reviewed:
         return [_card_response("Include from profile?", _profile_suggestions_card(gap, suggestions))]
 
-    prompt = build_section_prompt(gap)
     return [
-        _text_response(prompt),
         _card_response("Current section", _application_section_card(gap)),
     ]
 
@@ -2800,10 +2918,8 @@ def handle_application_form_upload(
         metadata = plan.get("metadata") or {}
         if metadata.get("analysis_errors"):
             overview += "\n\n_Note: some sections needed partial analysis._"
-        first_label = first_gap.get("label") or first_gap.get("key", "section").replace("_", " ").title()
         responses = [
             _text_response(overview),
-            _text_response(f"Starting with **{first_label}**."),
         ]
         responses.extend(_section_prompt_response(profile, first_gap, get_application_state(profile)))
         return responses
@@ -3174,9 +3290,15 @@ def handle_semester_refresh(student_id: str, form_data: dict, dismissed: bool = 
 
     if updates:
         update_profile_fields(student_id, updates)
-        return [_text_response(
+        responses = [_text_response(
             "Profile updated! Running matching with your new details..."
-        )] + handle_get_digest(student_id)
+        )]
+        digest_result = handle_get_digest(student_id)
+        if isinstance(digest_result, dict):
+            responses.append(digest_result)
+        else:
+            responses.extend(digest_result)
+        return responses
     else:
         return [_text_response("Profile unchanged.")]
 
@@ -3407,6 +3529,12 @@ def handle_message(student_id: str, message: dict) -> list:
     if "upload cv" in text or text == "cv":
         return [_text_response("Please attach your PDF CV to the chat first, then type CV again.")]
 
+    event_commands = {
+        "events", "show events", "competitions", "show me events", "event matches",
+    }
+    if text in event_commands:
+        return handle_get_events(student_id)
+
     scholarship_commands = {
         "scholarship", "scholarships", "show scholarships",
         "browse scholarships", "show me scholarships", "scholarship matches"
@@ -3424,12 +3552,12 @@ def handle_message(student_id: str, message: dict) -> list:
         return handle_get_scholarships(student_id)
 
     if profile and profile.get("last_scholarship_id") and text:
-        digest_terms = ["digest", "update", "what's new", "show me", "opportunities", "events", "inbox"]
+        digest_terms = ["digest", "update", "what's new", "show me", "opportunities", "inbox"]
         help_terms = ["hello", "hi", "hey", "start", "help"]
         if not any(kw in text for kw in digest_terms + help_terms):
             return handle_text_pasted(student_id, message.get("text") or "")
 
-    if any(kw in text for kw in ["digest", "update", "what's new", "show me", "opportunities", "events", "inbox"]):
+    if any(kw in text for kw in ["digest", "update", "what's new", "show me", "opportunities", "inbox"]):
         return handle_get_digest(student_id)
 
     if any(kw in text for kw in ["draft", "apply", "application"]):
