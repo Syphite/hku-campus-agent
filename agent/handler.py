@@ -55,6 +55,7 @@ from agent.conflict_checker        import run_conflict_checks_batch
 # Import email pipeline
 from agent.email_pipeline import run_inbox_pipeline
 from agent.graph import (
+    GraphApiError,
     calendar_events_to_blocked_slots,
     create_calendar_event,
     get_calendar_events,
@@ -1831,9 +1832,24 @@ def handle_get_digest(student_id: str) -> list:
 
     # 1. Run email inbox pipeline only when enabled
     inbox_summary = None
+    inbox_error_note = None
     if "inbox" in modules:
         try:
             inbox_summary = run_inbox_pipeline(student_id, profile)
+        except GraphApiError as exc:
+            logger.error("Email pipeline Graph error: %s", exc.to_log_dict())
+            inbox_summary = {
+                "processed": 0,
+                "archived": 0,
+                "kept": 0,
+                "archived_items": [],
+                "relevant_items": [],
+                "urgent_items": [],
+                "ambiguous_items": [],
+                "error": "Inbox unavailable — check Graph diagnostics in logs.",
+                "graph_hint": exc.hint,
+            }
+            inbox_error_note = exc.hint or "Inbox unavailable — check Graph diagnostics in logs."
         except Exception as e:
             logger.error(f"Email pipeline error: {e}")
             inbox_summary = None
@@ -1868,6 +1884,9 @@ def handle_get_digest(student_id: str) -> list:
     )
 
     responses = [_text_response(format_digest_message(digest))]
+
+    if inbox_error_note:
+        responses.append(_text_response(f"📬 **Inbox:** {inbox_error_note}"))
 
     if "scholarships" in modules:
         _append_scholarship_sections(responses, digest["scholarships"])

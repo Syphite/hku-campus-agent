@@ -3,9 +3,19 @@ agent/email_pipeline.py
 Connects graph.py + classifier.py and returns inbox summary for digest.py
 """
 
-from agent.graph      import get_unread_emails, archive_email, is_protected_sender, USER_EMAIL
+import logging
+
+from agent.graph import (
+    GraphApiError,
+    archive_email,
+    get_unread_emails,
+    is_protected_sender,
+    resolve_user_email,
+)
 from agent.classifier import classify_email
-from agent.profile    import save_profile
+from agent.profile import save_profile
+
+logger = logging.getLogger(__name__)
 
 
 def run_inbox_pipeline(student_id: str, profile: dict = None) -> dict:
@@ -14,8 +24,17 @@ def run_inbox_pipeline(student_id: str, profile: dict = None) -> dict:
     Returns structured summary for digest.py.
     """
     profile = profile or {}
-    user_email = USER_EMAIL or profile.get("email")
-    emails  = get_unread_emails(user_email)
+    user_email = resolve_user_email(profile.get("email"))
+    try:
+        emails = get_unread_emails(user_email)
+    except GraphApiError as exc:
+        logger.error(
+            "Inbox pipeline Graph failure for user_id=%s: %s",
+            user_email,
+            exc.to_log_dict(),
+        )
+        raise
+
     processed_email_ids = profile.get("processed_email_ids", [])
     if not isinstance(processed_email_ids, list):
         processed_email_ids = []
