@@ -109,66 +109,81 @@ def build_profile_keywords(profile, include_generic=True):
 def heuristic_classify(subject, body_preview, sender, profile=None):
     profile = profile or {}
     text = f"{subject} {body_preview} {sender}".lower()
-    profile_keywords = build_profile_keywords(profile)
-    
+    profile_keywords = build_profile_keywords(profile, include_generic=False)
+    broad_keywords = build_profile_keywords(profile, include_generic=True)
+
     urgent_hits = [k for k in URGENT_TERMS if k in text]
     noise_hits = [k for k in NOISE_TERMS if k in text]
     profile_hits = [k for k in profile_keywords if k in text]
+    broad_hits = [k for k in broad_keywords if k in text and k not in profile_hits]
 
     sender_lower = sender.lower()
     is_asso_forum = "asso_forum" in sender_lower or "asso_forum" in text
     is_university_sender = "@hku.hk" in sender_lower or "hku" in sender_lower
 
-    # Special handling for ASSO_FORUM
-    if is_asso_forum:
-        if profile_hits:
-            return {
-                "label": "relevant",
-                "reason": f"ASSO_FORUM post matches your profile keywords: {', '.join(profile_hits[:4])}.",
-                "decisive": True,
-            }
-        return {
-            "label": "relevant",
-            "reason": "ASSO_FORUM post may be useful for HKU student life even without a direct profile keyword match.",
-            "decisive": True,
-        }
-
-    if urgent_hits:
+    if urgent_hits and (profile_hits or is_university_sender):
         return {
             "label": "urgent",
             "reason": (
-                f"Urgent email with matches: {', '.join(profile_hits[:3]) or 'student/admin context'}."
-                if profile_hits or is_university_sender
-                else f"Contains urgent terms: {', '.join(urgent_hits[:3])}."
+                f"Urgent email with profile or HKU context: "
+                f"{', '.join(urgent_hits[:3])}."
             ),
             "decisive": True,
         }
 
-    if noise_hits and not profile_hits:
+    if noise_hits and not profile_hits and not is_university_sender and not is_asso_forum:
         return {
             "label": "noise",
             "reason": f"Promotional/noise language detected: {', '.join(noise_hits[:3])}.",
             "decisive": True,
         }
 
-    if profile_hits:
+    if len(profile_hits) >= 2:
         return {
             "label": "relevant",
-            "reason": f"Matches your interests/major/year keywords: {', '.join(profile_hits[:4])}.",
-            "decisive": len(profile_hits) >= 1,
+            "reason": f"Strong profile match: {', '.join(profile_hits[:4])}.",
+            "decisive": True,
         }
 
-    if is_university_sender:
+    if profile_hits and urgent_hits:
         return {
             "label": "relevant",
-            "reason": "University sender — likely useful for HKU student life even without a direct profile keyword match.",
+            "reason": f"Matches your interests and mentions timing: {', '.join(profile_hits[:3])}.",
+            "decisive": True,
+        }
+
+    if profile_hits:
+        return {
+            "label": "ambiguous",
+            "reason": f"Possible profile match ({', '.join(profile_hits[:3])}) — needs a quick review.",
+            "decisive": False,
+        }
+
+    if is_asso_forum or is_university_sender:
+        return {
+            "label": "ambiguous",
+            "reason": "HKU campus mail without a clear personal match — review recommended.",
+            "decisive": False,
+        }
+
+    if broad_hits:
+        return {
+            "label": "ambiguous",
+            "reason": f"General student-life topic ({', '.join(broad_hits[:3])}) — may or may not be useful.",
+            "decisive": False,
+        }
+
+    if noise_hits:
+        return {
+            "label": "noise",
+            "reason": f"Promotional language with no profile match: {', '.join(noise_hits[:3])}.",
             "decisive": True,
         }
 
     return {
-        "label": "noise",
-        "reason": "No strong match to your profile or student priorities.",
-        "decisive": bool(noise_hits),
+        "label": "ambiguous",
+        "reason": "No clear match to your profile — flagged for review.",
+        "decisive": False,
     }
 
 
@@ -187,10 +202,10 @@ def _llm_classify(subject: str, body_preview: str, sender: str, profile: dict, h
     prompt = f"""
 You are an email triage assistant for a university student.
 Classify this email into exactly one label:
-- urgent: requires immediate action
-- relevant: useful for the student based on profile or student life
-- noise: promotional, spam, irrelevant mass email
-- ambiguous: genuinely unclear — use sparingly when you cannot reasonably choose urgent, relevant, or noise
+- urgent: requires immediate action (deadline within days, exam, registration, payment)
+- relevant: clearly useful based on the student's profile, courses, or interests (high confidence)
+- noise: clear marketing/spam/unrelated promotional email (safe to archive)
+- ambiguous: bulk campus mail, newsletters, generic announcements, or anything uncertain
 
 Student profile:
 {json.dumps(profile_text, ensure_ascii=False, indent=2)}
@@ -203,13 +218,16 @@ From: {sender}
 Subject: {subject}
 Preview: {body_preview}
 
-Rules:
-- Use the student profile strongly.
-- Prefer relevant over ambiguous for HKU/university mail that could plausibly matter to the student.
-- ASSO_FORUM posts are often useful; mark them relevant unless clearly spam or off-topic.
-- If the email is marketing/promo and not relevant to the profile, mark it noise.
-- Use ambiguous only when the email could go either way and human judgment is truly needed.
-- Return JSON only with keys: label, reason.
+Routing targets (approximate):
+- Most mail should land in ambiguous or noise, not stay in the inbox.
+- Use ambiguous for HKU bulk mail, ASSO_FORUM posts, club mail, and generic campus updates
+  unless there is a strong, specific match to the student's profile.
+- Use relevant only when the email clearly matches the student's major, courses, or interests.
+- Use noise only for obvious external marketing/promo with no student relevance.
+- When unsure between relevant and ambiguous, choose ambiguous.
+- When unsure between ambiguous and noise for @hku.hk senders, choose ambiguous.
+
+Return JSON only with keys: label, reason.
 """
 
     response = openai_client.chat.completions.create(
@@ -243,6 +261,10 @@ def classify_email(subject, body_preview, sender, profile=None):
         try:
             return _llm_classify(subject, body_preview, sender, profile, heuristic)
         except Exception:
-            return {"label": heuristic["label"], "reason": heuristic["reason"]}
+            label = heuristic.get("label") or "ambiguous"
+            if label not in {"urgent", "relevant", "noise", "ambiguous"}:
+                label = "ambiguous"
+            return {"label": label, "reason": heuristic.get("reason", "")}
 
-    return {"label": heuristic["label"], "reason": heuristic["reason"]}
+    label = heuristic.get("label") or "ambiguous"
+    return {"label": label, "reason": heuristic.get("reason", "")}

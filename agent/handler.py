@@ -294,6 +294,28 @@ def _help_card_response() -> dict:
     except Exception:
         return _text_response("Type 'digest' for updates, 'scholarships' to browse, or 'help' for commands.")
 
+
+def _post_setup_commands_text(*, include_cv_step: bool = False, ready: bool = False) -> str:
+    """Commands and natural-language examples shown after onboarding, CV, or sign-in."""
+    parts = []
+    if include_cv_step:
+        parts.append(
+            "📄 **Next step:** attach your PDF CV to this chat and type **CV**."
+        )
+    if ready:
+        parts.append(
+            "You're all set! Try **digest**, **scholarships**, **events**, or **inbox** whenever you want an update."
+        )
+    else:
+        parts.append(
+            "After that, try **digest**, **scholarships**, **events**, or **inbox** whenever you want an update."
+        )
+    parts.append(
+        "**Natural language also works**, e.g. *what's new*, *show me competitions*, "
+        "*check my email*, *apply to Chen scholarship*, *change my GPA to 3.8*."
+    )
+    return "\n\n".join(parts)
+
 def _get_profile_field(profile: dict, field: str):
     academic = profile.get("academic", {})
     financial = profile.get("financial", {})
@@ -831,10 +853,7 @@ def handle_graph_token_response(student_id: str, token_payload) -> list:
         else:
             responses.extend(debug_result)
     else:
-        responses.append(_text_response(
-            "You're all set. Type **digest** for a full update, **events** for event matches, "
-            "or **inbox** to triage your email."
-        ))
+        responses.append(_text_response(_post_setup_commands_text(ready=True)))
     return responses
 
 _WEEKDAY_NAMES = (
@@ -2218,10 +2237,7 @@ def handle_onboarding_submit(student_id: str, form_data: dict) -> list:
     welcome = _text_response(
         f"Profile set up! Welcome, {profile.get('name', 'Student')}. I've saved your preferences."
     )
-    cv_prompt = _text_response(
-        "📄 **Next step:** attach your PDF CV to this chat and type **CV**. "
-        "After that, type **digest**, **events**, or **inbox** whenever you want an update."
-    )
+    cv_prompt = _text_response(_post_setup_commands_text(include_cv_step=True))
     return [welcome, cv_prompt]
 
 def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
@@ -2252,17 +2268,14 @@ def handle_cv_upload(student_id: str, pdf_bytes: bytes, filename: str) -> list:
             cv_ack,
             _oauth_login_required(
                 "Smart Inbox and calendar features need a one-time Microsoft sign-in "
-                "for email access. After signing in, type **digest**, **events**, or **inbox**.",
+                f"for email access.\n\n{_post_setup_commands_text(ready=True)}",
                 pending_command="signin",
             ),
         ]
 
     return [
         cv_ack,
-        _text_response(
-            "When you're ready, type **digest** for a full update, **events** for event matches, "
-            "or **inbox** to triage your email."
-        ),
+        _text_response(_post_setup_commands_text(ready=True)),
     ]
 
 def handle_graph_debug(student_id: str, scope: str) -> list:
@@ -2333,13 +2346,16 @@ def handle_get_inbox(student_id: str) -> list:
 
     processed = inbox_summary.get("processed", 0)
     archived = inbox_summary.get("archived", 0)
+    ambiguous = inbox_summary.get("ambiguous_moved", 0)
     kept = inbox_summary.get("kept", 0)
+    fetched = inbox_summary.get("candidates_fetched", 0)
     scan_mode = inbox_summary.get("scan_mode", "")
     duplicates = inbox_summary.get("duplicates_archived", 0)
     mode_label = "unread inbox scan" if scan_mode == "unread_scan" else scan_mode.replace("_", " ")
     lines = [
-        f"📬 **Inbox update:** {processed} email(s) processed, {archived} archived, {kept} kept in inbox.",
-        f"Scan mode: **{mode_label}**.",
+        f"📬 **Inbox update:** {processed} email(s) processed, {archived} archived, "
+        f"{ambiguous} moved to **Agent Ambiguous**, {kept} kept in inbox.",
+        f"Scan mode: **{mode_label}** ({fetched} unread fetched).",
     ]
     if duplicates:
         lines.append(f"Duplicates archived: **{duplicates}**.")

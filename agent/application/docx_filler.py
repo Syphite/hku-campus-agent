@@ -103,13 +103,13 @@ def _find_header_row(table, headers: list[str]):
 
 def _header_column_map(cells, headers: list[str], item_fields: dict) -> dict:
     mapping = {}
-    row_texts = [normalize_text(cell.text) for cell in cells]
     for logical_key, header_label in (item_fields or {}).items():
-        header_norm = normalize_text(header_label)
-        for col_index, text in enumerate(row_texts):
-            if col_index < len(cells) and _is_row_label_cell(cells[col_index].text):
+        for col_index, cell in enumerate(cells):
+            if _is_row_label_cell(cell.text):
                 continue
-            if texts_match(header_label, text) or header_norm in text or text in header_norm:
+            if not normalize_text(cell.text):
+                continue
+            if texts_match(header_label, cell.text):
                 mapping[logical_key] = col_index
                 break
     return mapping

@@ -1,10 +1,26 @@
 """Tests for approved-data key resolution and DOCX row detection."""
 
+import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock
 
-from agent.application.docx_filler import _find_header_row, _is_row_label_cell, _next_empty_data_row
+from agent.application.docx_filler import (
+    _find_header_row,
+    _fill_repeating_list,
+    _header_column_map,
+    _is_row_label_cell,
+    _next_empty_data_row,
+    _row_cells,
+    fill_docx_form,
+)
 from agent.application.form_ai import resolve_approved_repeating_lists
+
+FIXTURE_DOCX = os.path.join(
+    os.path.dirname(__file__),
+    "fixtures",
+    "DHCFS_Application_Form_2627.docx",
+)
 
 
 class ResolveApprovedRepeatingListsTests(unittest.TestCase):
@@ -127,6 +143,69 @@ class DocxRowDetectionTests(unittest.TestCase):
         self.assertIsNotNone(match)
         row_index, _cells = match
         self.assertEqual(row_index, 1)
+
+
+class DhcfsAwardsTableTests(unittest.TestCase):
+    def test_awards_header_maps_past_row_label_column(self):
+        if not os.path.exists(FIXTURE_DOCX):
+            self.skipTest("DHCFS fixture DOCX not available")
+
+        from docx import Document
+
+        table = Document(FIXTURE_DOCX).tables[3]
+        headers = ["Year (MM/YY)", "Name of the Award", "Awarding Unit"]
+        item_fields = {
+            "dates": "Year (MM/YY)",
+            "role": "Name of the Award",
+            "organization": "Awarding Unit",
+        }
+        header_match = _find_header_row(table, headers)
+        self.assertIsNotNone(header_match)
+        _row_index, header_cells = header_match
+
+        column_map = _header_column_map(header_cells, headers, item_fields)
+        self.assertEqual(column_map, {"dates": 1, "role": 2, "organization": 3})
+
+    def test_awards_rows_fill_in_fixture_docx(self):
+        if not os.path.exists(FIXTURE_DOCX):
+            self.skipTest("DHCFS fixture DOCX not available")
+
+        schema = {
+            "repeating_lists": [
+                {
+                    "key": "awards",
+                    "table_index": 3,
+                    "column_headers": ["Year (MM/YY)", "Name of the Award", "Awarding Unit"],
+                    "item_fields": {
+                        "dates": "Year (MM/YY)",
+                        "role": "Name of the Award",
+                        "organization": "Awarding Unit",
+                    },
+                    "max_rows": 5,
+                }
+            ]
+        }
+        filled_data = {
+            "repeating_lists": {
+                "awards": [
+                    {"dates": "06/24", "role": "Dean's List", "organization": "HKU"},
+                    {"dates": "05/23", "role": "Hackathon Winner", "organization": "HKSTP"},
+                ]
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "filled.docx")
+            _, fill_report = fill_docx_form(FIXTURE_DOCX, filled_data, schema, output_path)
+            self.assertEqual(fill_report["repeating_lists"]["awards"], 2)
+
+            from docx import Document
+
+            table = Document(output_path).tables[3]
+            row1 = [cell.text.strip() for cell in _row_cells(table, 1)]
+            row2 = [cell.text.strip() for cell in _row_cells(table, 2)]
+            self.assertEqual(row1[1:], ["06/24", "Dean's List", "HKU"])
+            self.assertEqual(row2[1:], ["05/23", "Hackathon Winner", "HKSTP"])
 
 
 if __name__ == "__main__":

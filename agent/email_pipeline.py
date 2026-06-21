@@ -27,6 +27,7 @@ from agent.profile import save_profile
 logger = logging.getLogger(__name__)
 
 SCAN_MODE = "unread_scan"
+INBOX_SCAN_LIMIT = 500
 
 
 def _dedupe_inbox_items(items: list[dict]) -> list[dict]:
@@ -60,7 +61,7 @@ def _parse_duplicate_result(result) -> tuple[bool, str]:
 def fetch_inbox_candidates(user_token: str, profile: dict) -> tuple[list, str]:
     """Fetch all unread inbox messages, newest first (fully paginated)."""
     del profile  # kept for API compatibility with diagnostics
-    return get_all_unread_emails(user_token, max_messages=None), SCAN_MODE
+    return get_all_unread_emails(user_token, max_messages=INBOX_SCAN_LIMIT), SCAN_MODE
 
 
 def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | None = None) -> dict:
@@ -200,6 +201,16 @@ def run_inbox_pipeline(student_id: str, profile: dict = None, user_token: str | 
         + len(ambiguous_items)
     )
     kept_in_inbox = len(urgent_items) + len(relevant_items)
+    logger.info(
+        "Inbox pipeline for %s: fetched=%s processed=%s archived=%s ambiguous=%s kept=%s duplicates=%s",
+        student_id,
+        len(emails),
+        processed_count,
+        len(archived_items),
+        len(ambiguous_items),
+        kept_in_inbox,
+        len(duplicate_items),
+    )
     return {
         "processed": processed_count,
         "archived": len(archived_items),

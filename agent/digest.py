@@ -137,6 +137,7 @@ def assemble_digest(
             "events_upcoming":      len(upcoming_events),
             "emails_processed":     inbox_summary.get("processed", 0),
             "emails_archived":      inbox_summary.get("archived", 0),
+            "emails_ambiguous":     inbox_summary.get("ambiguous_moved", 0),
             "inbox_urgent":         len(inbox_summary.get("urgent_items") or []),
             "inbox_relevant":       len(inbox_summary.get("relevant_items") or []),
         }
@@ -170,9 +171,11 @@ def format_digest_message(digest: dict) -> str:
             f"📌 **{s['inbox_relevant']} relevant email(s)** — talks and events with schedule checks; tap **Add to Calendar** if you want to register."
         )
     if s["emails_processed"] > 0:
+        archived = s.get("emails_archived", 0)
+        ambiguous = s.get("emails_ambiguous", 0)
         lines.append(
             f"📬 **Inbox:** {s['emails_processed']} emails processed, "
-            f"{s['emails_archived']} archived."
+            f"{archived} archived, {ambiguous} moved to Agent Ambiguous."
         )
     if s["events_urgent"] > 0:
         lines.append(
